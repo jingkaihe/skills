@@ -206,4 +206,3 @@ After adding, verify with `waitrose trolley --json`. The add command may report 
 
 - Ensure you have a valid address ID (`waitrose address list`)
 - Check slot availability first (`waitrose slot list`)
-- Popular Christmas slots book up quickly
