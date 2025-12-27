@@ -20,7 +20,11 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 ## Installation
 
 ```bash
+# Install all skills to the global kodelet skills directory
 kodelet skill add jingkaihe/skills -g
+
+# Install a specific skill to the global kodelet skills directory
+kodelet skill add jingkaihe/skills -d waitrose-cli -g
 ```
 
 ## Usage
