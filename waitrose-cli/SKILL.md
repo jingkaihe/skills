@@ -206,3 +206,13 @@ After adding, verify with `waitrose trolley --json`. The add command may report 
 
 - Ensure you have a valid address ID (`waitrose address list`)
 - Check slot availability first (`waitrose slot list`)
+
+## Completing the Shopping Experience
+
+After finishing a grocery shopping session (adding items to trolley, booking a slot, etc.), always show the user the trolley link so they can review and checkout:
+
+```
+https://www.waitrose.com/ecom/shop/trolley
+```
+
+This allows users to verify their order, apply promotions, and complete checkout on the Waitrose website.
