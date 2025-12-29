@@ -1,11 +1,11 @@
 ---
 name: google-workspace
-description: If you use the google-workspace MCP tool, read this skill first. Contains Gmail search syntax, common patterns, and up-to-date TypeScript signatures for email search, attachment downloads, and contact management.
+description: If you use the google-workspace MCP tool, read this skill first. Contains Gmail search syntax, Google Calendar patterns, and up-to-date TypeScript signatures for email, calendar, and contact management.
 ---
 
 # Google Workspace MCP Skill
 
-Interact with Gmail and Google Contacts through the `google-workspace` MCP server.
+Interact with Gmail, Google Calendar, and Google Contacts through the `google-workspace` MCP server.
 
 ## Quick Start
 
@@ -82,6 +82,70 @@ const contacts = await gmail.gmailSearchContacts({
 });
 ```
 
+### Create All-Day Event (OOO, Holiday Block)
+```typescript
+import * as gw from './servers/google-workspace/index.js';
+
+const { accounts } = await gw.gmailListAccounts({});
+const account = accounts[0];
+
+// end_date is EXCLUSIVE - '2026-01-05' means event covers through Jan 4
+const result = await gw.calendarCreateEvent({
+  account: account,
+  summary: '🎄 OOO - Christmas Holiday',
+  description: 'Out of office for holiday.',
+  start_date: '2025-12-22',      // YYYY-MM-DD format
+  end_date: '2026-01-05',        // Exclusive - event ends Jan 4
+  visibility: 'public',
+  use_default_reminders: false   // Recommended for OOO blocks
+});
+```
+
+### Create Timed Event with Google Meet
+```typescript
+const result = await gw.calendarCreateEvent({
+  account: account,
+  summary: 'Meeting: Project Discussion',
+  description: 'Agenda: Review project status',
+  attendees: ['attendee@example.com'],
+  start_date_time: '2026-01-06T20:00:00',  // RFC3339 format
+  end_date_time: '2026-01-06T21:00:00',
+  time_zone: 'Europe/London',
+  add_conferencing: true,        // Adds Google Meet
+  use_default_reminders: true
+});
+
+// Get Google Meet link from response
+if (result.conference_data?.entry_points) {
+  const meetLink = result.conference_data.entry_points.find(e => e.entry_point_type === 'video');
+  console.log(`Google Meet: ${meetLink?.uri}`);
+}
+```
+
+### Update Event Attendees
+```typescript
+await gw.calendarUpdateEvent({
+  account: account,
+  event_id: 'event_id_here',
+  attendees: ['corrected.email@example.com']
+});
+```
+
+### Delete and Recreate Event (Workaround for Reminder Bugs)
+When updating events, you may encounter "Cannot specify both default reminders and overrides" error. The workaround is to delete and recreate:
+```typescript
+await gw.calendarDeleteEvent({
+  account: account,
+  event_id: 'old_event_id'
+});
+
+const result = await gw.calendarCreateEvent({
+  account: account,
+  // ... new event properties
+  use_default_reminders: false  // Explicitly set to avoid conflicts
+});
+```
+
 ## Gmail Search Query Syntax
 
 | Operator | Example | Description |
@@ -102,7 +166,7 @@ Combine operators: `from:boss@company.com is:unread has:attachment`
 
 ## Available Tools
 
-### Email Operations
+### Email Operations (Gmail)
 - `gmailListAccounts` - List connected accounts (call first!)
 - `gmailListEmails` - List emails with query/labels
 - `gmailGetEmail` - Get email by ID
@@ -128,6 +192,32 @@ Combine operators: `from:boss@company.com is:unread has:attachment`
 ### Contacts
 - `gmailListContacts` / `gmailSearchContacts`
 - `gmailCreateContact` / `gmailUpdateContact` / `gmailDeleteContact`
+
+### Calendar Events
+- `calendarListEvents` / `calendarSearchEvents` / `calendarGetEvent`
+- `calendarCreateEvent` - Create with attendees, Google Meet, reminders
+- `calendarUpdateEvent` - Modify existing event
+- `calendarDeleteEvent` / `calendarDeleteFutureEvents`
+- `calendarQuickAddEvent` - Create from natural language string
+- `calendarGetRecurringInstances` - Get instances of recurring event
+
+### Calendar Management
+- `calendarListCalendars` / `calendarCreateCalendar` / `calendarUpdateCalendar` / `calendarDeleteCalendar`
+- `calendarAddConferencing` - Add Google Meet to existing event
+- `calendarUpdateReminders` - Modify event reminders
+- `calendarMoveEvent` - Move to different calendar
+- `calendarRespondToEvent` - Accept/decline/tentative
+- `calendarFindAvailableSlots` / `calendarGetFreeBusy` - Check availability
+
+## Key Calendar Notes
+
+| Concept | Details |
+|---------|---------|
+| **All-day events** | Use `start_date` / `end_date` in `YYYY-MM-DD` format |
+| **Timed events** | Use `start_date_time` / `end_date_time` in RFC3339 format |
+| **end_date is exclusive** | `end_date: '2026-01-05'` means event covers through Jan 4 |
+| **Google Meet** | Set `add_conferencing: true` |
+| **Reminder bug** | Update can fail with "Cannot specify both default reminders and overrides" - workaround: delete + recreate |
 
 ## Processing Downloaded Attachments
 
