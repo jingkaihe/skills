@@ -51,6 +51,40 @@ The search results include:
 - `displayPrice`: Price display (e.g., `"£3.50"` or `"per kg"`)
 - `size`: Package size
 
+## Product Details
+
+Get full product details (ingredients, nutrition, attributes, etc.):
+
+```bash
+# Full product payload as JSON
+waitrose product get <lineNumber> --json
+```
+
+Useful fields in the JSON payload:
+- `contents.marketingDescBop`: Long description
+- `contents.ingredients`: Ingredients list (HTML)
+- `contents.nutrients`: Nutrition data
+- `attributes`: Dietary/allergen-related flags
+
+### Quick jq filters
+
+```bash
+# Pull key text fields
+waitrose product get <lineNumber> --json | jq -r '.contents.marketingDescBop, .contents.ingredients'
+
+# Nutrition table (name + values)
+waitrose product get <lineNumber> --json | jq -r '.contents.nutrients.nutrientsData[] | "\(.name): \(.valuePerUnit) (\(.valuePerServing))"'
+
+# Categories list
+waitrose product get <lineNumber> --json | jq -r '.categories[] | "\(.id) - \(.name)"'
+
+# Barcodes
+waitrose product get <lineNumber> --json | jq -r '.barCodes[]'
+
+# Attributes (non-false only)
+waitrose product get <lineNumber> --json | jq -r '.attributes | to_entries[] | select(.value==true) | .key'
+```
+
 ## Trolley Management
 
 ### View Trolley
