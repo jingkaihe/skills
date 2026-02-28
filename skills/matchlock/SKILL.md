@@ -7,6 +7,10 @@ description: Run AI agents and arbitrary code in ephemeral micro-VMs with VM-lev
 
 CLI tool and SDK for running AI agents in ephemeral micro-VMs with VM-level isolation, network allowlisting, and secret injection via MITM proxy.
 
+Repository: `github.com/jingkaihe/matchlock`
+
+For deeper dives, use the Matchlock repo as the source of truth and reference these locations: Go SDK (`pkg/sdk`), Python SDK (`sdk/python`), TypeScript SDK (`sdk/typescript`), and core source code (`cmd/`, `internal/`, `pkg/`).
+
 **Key principle:** Secrets never enter the VM. The VM only sees placeholder values; a host-side MITM proxy replaces them in-flight when HTTP requests go to explicitly allowed hosts.
 
 ## Architecture
