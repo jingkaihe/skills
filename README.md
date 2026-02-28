@@ -8,6 +8,7 @@ A collection of CLI tool skill definitions for AI assistants.
 |-------|-------------|
 | [google-workspace](./skills/google-workspace/SKILL.md) | Google Workspace MCP integration - Gmail search, email management, attachments, and contacts |
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | Interact with iCloud calendar and email services - manage calendars, events (with recurrence), mailboxes, emails, and drafts |
+| [matchlock](./skills/matchlock/SKILL.md) | Run AI agents in ephemeral micro-VMs with VM-level isolation, network allowlisting, and secret injection - CLI, Go SDK, and Python SDK |
 | [waitrose-cli](./skills/waitrose-cli/SKILL.md) | Interact with Waitrose & Partners grocery services - manage trolley, search products, book delivery slots, and view orders |
 
 ## Available Recipes
