@@ -41,6 +41,7 @@ matchlock run --image <image> [flags] -- <command>
 | `--secret` | | | Secret injection: `NAME=VALUE@host1,host2` or `NAME@host1,host2` |
 | `--no-network` | | `false` | Fully offline sandbox |
 | `--network-intercept` | | `false` | Force interception proxy even with empty allow-list |
+| `--detach` | `-d` | `false` | Run detached in background; prints VM ID, implies `--rm=false`, incompatible with `-t/-i` |
 | `-it` | | | Interactive TTY mode |
 | `--rm` | | `true` | Remove sandbox after exit (`--rm=false` to keep alive) |
 | `-p` | | | Publish port `[LOCAL:]REMOTE` |
@@ -76,6 +77,12 @@ matchlock run --image ubuntu:latest -it -- bash
 
 # Keep VM alive after command exits
 matchlock run --image python:3.12-alpine --rm=false -- python3 -c "print('ready')"
+
+# Detached mode (Docker-style; same lifecycle as --rm=false, prints VM ID)
+matchlock run --image nginx:latest -d
+
+# Detached mode with startup command
+matchlock run --image alpine:latest -d -- sh -c "echo started; sleep 300"
 
 # Network allowlisting with secret injection
 matchlock run --image python:3.12-alpine \
