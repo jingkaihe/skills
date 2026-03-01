@@ -45,7 +45,7 @@ matchlock run --image <image> [flags] -- <command>
 | `-it` | | | Interactive TTY mode |
 | `--rm` | | `true` | Remove sandbox after exit (`--rm=false` to keep alive) |
 | `-p` | | | Publish port `[LOCAL:]REMOTE` |
-| `--cpus` | | 2 | Number of CPUs |
+| `--cpus` | | 2 | Number of CPUs (supports fractional values, e.g. `0.5`) |
 | `--memory` | | 512 | Memory in MB |
 | `--disk-size` | | 2048 | Disk size in MB |
 | `--timeout` | | 300 | Timeout in seconds |
@@ -65,6 +65,8 @@ matchlock run --image <image> [flags] -- <command>
 | `--hostname` | | sandbox ID | Guest hostname |
 | `--mtu` | | 1500 | Network MTU |
 | `--address` | | `127.0.0.1` | Bind address for published ports |
+
+`--cpus` accepts finite values greater than 0. Fractional values are implemented as: guest vCPU count = `ceil(cpus)` (for scheduler/topology), and guest CPU usage is additionally constrained with cgroup `cpu.max` to approximately the requested fraction (for example, `0.5` => 1 visible vCPU with ~50% of one CPU time budget).
 
 ### Common CLI Examples
 
@@ -104,6 +106,9 @@ matchlock run --image alpine:latest --no-network -- echo "no network"
 
 # Resource limits
 matchlock run --image python:3.12-alpine --cpus 4 --memory 2048 --disk-size 10240 --timeout 600 -- python3 heavy_task.py
+
+# Fractional CPU request (1 visible vCPU, cgroup-limited to ~50% CPU budget)
+matchlock run --image alpine:latest --cpus 0.5 -- echo "half-cpu request"
 ```
 
 ### Exec into a Running Sandbox
@@ -192,7 +197,7 @@ from matchlock import Client, Sandbox
 
 sandbox = (
     Sandbox("python:3.12-alpine")
-    .with_cpus(2)
+    .with_cpus(0.5)
     .with_memory(1024)
     .with_disk_size(5120)
     .with_timeout(300)
@@ -341,7 +346,7 @@ Reference examples are in the `references/go/` directory.
 
 ```go
 sandbox := sdk.New("python:3.12-alpine").
-    WithCPUs(2).
+    WithCPUs(0.5).
     WithMemory(1024).
     WithDiskSize(5120).
     WithTimeout(300).
@@ -476,7 +481,7 @@ Reference examples are in the `references/typescript/` directory.
 import { Client, Sandbox } from "matchlock-sdk";
 
 const sandbox = new Sandbox("node:22-alpine")
-  .withCPUs(2)
+  .withCPUs(0.5)
   .withMemory(1024)
   .withDiskSize(5120)
   .withTimeout(300)
@@ -609,7 +614,7 @@ Complete working examples are in the `references/` directory. Each subdirectory 
 
 | Directory | Language | Covers |
 |-----------|----------|--------|
-| `references/python/` | Python | basic, exec_modes, network_interception, vfs_hooks |
+| `references/python/` | Python | basic, exec_modes, network_interception, port_forward, vfs_hooks |
 | `references/go/` | Go | basic, exec_modes, network_interception, vfs_hooks |
 | `references/typescript/` | TypeScript | basic, exec_modes, network_interception |
 
