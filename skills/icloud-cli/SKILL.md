@@ -1,6 +1,6 @@
 ---
 name: icloud-cli
-description: Interact with iCloud services using the icloud CLI tool. Use when users want to manage iCloud calendars (list, create, update, delete calendars), manage calendar events (list, create, update, delete events with recurrence support), or manage iCloud email (list mailboxes, read/search emails, send/reply, manage drafts, move/delete/mark/flag emails). Triggers on mentions of iCloud, Apple calendar, iCloud email, calendar events, or scheduling tasks.
+description: Manage iCloud calendars, events, and email using the icloud CLI. Use when users mention iCloud, Apple calendar, iCloud email, calendar events, or scheduling tasks.
 ---
 
 # iCloud CLI

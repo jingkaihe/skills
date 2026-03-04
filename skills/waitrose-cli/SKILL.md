@@ -1,6 +1,6 @@
 ---
 name: waitrose-cli
-description: Interact with Waitrose & Partners grocery services using the waitrose CLI. Use when users want to manage their Waitrose account, view/modify shopping trolley, check delivery slots, view orders, or manage addresses. Triggers on mentions of Waitrose, grocery shopping, delivery slots, trolley/cart management, or order history.
+description: Manage Waitrose grocery shopping using the waitrose CLI. Use when users mention Waitrose, grocery shopping, delivery slots, trolley/cart management, or order history.
 ---
 
 # Waitrose CLI
