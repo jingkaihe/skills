@@ -178,6 +178,16 @@ matchlock gc <vm-id>            # Reconcile specific VM
 matchlock gc --force-running    # Also reconcile running VMs
 ```
 
+### Host Diagnostics
+
+```bash
+matchlock diagnose --json
+```
+
+`matchlock diagnose` runs host preflight checks before you try to launch sandboxes.
+
+Examples include host virtualization support, required artifacts, and key runtime dependencies.
+
 ### Setup (Linux, requires root)
 
 ```bash
