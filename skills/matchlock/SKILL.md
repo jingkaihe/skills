@@ -13,6 +13,8 @@ For deeper dives, use the Matchlock repo as the source of truth and reference th
 
 **Key principle:** Secrets never enter the VM. The VM only sees placeholder values; a host-side MITM proxy replaces them in-flight when HTTP requests go to explicitly allowed hosts.
 
+When software inside the VM expects a specific token shape, Matchlock also supports caller-defined placeholders via CLI flags (`--secret-placeholder`, `--secret-file`) and SDK builder helpers.
+
 ## Architecture
 
 ```
@@ -39,6 +41,8 @@ matchlock run --image <image> [flags] -- <command>
 | `--image` | | *(required)* | Container image |
 | `--allow-host` | | | Allowed hosts (repeatable; supports `*.example.com` wildcards) |
 | `--secret` | | | Secret injection: `NAME=VALUE@host1,host2` or `NAME@host1,host2` |
+| `--secret-placeholder` | | | Override the in-VM placeholder value: `NAME=PLACEHOLDER` |
+| `--secret-file` | | | Load JSON secrets map: `name -> {value, placeholder, hosts}` |
 | `--no-network` | | `false` | Fully offline sandbox |
 | `--network-intercept` | | `false` | Force interception proxy even with empty allow-list |
 | `--detach` | `-d` | `false` | Run detached in background; prints VM ID, implies `--rm=false`, incompatible with `-t/-i` |
@@ -92,6 +96,14 @@ matchlock run --image python:3.12-alpine \
   --secret "OPENAI_API_KEY@api.openai.com" \
   -- python3 script.py
 
+# Custom placeholder for tools that validate token format inside the VM
+matchlock run --image ubuntu:24.04 \
+  --allow-host github.com \
+  --allow-host api.github.com \
+  --secret "GH_TOKEN@github.com,api.github.com" \
+  --secret-placeholder "GH_TOKEN=gho_sandbox_placeholder" \
+  -- sh -lc 'printf "%s\n" "$GH_TOKEN"'
+
 # Mount a host directory
 matchlock run --image node:22-alpine \
   -v /home/user/project:/workspace:host_fs \
@@ -110,6 +122,24 @@ matchlock run --image python:3.12-alpine --cpus 4 --memory 2048 --disk-size 1024
 # Fractional CPU request (1 visible vCPU, cgroup-limited to ~50% CPU budget)
 matchlock run --image alpine:latest --cpus 0.5 -- echo "half-cpu request"
 ```
+
+### Custom Secret Placeholders
+
+Use a custom placeholder when the guest-side tool validates the token format before making a request. A common example is `GH_TOKEN`, where tools may expect a `gho_`, `ghp_`, or `github_pat_`-shaped value.
+
+`--secret-file` accepts JSON in this format:
+
+```json
+{
+  "GH_TOKEN": {
+    "value": "gho_xxxxxxxxx_therealone",
+    "placeholder": "gho_sandbox_placeholder",
+    "hosts": ["github.com", "api.github.com"]
+  }
+}
+```
+
+Placeholder values must not overlap with each other, or with Matchlock's generated placeholder format (`SANDBOX_SECRET_<hex>`), otherwise Matchlock rejects the config.
 
 ### Exec into a Running Sandbox
 
@@ -216,6 +246,13 @@ sandbox = (
     .allow_host("api.openai.com", "*.npmjs.org")
     .add_host("api.internal", "10.0.0.10")
     .add_secret("API_KEY", os.environ["API_KEY"], "api.openai.com")
+    .add_secret_with_placeholder(
+        "GH_TOKEN",
+        os.environ["GH_TOKEN"],
+        "gho_sandbox_placeholder",
+        "github.com",
+        "api.github.com",
+    )
     .block_private_ips()
     .with_dns_servers("1.1.1.1")
     .with_network_mtu(1200)
@@ -365,6 +402,7 @@ sandbox := sdk.New("python:3.12-alpine").
     AllowHost("api.openai.com", "*.npmjs.org").
     AddHost("api.internal", "10.0.0.10").
     AddSecret("API_KEY", os.Getenv("API_KEY"), "api.openai.com").
+    AddSecretWithPlaceholder("GH_TOKEN", os.Getenv("GH_TOKEN"), "gho_sandbox_placeholder", "github.com", "api.github.com").
     BlockPrivateIPs().
     WithDNSServers("1.1.1.1").
     WithNetworkMTU(1200).
@@ -500,6 +538,13 @@ const sandbox = new Sandbox("node:22-alpine")
   .allowHost("registry.npmjs.org", "*.npmjs.org", "api.anthropic.com")
   .addHost("api.internal", "10.0.0.10")
   .addSecret("API_KEY", process.env.API_KEY ?? "", "api.anthropic.com")
+  .addSecretWithPlaceholder(
+    "GH_TOKEN",
+    process.env.GH_TOKEN ?? "",
+    "gho_sandbox_placeholder",
+    "github.com",
+    "api.github.com",
+  )
   .blockPrivateIPs()
   .withDNSServers("1.1.1.1")
   .withNetworkMTU(1200)
