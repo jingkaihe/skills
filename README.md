@@ -6,6 +6,7 @@ A collection of CLI tool skill definitions for AI assistants.
 
 | Skill | Description |
 |-------|-------------|
+| [ast-grep](./skills/ast-grep/SKILL.md) | Structural code search with ast-grep using AST-aware patterns |
 | [google-workspace](./skills/google-workspace/SKILL.md) | Google Workspace MCP integration - Gmail search, email management, attachments, and contacts |
 | [librarian](./skills/librarian/SKILL.md) | Maintain a local cache of remote Git repositories for code research and exploration |
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | Manage iCloud calendars, events, and email via the CLI |
