@@ -104,50 +104,40 @@ Apply the following additional review focus where relevant, but continue to repo
 
 {{end}}OUTPUT FORMAT:
 
-Follow the same structure as the Codex review output, but you do **not** need to emit strict JSON.
+Return the review in natural markdown using this structure:
 
-Return your review in this order:
+```
+## Findings
 
-1. `findings`
-2. `overall_correctness`
-3. `overall_explanation`
-4. `overall_confidence_score`
+If there are no qualifying findings, write `No findings.`
 
-For each finding, include the equivalent of these fields:
+### [P1] Example finding title
+- Priority: `1`
+- Confidence: `0.92`
+- Location: `/absolute/path/to/file.rs:120-124`
 
-- `title`: imperative, at most 80 characters, and prefixed with `[P0]`, `[P1]`, `[P2]`, or `[P3]`
-- `body`: valid Markdown explaining why this is a problem, citing files, lines, or functions where relevant
-- `confidence_score`: a float from `0.0` to `1.0`
-- `priority`: numeric priority (`0` to `3`)
-- `code_location`: absolute file path plus a short line range
+This change can fail when ...
 
-If there are no qualifying findings, explicitly say that there are no findings before giving the overall verdict.
+<Repeat for each additional finding>
 
-Use a readable markdown structure such as:
+## Overall Correctness
 
-### Findings
+Write exactly one of:
+- `patch is correct`
+- `patch is incorrect`
 
-{{"```"}}
-- title: [P1] Example finding title
-  priority: 1
-  confidence_score: 0.92
-  code_location: /absolute/path/to/file.rs:120-124
-  body: This change can fail when ...
-{{"```"}}
+## Overall Explanation
 
-### Overall Correctness
+Provide a 1-3 sentence explanation justifying the overall correctness verdict.
 
-`patch is correct` or `patch is incorrect`
+## Overall Confidence Score
 
-### Overall Explanation
+Provide a float from `0.0` to `1.0`.
+```
 
-1-3 sentences justifying the verdict.
-
-### Overall Confidence Score
-
-A float from `0.0` to `1.0`.
-
-- Keep the same field names where practical, even in markdown.
-- Keep line ranges as short as possible for interpreting the issue (avoid ranges over 5–10 lines; pick the most suitable subrange).
-- The `code_location` should overlap with the diff.
+- **Do not** wrap the final markdown output in markdown fences or extra prose.
+- Keep the same core information as the Codex review output: title, body, confidence, priority, and code location for each finding.
+- Use absolute file paths and short line ranges in each finding's location.
+- Line ranges must be as short as possible for interpreting the issue (avoid ranges over 5–10 lines; pick the most suitable subrange).
+- The location should overlap with the diff.
 - Do not generate a PR fix.
