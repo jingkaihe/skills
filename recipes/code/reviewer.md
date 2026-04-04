@@ -8,7 +8,7 @@ arguments:
     default: "main"
   scope:
     description: Scope of review - 'staged' for staged changes, 'working' for working directory, 'branch' for branch comparison
-    default: "staged"
+    default: "branch"
   focus:
     description: Optional focus area for the review (e.g., correctness, security, architecture, performance, testing, simplification)
 ---
