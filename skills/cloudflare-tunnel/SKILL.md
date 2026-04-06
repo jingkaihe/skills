@@ -57,6 +57,64 @@ The standardized path in this skill is:
 2. `uv run scripts/remote_managed_tunnel.py provision-custom-domain ... --write-token-file ...`
 3. `cloudflared tunnel --no-autoupdate run --token-file ...`
 
+## CLI quick reference
+
+Script: `scripts/remote_managed_tunnel.py`
+
+```bash
+uv run scripts/remote_managed_tunnel.py [--api-token-env ENV] [--output text|json] <subcommand> ...
+```
+
+Global flags go **before** the subcommand.
+
+```bash
+# good
+uv run scripts/remote_managed_tunnel.py --output json validate-token --show-zones
+
+# bad
+uv run scripts/remote_managed_tunnel.py validate-token --show-zones --output json
+```
+
+### `validate-token`
+
+```bash
+uv run scripts/remote_managed_tunnel.py validate-token [--zone-name ZONE] [--show-zones]
+```
+
+Checks that the API token works, optionally lists visible zones, and resolves `zone_id`/`account_id` for a zone.
+
+```bash
+uv run scripts/remote_managed_tunnel.py validate-token --show-zones
+uv run scripts/remote_managed_tunnel.py --output json validate-token --zone-name example.com --show-zones
+```
+
+### `provision-custom-domain`
+
+```bash
+uv run scripts/remote_managed_tunnel.py provision-custom-domain --zone-name ZONE --hostname HOST --origin-url URL [--tunnel-name NAME] [--write-token-file PATH] [--fallback-service http_status:404] [--dry-run] [--no-check-origin] [--origin-timeout SEC] [--unproxied] [--include-token]
+```
+
+Required: `--zone-name`, `--hostname`, `--origin-url`.
+
+Useful options: `--tunnel-name`, `--write-token-file`, `--dry-run`, `--no-check-origin`, `--origin-timeout`, `--unproxied`, `--include-token`.
+
+Normal run behavior: validate hostname and origin, resolve zone/account IDs, create the tunnel, push ingress for `hostname -> origin-url`, upsert the DNS CNAME, then print the tunnel id, public target, and `cloudflared` run command.
+
+```bash
+# preflight only
+uv run scripts/remote_managed_tunnel.py --output json provision-custom-domain --zone-name example.com --hostname app.example.com --origin-url http://127.0.0.1:8000 --dry-run
+
+# provision and save token securely
+uv run scripts/remote_managed_tunnel.py provision-custom-domain --zone-name example.com --hostname app.example.com --origin-url http://127.0.0.1:8000 --tunnel-name app-example-com --write-token-file /tmp/app-example-com.token
+
+# run connector
+cloudflared tunnel --no-autoupdate run --token-file /tmp/app-example-com.token
+```
+
+Common output keys: `hostname`, `zone_name`, `origin_url`, `origin_check`, `zone_id`, `account_id`, `tunnel_name`, `tunnel_id`, `public_target`, `dns_action`, `dns_record_id`, `token_file`, `run_command`.
+
+Notes: prefer `http://127.0.0.1:<PORT>` as the origin; prefer `--write-token-file` over `--include-token`; if parsing fails, check whether global flags were placed after the subcommand; there is no cleanup subcommand yet, so cleanup means deleting the DNS record and the tunnel via the API.
+
 ## Response pattern
 
 When helping the user, keep the answer in this order:
