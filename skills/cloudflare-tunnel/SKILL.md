@@ -1,6 +1,6 @@
 ---
 name: cloudflare-tunnel
-description: Use whenever the user wants to expose localhost or a private service through Cloudflare Tunnel, publish a stable custom-domain HTTPS endpoint with cloudflared, run a named tunnel using a Cloudflare API token or tunnel token, or generate a temporary trycloudflare.com URL. Trigger on mentions of cloudflared, Cloudflare Tunnel, trycloudflare, Argo Tunnel, public hostname, expose localhost, preview URL, webhook testing, or custom-domain HTTPS over Cloudflare.
+description: Use whenever the user wants to expose localhost or a private service through Cloudflare Tunnel, publish a stable custom-domain HTTPS endpoint with cloudflared, run a named tunnel with API-provisioned credentials, or generate a temporary trycloudflare.com URL. Trigger on mentions of cloudflared, Cloudflare Tunnel, trycloudflare, Argo Tunnel, public hostname, expose localhost, preview URL, webhook testing, or custom-domain HTTPS over Cloudflare.
 ---
 
 # Cloudflare Tunnel
@@ -14,7 +14,7 @@ Prefer current Cloudflare docs and API behavior over stale memory. The upstream 
 
 ## First principles
 
-- If `CLOUDFLARE_API_TOKEN` and/or `CLOUDFLARE_TUNNEL_TOKEN` are already available, avoid interactive `cloudflared tunnel login`.
+- If `CLOUDFLARE_API_TOKEN` is already available, avoid interactive `cloudflared tunnel login`.
 - For anything stable, repeatable, or user-facing, prefer a **remotely-managed named tunnel** over a locally-managed `config.yml` workflow.
 - For public HTTPS, usually point Cloudflare Tunnel at `http://127.0.0.1:<PORT>` and let Cloudflare terminate public TLS at the edge. Only use an HTTPS origin if the local service actually requires TLS.
 - For servers, containers, and production-ish setups, prefer `cloudflared tunnel --no-autoupdate run --token-file ...` and manage upgrades deliberately.
@@ -47,9 +47,9 @@ Need a temporary share link, local demo URL, or there is no usable token / no Cl
 Do **not** default to locally-managed tunnels unless the user explicitly wants YAML-managed config on disk, version-controlled ingress rules, or an offline-ish workflow. For most CLI and ops tasks, the best path is:
 
 1. use `CLOUDFLARE_API_TOKEN` to create or update a remotely-managed tunnel and DNS
-2. use `CLOUDFLARE_TUNNEL_TOKEN` to run `cloudflared`
+2. write the returned tunnel token to a file and use that to run `cloudflared`
 
-That split is cleaner because the API token manages configuration while the tunnel token only authorizes the connector process.
+That split is cleaner because the API token manages configuration while the returned tunnel token only authorizes the connector process.
 
 The standardized path in this skill is:
 
@@ -113,7 +113,7 @@ cloudflared tunnel --no-autoupdate run --token-file /tmp/app-example-com.token
 
 Common output keys: `hostname`, `zone_name`, `origin_url`, `origin_check`, `zone_id`, `account_id`, `tunnel_name`, `tunnel_id`, `public_target`, `dns_action`, `dns_record_id`, `token_file`, `run_command`.
 
-Notes: prefer `http://127.0.0.1:<PORT>` as the origin; prefer `--write-token-file` over `--include-token`; if parsing fails, check whether global flags were placed after the subcommand; there is no cleanup subcommand yet, so cleanup means deleting the DNS record and the tunnel via the API.
+Notes: prefer `http://127.0.0.1:<PORT>` as the origin; prefer `--write-token-file` over `--include-token`; if parsing fails, check whether global flags were placed after the subcommand; cleanup means deleting the DNS record and the tunnel via the API.
 
 ## Response pattern
 

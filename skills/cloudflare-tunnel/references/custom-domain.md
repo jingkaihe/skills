@@ -11,7 +11,7 @@ Why this is usually optimal:
 - no interactive browser login is required when `CLOUDFLARE_API_TOKEN` is already available
 - no local credentials JSON or local config file is required just to run the connector
 - routing changes live in Cloudflare and are easier to update centrally
-- the tunnel token can be handed to the runtime host without also granting broad API access
+- the returned tunnel token can be handed to the runtime host without also granting broad API access
 
 ## Inputs you need
 
