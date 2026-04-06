@@ -17,9 +17,11 @@ Prefer current Cloudflare docs and API behavior over stale memory. The upstream 
 - If `CLOUDFLARE_API_TOKEN` and/or `CLOUDFLARE_TUNNEL_TOKEN` are already available, avoid interactive `cloudflared tunnel login`.
 - For anything stable, repeatable, or user-facing, prefer a **remotely-managed named tunnel** over a locally-managed `config.yml` workflow.
 - For public HTTPS, usually point Cloudflare Tunnel at `http://127.0.0.1:<PORT>` and let Cloudflare terminate public TLS at the edge. Only use an HTTPS origin if the local service actually requires TLS.
-- For servers, containers, and production-ish setups, prefer `cloudflared tunnel --no-autoupdate run --token ...` and manage upgrades deliberately.
+- For servers, containers, and production-ish setups, prefer `cloudflared tunnel --no-autoupdate run --token-file ...` and manage upgrades deliberately.
 - For admin panels or internal tools, recommend Cloudflare Access in front of the public hostname.
 - If uptime matters, run the same named tunnel on 2+ replicas rather than relying on a single `cloudflared` process.
+- For repeated API work, prefer the bundled `uv` script in `scripts/remote_managed_tunnel.py` over ad-hoc `curl` blocks. It standardizes token validation, zone resolution, tunnel creation, ingress config, and DNS upsert.
+- Be opinionated and fail fast: if the scripted path cannot run, stop and surface the blocker instead of drifting into a hand-built `curl` procedure.
 
 ## Decision rule
 
@@ -38,6 +40,7 @@ Need a temporary share link, local demo URL, or there is no usable token / no Cl
 - Read `references/custom-domain.md` for **custom-domain HTTPS serving**.
 - Read `references/quick-tunnel.md` for **trycloudflare.com serving**.
 - Read `references/sources.md` when you need to sanity-check a limit, endpoint, or doc-backed behavior.
+- Use `scripts/remote_managed_tunnel.py` when you need a repeatable custom-domain setup flow.
 
 ## Strong default stance
 
@@ -48,12 +51,18 @@ Do **not** default to locally-managed tunnels unless the user explicitly wants Y
 
 That split is cleaner because the API token manages configuration while the tunnel token only authorizes the connector process.
 
+The standardized path in this skill is:
+
+1. `uv run scripts/remote_managed_tunnel.py validate-token ...`
+2. `uv run scripts/remote_managed_tunnel.py provision-custom-domain ... --write-token-file ...`
+3. `cloudflared tunnel --no-autoupdate run --token-file ...`
+
 ## Response pattern
 
 When helping the user, keep the answer in this order:
 
 1. say which mode you are choosing and why
 2. ask only for missing inputs (`hostname`, `zone`, `local port`, `origin URL`)
-3. give exact commands
+3. give exact commands that use the bundled Python script for repeatable custom-domain setup; do not switch to raw API `curl` fallback in normal use
 4. mention the one or two most relevant gotchas
 5. end with a concrete validation step using the final public URL

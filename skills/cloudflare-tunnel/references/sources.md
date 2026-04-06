@@ -18,6 +18,18 @@ This skill was based on Cloudflare's tunnel reference bundle in `cloudflare/skil
 - Quick Tunnel docs explicitly warn about `.cloudflared/config.yaml` conflicts.
 - Current replica guidance is lower than some older references implied: current docs describe up to `100` connections / `25` replicas per tunnel.
 
+## Operational learnings to keep in the skill
+
+- Standardize repeated API work in a bundled `uv` script instead of repeating multi-line `curl` snippets in markdown.
+- The default procedure should be: validate token -> provision remote-managed tunnel -> write token file -> run `cloudflared` with `--token-file`.
+- Be fail-fast instead of fallback-heavy. If the scripted workflow cannot run, stop and explain the blocker rather than improvising a second manual path.
+- In practice, token scope should usually include:
+  - `Account -> Cloudflare Tunnel -> Edit`
+  - `Zone -> DNS -> Edit`
+  - `Zone -> Zone -> Read` when the workflow resolves `ZONE_ID` from the zone name
+- Preflighting the local origin before creating Cloudflare resources catches the most common operator mistake early.
+- `cloudflared tunnel --no-autoupdate run --token-file ...` is a good default for local long-running sessions because it avoids exposing the raw tunnel token on the process list.
+
 ## How to use this reference
 
 - If a limit, endpoint, or flag matters to the task, re-check the official docs before stating it confidently.

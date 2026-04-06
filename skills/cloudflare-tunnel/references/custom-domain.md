@@ -20,81 +20,81 @@ Why this is usually optimal:
 - `ORIGIN_URL` — local service address, usually `http://127.0.0.1:3000`
 - `TUNNEL_NAME` — friendly name, for example `app-tunnel`
 
-If the user already has `CLOUDFLARE_TUNNEL_TOKEN` for the intended tunnel, you can often skip tunnel creation and just run the connector. Use the API token when you need to create or change routes.
+## Standardized workflow
 
-## Best workflow
+This skill should use the bundled script in `scripts/remote_managed_tunnel.py`.
 
-### 1) Resolve zone and account IDs from the zone name
+Do **not** fall back to hand-written `curl` and `jq` snippets in normal use. If the script cannot run, fail fast and surface the blocker.
+
+### 1) Validate the token and zone
+
+```bash
+export ZONE_NAME=example.com
+
+uv run scripts/remote_managed_tunnel.py validate-token \
+  --zone-name "$ZONE_NAME" \
+  --show-zones
+```
+
+This confirms that the token can list zones and resolve the target zone.
+
+### 2) Provision the tunnel, ingress, and DNS
 
 ```bash
 export ZONE_NAME=example.com
 export HOSTNAME=app.example.com
 export ORIGIN_URL=http://127.0.0.1:3000
 export TUNNEL_NAME=app-tunnel
+export TOKEN_FILE=/tmp/app-example-com.token
 
-ZONE_JSON=$(curl -fsS --get https://api.cloudflare.com/client/v4/zones \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  --data-urlencode "name=$ZONE_NAME")
-
-ZONE_ID=$(jq -r '.result[0].id' <<<"$ZONE_JSON")
-ACCOUNT_ID=$(jq -r '.result[0].account.id' <<<"$ZONE_JSON")
+uv run scripts/remote_managed_tunnel.py provision-custom-domain \
+  --zone-name "$ZONE_NAME" \
+  --hostname "$HOSTNAME" \
+  --origin-url "$ORIGIN_URL" \
+  --tunnel-name "$TUNNEL_NAME" \
+  --write-token-file "$TOKEN_FILE"
 ```
 
-If `jq` is not available, parse the JSON with Python instead of changing the overall flow.
+The script intentionally fails early if:
 
-### 2) Create a remotely-managed tunnel if you do not already have a tunnel token
+- `CLOUDFLARE_API_TOKEN` is missing
+- the token cannot see the requested zone
+- the hostname is outside the zone
+- the local origin is unreachable
+- the API returns an error during tunnel or DNS provisioning
+
+For a preflight with no side effects:
 
 ```bash
-TUNNEL_JSON=$(curl -fsS https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel \
-  --request POST \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data "{\"name\":\"$TUNNEL_NAME\",\"config_src\":\"cloudflare\"}")
-
-TUNNEL_ID=$(jq -r '.result.id' <<<"$TUNNEL_JSON")
-export CLOUDFLARE_TUNNEL_TOKEN=$(jq -r '.result.token' <<<"$TUNNEL_JSON")
+uv run scripts/remote_managed_tunnel.py provision-custom-domain \
+  --zone-name "$ZONE_NAME" \
+  --hostname "$HOSTNAME" \
+  --origin-url "$ORIGIN_URL" \
+  --dry-run \
+  --output json
 ```
 
-If the environment already provides `CLOUDFLARE_TUNNEL_TOKEN` and the tunnel is known-good, do not recreate it just to be fancy.
+### 3) Run the connector
 
-### 3) Configure the public hostname -> local origin mapping
-
-Always include a catch-all rule at the end.
+Foreground:
 
 ```bash
-curl -fsS https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations \
-  --request PUT \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data "{\"config\":{\"ingress\":[{\"hostname\":\"$HOSTNAME\",\"service\":\"$ORIGIN_URL\",\"originRequest\":{}},{\"service\":\"http_status:404\"}]}}"
+cloudflared tunnel --no-autoupdate run --token-file "$TOKEN_FILE"
 ```
 
-### 4) Create the proxied DNS record
-
-The public hostname should point to `<TUNNEL_ID>.cfargotunnel.com` as a proxied CNAME.
+Long-running local CLI session in tmux:
 
 ```bash
-curl -fsS https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records \
-  --request POST \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data "{\"type\":\"CNAME\",\"proxied\":true,\"name\":\"$HOSTNAME\",\"content\":\"$TUNNEL_ID.cfargotunnel.com\"}"
+tmux -L llm-agent new-session -d -s app-tunnel
+tmux -L llm-agent set-option -t app-tunnel remain-on-exit on
+tmux -L llm-agent send-keys -t app-tunnel \
+  "cloudflared tunnel --no-autoupdate run --token-file $TOKEN_FILE 2>&1" Enter
 ```
 
-If the DNS record already exists, update it instead of creating a duplicate.
-
-### 5) Run the connector
-
-For a foreground run:
+Persistent system service on Linux or macOS:
 
 ```bash
-cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN"
-```
-
-For a persistent service on Linux or macOS:
-
-```bash
-sudo cloudflared service install "$CLOUDFLARE_TUNNEL_TOKEN"
+sudo cloudflared service install "$(cat "$TOKEN_FILE")"
 ```
 
 ## Validation
@@ -110,6 +110,10 @@ Also confirm that `cloudflared` logs show a healthy connection and that the app 
 ## Important guidance
 
 - For public HTTPS, your origin usually does **not** need its own public certificate. A local HTTP origin is often the simplest and best option.
+- The API token usually needs:
+  - `Account -> Cloudflare Tunnel -> Edit`
+  - `Zone -> DNS -> Edit`
+  - `Zone -> Zone -> Read` when the script resolves the zone automatically
 - If the local origin uses HTTPS with a self-signed certificate, prefer either:
   - switching the tunnel service URL to local HTTP, or
   - adding the correct `originRequest` TLS settings instead of hoping it works
