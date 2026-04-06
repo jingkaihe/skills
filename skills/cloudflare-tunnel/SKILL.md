@@ -1,0 +1,59 @@
+---
+name: cloudflare-tunnel
+description: Use whenever the user wants to expose localhost or a private service through Cloudflare Tunnel, publish a stable custom-domain HTTPS endpoint with cloudflared, run a named tunnel using a Cloudflare API token or tunnel token, or generate a temporary trycloudflare.com URL. Trigger on mentions of cloudflared, Cloudflare Tunnel, trycloudflare, Argo Tunnel, public hostname, expose localhost, preview URL, webhook testing, or custom-domain HTTPS over Cloudflare.
+---
+
+# Cloudflare Tunnel
+
+This skill focuses on the two best public-serving flows:
+
+1. a **named, remotely-managed tunnel** for stable custom-domain HTTPS
+2. a **Quick Tunnel** for temporary `trycloudflare.com` sharing
+
+Prefer current Cloudflare docs and API behavior over stale memory. The upstream Cloudflare skill references are a strong starting point, but Tunnel details do move; use `references/sources.md` as the current baseline.
+
+## First principles
+
+- If `CLOUDFLARE_API_TOKEN` and/or `CLOUDFLARE_TUNNEL_TOKEN` are already available, avoid interactive `cloudflared tunnel login`.
+- For anything stable, repeatable, or user-facing, prefer a **remotely-managed named tunnel** over a locally-managed `config.yml` workflow.
+- For public HTTPS, usually point Cloudflare Tunnel at `http://127.0.0.1:<PORT>` and let Cloudflare terminate public TLS at the edge. Only use an HTTPS origin if the local service actually requires TLS.
+- For servers, containers, and production-ish setups, prefer `cloudflared tunnel --no-autoupdate run --token ...` and manage upgrades deliberately.
+- For admin panels or internal tools, recommend Cloudflare Access in front of the public hostname.
+- If uptime matters, run the same named tunnel on 2+ replicas rather than relying on a single `cloudflared` process.
+
+## Decision rule
+
+Choose the serving mode first:
+
+```text
+Need a stable hostname, custom domain, reusable deployment, or anything beyond ad-hoc testing?
+-> Use a named remotely-managed tunnel.
+
+Need a temporary share link, local demo URL, or there is no usable token / no Cloudflare-managed zone?
+-> Use a Quick Tunnel (trycloudflare.com).
+```
+
+## What to load next
+
+- Read `references/custom-domain.md` for **custom-domain HTTPS serving**.
+- Read `references/quick-tunnel.md` for **trycloudflare.com serving**.
+- Read `references/sources.md` when you need to sanity-check a limit, endpoint, or doc-backed behavior.
+
+## Strong default stance
+
+Do **not** default to locally-managed tunnels unless the user explicitly wants YAML-managed config on disk, version-controlled ingress rules, or an offline-ish workflow. For most CLI and ops tasks, the best path is:
+
+1. use `CLOUDFLARE_API_TOKEN` to create or update a remotely-managed tunnel and DNS
+2. use `CLOUDFLARE_TUNNEL_TOKEN` to run `cloudflared`
+
+That split is cleaner because the API token manages configuration while the tunnel token only authorizes the connector process.
+
+## Response pattern
+
+When helping the user, keep the answer in this order:
+
+1. say which mode you are choosing and why
+2. ask only for missing inputs (`hostname`, `zone`, `local port`, `origin URL`)
+3. give exact commands
+4. mention the one or two most relevant gotchas
+5. end with a concrete validation step using the final public URL
