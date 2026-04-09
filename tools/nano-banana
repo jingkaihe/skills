@@ -22,6 +22,7 @@ from google.genai import types
 TOOL_NAME = "nano-banana"
 DESCRIPTION = "Generate an image from a prompt using Google Gemini Nano Banana and save it under $HOME/.cache/nano-banana."
 DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 CACHE_DIR = Path.home() / ".cache" / "nano-banana"
 VALID_ASPECT_RATIOS = {
     "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
@@ -71,6 +72,16 @@ def slugify(value: str, max_length: int = 48) -> str:
 
 
 def build_client() -> genai.Client:
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION)
+
+    if project:
+        return genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+        )
+
     return genai.Client()
 
 
