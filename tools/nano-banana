@@ -1,0 +1,163 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "google-genai",
+#   "pillow",
+# ]
+# ///
+
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from google import genai
+from google.genai import types
+
+TOOL_NAME = "nano-banana"
+DESCRIPTION = "Generate an image from a prompt using Google Gemini Nano Banana and save it under $HOME/.cache/nano-banana."
+DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+CACHE_DIR = Path.home() / ".cache" / "nano-banana"
+VALID_ASPECT_RATIOS = {
+    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
+}
+VALID_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
+
+
+def get_description() -> dict[str, Any]:
+    return {
+        "name": TOOL_NAME,
+        "description": DESCRIPTION,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Text prompt describing the image to generate."
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "description": "Optional aspect ratio. One of 1:1, 1:4, 1:8, 2:3, 3:2, 3:4, 4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9."
+                },
+                "image_size": {
+                    "type": "string",
+                    "description": "Optional output size. One of 512, 1K, 2K, 4K."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional Gemini image generation model. Defaults to gemini-3.1-flash-image-preview."
+                }
+            },
+            "required": ["prompt"]
+        }
+    }
+
+
+def error(message: str, *, exit_code: int = 1) -> None:
+    print(json.dumps({"success": False, "error": message}, indent=2))
+    sys.exit(exit_code)
+
+
+def slugify(value: str, max_length: int = 48) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    if not slug:
+        slug = "image"
+    return slug[:max_length].rstrip("-") or "image"
+
+
+def build_client() -> genai.Client:
+    return genai.Client()
+
+
+def save_generated_image(response: Any, prompt: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    prefix = slugify(prompt)
+
+    for part in getattr(response, "parts", []) or []:
+        if getattr(part, "inline_data", None) is None:
+            continue
+        image = part.as_image()
+        suffix = uuid.uuid4().hex[:8]
+        output_path = CACHE_DIR / f"{timestamp}-{prefix}-{suffix}.png"
+        image.save(output_path)
+        return output_path
+
+    raise RuntimeError("The model response did not contain an image.")
+
+
+def run_tool() -> None:
+    try:
+        input_data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        error(f"Invalid JSON input: {exc}")
+
+    prompt = input_data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        error("Missing required parameter: prompt")
+    prompt = prompt.strip()
+
+    aspect_ratio = input_data.get("aspect_ratio")
+    if aspect_ratio is not None:
+        if not isinstance(aspect_ratio, str) or aspect_ratio not in VALID_ASPECT_RATIOS:
+            error(f"Invalid aspect_ratio. Expected one of: {', '.join(sorted(VALID_ASPECT_RATIOS))}")
+
+    image_size = input_data.get("image_size")
+    if image_size is not None:
+        if not isinstance(image_size, str) or image_size not in VALID_IMAGE_SIZES:
+            error(f"Invalid image_size. Expected one of: {', '.join(sorted(VALID_IMAGE_SIZES))}")
+
+    model = input_data.get("model")
+    if model is None:
+        model = DEFAULT_MODEL
+    elif not isinstance(model, str) or not model.strip():
+        error("model must be a non-empty string when provided")
+    else:
+        model = model.strip()
+
+    try:
+        client = build_client()
+        config = types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
+        if aspect_ratio or image_size:
+            config.image_config = types.ImageConfig(
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+            )
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        output_path = save_generated_image(response, prompt)
+        print(json.dumps({
+            "success": True,
+            "image_path": str(output_path),
+            "model": model,
+        }, indent=2))
+    except Exception as exc:
+        error(f"Image generation failed: {exc}")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print(f"Usage: {TOOL_NAME} [description|run]", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+    if command == "description":
+        print(json.dumps(get_description(), indent=2))
+    elif command == "run":
+        run_tool()
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
