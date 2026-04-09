@@ -100,6 +100,8 @@ podman run -d \
     -a qwen3.5-35b-a3b-bf16
 ```
 
+If the user needs auth, `llama-server` supports `--api-key KEY` and `--api-key-file FNAME`. The built-in Web UI uses `Authorization: Bearer <key>` and stores the key in browser localStorage.
+
 ## Performance reference
 
 These numbers are useful as orientation, not as a universal guarantee.

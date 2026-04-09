@@ -162,6 +162,10 @@ podman run -d \
 
 Add model-specific flags as needed.
 
+### llama-server auth and Web UI notes
+
+`llama-server` supports `--api-key KEY` and `--api-key-file FNAME`. The built-in Web UI uses `Authorization: Bearer <key>` and stores the key in browser localStorage; `x-api-key` appears in Anthropic-compatible API examples, not in the built-in Web UI.
+
 ## Strix Halo llama.cpp defaults
 
 These are the baseline defaults to reach for on Strix Halo.
