@@ -1,0 +1,358 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "filetype",
+#   "google-genai",
+# ]
+# ///
+
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import filetype
+from google import genai
+from google.genai import types
+
+TOOL_NAME = "look_at"
+DESCRIPTION = """Extract specific information from a local file, including PDFs, images, audio, video, and documents.
+
+Use this tool when you need analysis or summarization rather than the literal file contents. Always provide a clear objective describing what you want to learn. Pass reference files when you want a comparison.
+
+Good fit: interpreted analysis of media or documents, targeted extraction, visual description, comparison.
+Bad fit: source code or plain text when you need exact contents, simple file reading, or files you plan to edit afterward.
+"""
+DEFAULT_MODEL = "gemini-3-flash-preview"
+MAX_TEXT_CHARS = 100_000
+MAX_OUTPUT_TOKENS = 65_535
+
+INLINE_VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/mpeg",
+    "video/mov",
+    "video/avi",
+    "video/x-flv",
+    "video/mpg",
+    "video/webm",
+    "video/wmv",
+    "video/3gpp",
+}
+INLINE_AUDIO_MIME_TYPES = {
+    "audio/aac",
+    "audio/flac",
+    "audio/mp3",
+    "audio/m4a",
+    "audio/mpeg",
+    "audio/mpga",
+    "audio/mp4",
+    "audio/opus",
+    "audio/pcm",
+    "audio/wav",
+    "audio/webm",
+}
+EXTENSION_TO_MIME = {
+    ".3gp": "video/3gpp",
+    ".aac": "audio/aac",
+    ".avi": "video/avi",
+    ".flac": "audio/flac",
+    ".flv": "video/x-flv",
+    ".m4a": "audio/m4a",
+    ".mov": "video/mov",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpg",
+    ".opus": "audio/opus",
+    ".pdf": "application/pdf",
+    ".wav": "audio/wav",
+    ".webm": "video/webm",
+    ".wmv": "video/wmv",
+}
+SYSTEM_PROMPT = """Analyze the provided file for a software engineer.
+
+- Be concise, direct, and accurate.
+- Focus only on the stated objective; do not add tangential information.
+- No preamble, flattery, or unnecessary summary.
+- When analyzing images, describe only what is visible; do not guess.
+- When analyzing code, reference specific symbols or line-level details when useful.
+- When analyzing documents, extract only the requested information.
+- When reference files are provided, compare them systematically and call out concrete differences and similarities.
+- Use GitHub-flavored Markdown when helpful, including code fences for code snippets.
+"""
+
+
+def get_description() -> dict[str, Any]:
+    return {
+        "name": TOOL_NAME,
+        "description": DESCRIPTION,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the file to analyze.",
+                },
+                "objective": {
+                    "type": "string",
+                    "description": "Natural-language description of the analysis goal (e.g., summarize, extract data, describe image).",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "The broader goal and context for the analysis. Include relevant background information about what you are trying to achieve and why this analysis is needed.",
+                },
+                "referenceFiles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of absolute paths to reference files for comparison (e.g., to compare two screenshots or documents).",
+                },
+            },
+            "required": ["path", "objective", "context"],
+        },
+    }
+
+
+def fail(message: str, *, exit_code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def ensure_non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        fail(f"Missing required parameter: {field_name}")
+    return value.strip()
+
+
+def ensure_string_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        fail(f"{field_name} must be an array of non-empty strings")
+    return [item.strip() for item in value]
+
+
+def normalize_local_path(raw_path: str) -> Path:
+    parsed = urlparse(raw_path)
+    if parsed.scheme in {"http", "https"}:
+        fail("look_at only supports local files")
+    if parsed.scheme == "file":
+        if parsed.netloc not in {"", "localhost"}:
+            fail(f"Unsupported file URI host: {parsed.netloc}")
+        path = Path(parsed.path)
+    else:
+        path = Path(raw_path)
+
+    path = Path(os.path.expanduser(str(path)))
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def ensure_regular_file(path: Path) -> Path:
+    if not path.exists():
+        fail(f"File not found: {path}")
+    if not path.is_file():
+        fail(f"Path is not a file: {path}")
+    return path
+
+
+def language_tag_for_path(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".")
+    if not suffix:
+        return "text"
+    if suffix in {"csv", "tsv"}:
+        return suffix
+    return suffix
+
+
+def format_text_payload(path: Path, text: str, label: str) -> str:
+    body = text[:MAX_TEXT_CHARS]
+    if len(text) > MAX_TEXT_CHARS:
+        body += "\n\n[Truncated]"
+    return f"{label}: {path}\n```{language_tag_for_path(path)}\n{body}\n```"
+
+
+def normalize_mime_type(path: Path, detected_mime: str | None) -> str:
+    suffix_mime = EXTENSION_TO_MIME.get(path.suffix.lower())
+    if suffix_mime:
+        return suffix_mime
+    if detected_mime:
+        if detected_mime == "video/quicktime":
+            return "video/mov"
+        if detected_mime == "audio/x-wav":
+            return "audio/wav"
+        return detected_mime
+    guessed_mime, _ = mimetypes.guess_type(path.name)
+    if guessed_mime == "video/quicktime":
+        return "video/mov"
+    if guessed_mime == "audio/x-wav":
+        return "audio/wav"
+    return guessed_mime or "text/plain"
+
+
+def guess_mime_type(path: Path, data: bytes) -> str:
+    kind = filetype.guess(data)
+    return normalize_mime_type(path, kind.mime if kind else None)
+
+
+def is_inline_mime_type(mime_type: str) -> bool:
+    return (
+        mime_type.startswith("image/")
+        or mime_type == "application/pdf"
+        or mime_type in INLINE_VIDEO_MIME_TYPES
+        or mime_type in INLINE_AUDIO_MIME_TYPES
+    )
+
+
+def build_environment_context() -> str:
+    lines: list[str] = []
+    os_name = platform.system().strip()
+    os_version = platform.release().strip()
+    if os_name:
+        if os_version:
+            lines.append(f"Operating system: {os_name} ({os_version})")
+        else:
+            lines.append(f"Operating system: {os_name}")
+
+    cwd = str(Path.cwd())
+    if cwd:
+        lines.append(f"Working directory: {cwd}")
+
+    try:
+        repo_url = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        ).stdout.strip()
+        if repo_url:
+            lines.append(f"Repository: {repo_url}")
+    except Exception:
+        pass
+
+    if not lines:
+        return ""
+    return "\n# Environment\n\n" + "\n".join(lines) + "\n"
+
+
+def build_client() -> genai.Client:
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+
+    if project:
+        return genai.Client(vertexai=True, project=project, location=location)
+
+    return genai.Client()
+
+
+def build_parts(main_path: Path, objective: str, context: str, reference_files: list[Path]) -> list[types.Part]:
+    parts: list[types.Part] = []
+
+    def append_file(path: Path, label: str) -> None:
+        data = path.read_bytes()
+        mime_type = guess_mime_type(path, data)
+        if is_inline_mime_type(mime_type):
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+        else:
+            parts.append(
+                types.Part.from_text(
+                    text=format_text_payload(path, data.decode("utf-8", errors="replace"), label)
+                )
+            )
+
+    append_file(main_path, "File")
+
+    for reference_file in reference_files:
+        append_file(reference_file, "Reference file")
+
+    parts.append(
+        types.Part.from_text(
+            text=f"{context}\n\nAnalyze this file with the following objective:\n\n{objective}"
+        )
+    )
+    return parts
+
+
+def extract_response_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    chunks: list[str] = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text.strip():
+                chunks.append(part_text.strip())
+
+    return "\n\n".join(chunks).strip()
+
+
+def analyze_file(main_path: Path, objective: str, context: str, reference_files: list[Path]) -> str:
+    client = build_client()
+    contents = [types.Content(role="user", parts=build_parts(main_path, objective, context, reference_files))]
+    config = types.GenerateContentConfig(
+        systemInstruction=SYSTEM_PROMPT + build_environment_context(),
+        maxOutputTokens=MAX_OUTPUT_TOKENS,
+        temperature=1,
+    )
+    response = client.models.generate_content(
+        model=DEFAULT_MODEL,
+        contents=contents,
+        config=config,
+    )
+    result = extract_response_text(response)
+    if not result:
+        fail("No response from analysis")
+    return result
+
+
+def run_tool() -> None:
+    try:
+        input_data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        fail(f"Invalid JSON input: {exc}")
+
+    path = ensure_regular_file(normalize_local_path(ensure_non_empty_string(input_data.get("path"), "path")))
+    objective = ensure_non_empty_string(input_data.get("objective"), "objective")
+    context = ensure_non_empty_string(input_data.get("context"), "context")
+    reference_files = [
+        ensure_regular_file(normalize_local_path(raw_path))
+        for raw_path in ensure_string_list(input_data.get("referenceFiles"), "referenceFiles")
+    ]
+
+    try:
+        print(analyze_file(path, objective, context, reference_files))
+    except Exception as exc:
+        fail(f"Failed to analyze file: {exc}")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print(f"Usage: {TOOL_NAME} [description|run]", file=sys.stderr)
+        sys.exit(1)
+
+    command = sys.argv[1]
+    if command == "description":
+        print(json.dumps(get_description(), indent=2))
+    elif command == "run":
+        run_tool()
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
