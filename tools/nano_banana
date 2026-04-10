@@ -19,7 +19,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-TOOL_NAME = "nano-banana"
+TOOL_NAME = "nano_banana"
 DESCRIPTION = "Generate an image from a prompt using Google Gemini Nano Banana and save it under $HOME/.cache/nano-banana."
 DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
