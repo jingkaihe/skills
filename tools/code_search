@@ -1,0 +1,225 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+
+import json
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+
+DESCRIPTION = {
+    "name": "code_search",
+    "description": (
+        "Intelligently search your codebase: use it for complex, multi-step "
+        "search tasks where you need to find code based on functionality or "
+        "concepts rather than exact matches. Use this when you would otherwise "
+        "chain multiple grep calls. Best for behavior/concept questions, "
+        "correlating multiple areas of the codebase, or filtering broad terms "
+        "by context. Be specific and goal-oriented in the query."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "A precise engineering search request. Be specific and include "
+                    "technical terms, file types, APIs, code patterns, or success "
+                    "criteria so the agent knows when it has found the right code."
+                ),
+            },
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Optional directory to search from. Defaults to the current "
+                    "working directory. Relative paths are resolved against the "
+                    "current working directory."
+                ),
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "Maximum number of search turns to suggest to the subagent. Defaults to 3.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
+def emit_json(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def emit_error(message: str) -> int:
+    emit_json({"error": message})
+    return 0
+
+
+def resolve_search_cwd(raw_cwd: object) -> Path:
+    if raw_cwd is None:
+        return Path.cwd().resolve()
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+        raise ValueError("cwd must be a non-empty string when provided")
+
+    candidate = Path(raw_cwd).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+
+    resolved = candidate.resolve()
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd is not a directory: {resolved}")
+    return resolved
+
+
+def resolve_max_turns(raw_value: object) -> int:
+    if raw_value is None:
+        return 3
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        raise ValueError("max_turns must be an integer")
+    if raw_value < 1:
+        raise ValueError("max_turns must be at least 1")
+    return raw_value
+
+
+def build_sysprompt(max_turns: int) -> str:
+    return textwrap.dedent(
+        f"""\
+        You are a fast, parallel code search agent.
+        {{include "templates/sections/context_runtime.tmpl" .}}
+
+        ## Goal
+        - Use only `grep_tool`, `glob_tool`, and `file_read`.
+        - Find the most relevant files and line ranges for the user's request.
+        - Search efficiently; do not explore the whole repo or write a long essay.
+        - Always finish with a final assistant message, not raw tool output.
+
+        ## Search Strategy
+        - Maximize parallelism with diverse, scoped searches whenever possible.
+        - Try to finish within {max_turns} turns and stop once you have enough evidence.
+        - Prioritize source code over documentation unless the query is explicitly about docs.
+        - Be exhaustive when the request implies completeness, such as all usages, call sites, or implementations.
+        - Prefer `grep_tool` first and narrow globs to likely directories. Avoid repeated repo-wide scans.
+        - Read candidate files to confirm relevance before returning them.
+
+        ## Response
+        - Start with a 1 or 2 line summary.
+        - Then list the relevant files as markdown links in this format: `[relativePath#L{{start}}-L{{end}}](file://{{absolutePath}}#L{{start}}-L{{end}})`
+        - Include useful line ranges that cover the full relevant function, method, class, or block with a little context.
+        - If nothing relevant is found, say so briefly instead of guessing.
+        - On your last turn, stop searching and provide the best final answer you have.
+        """
+    )
+
+
+def build_kodelet_args(
+    query: str, search_cwd: Path, sysprompt_path: Path
+) -> list[str]:
+    return [
+        "kodelet",
+        "run",
+        "--result-only",
+        "--as-subagent",
+        "--use-weak-model",
+        "--no-skills",
+        "--disable-subagent",
+        "--disable-fs-search-tools=false",
+        "--no-workflows",
+        "--no-hooks",
+        "--no-mcp",
+        "--log-level",
+        "error",
+        "--tool-mode",
+        "full",
+        "--allowed-tools",
+        "file_read,grep_tool,glob_tool",
+        "--sysprompt",
+        str(sysprompt_path),
+        "--cwd",
+        str(search_cwd),
+        query,
+    ]
+
+
+def run_code_search(raw_input: str) -> int:
+    try:
+        payload = json.loads(raw_input or "{}")
+    except json.JSONDecodeError as exc:
+        return emit_error(f"Invalid JSON input: {exc}")
+
+    if not isinstance(payload, dict):
+        return emit_error("Input must be a JSON object")
+
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return emit_error("query is required and must be a non-empty string")
+
+    try:
+        search_cwd = resolve_search_cwd(payload.get("cwd"))
+        max_turns = resolve_max_turns(payload.get("max_turns"))
+    except ValueError as exc:
+        return emit_error(str(exc))
+
+    sysprompt_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tmpl", encoding="utf-8", delete=False
+        ) as handle:
+            handle.write(build_sysprompt(max_turns))
+            sysprompt_path = Path(handle.name)
+
+        completed = subprocess.run(
+            build_kodelet_args(
+                query=query.strip(),
+                search_cwd=search_cwd,
+                sysprompt_path=sysprompt_path,
+            ),
+            cwd=str(search_cwd),
+            capture_output=True,
+            text=True,
+            timeout=110,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return emit_error("code_search timed out while waiting for kodelet to finish")
+    except OSError as exc:
+        return emit_error(f"Failed to execute kodelet: {exc}")
+    finally:
+        if sysprompt_path is not None:
+            try:
+                sysprompt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    if completed.returncode != 0:
+        details = stdout or stderr or f"exit status {completed.returncode}"
+        return emit_error(f"code_search failed: {details}")
+
+    if not stdout:
+        return emit_error("code_search returned an empty response")
+
+    print(stdout)
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2 or argv[1] not in {"description", "run"}:
+        print("Usage: code_search [description|run]", file=sys.stderr)
+        return 1
+
+    if argv[1] == "description":
+        emit_json(DESCRIPTION)
+        return 0
+
+    return run_code_search(sys.stdin.read())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
