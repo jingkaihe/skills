@@ -21,7 +21,6 @@ A collection of CLI tool skill definitions for AI assistants.
 | Recipe | Description |
 |--------|-------------|
 | [code/architect](./recipes/code/architect.md) | Analyzes codebase patterns and designs architectural solutions with implementation blueprints |
-| [code/explorer](./recipes/code/explorer.md) | Explores and explains a codebase to help understand how it works |
 | [code/reviewer](./recipes/code/reviewer.md) | Performs a comprehensive code review of changes with focus on quality, security, and best practices |
 | [ralph/init](./recipes/ralph/init.md) | Generate a PRD (Product Requirements Document) based on discussion and design docs for autonomous development |
 | [ralph/iterate](./recipes/ralph/iterate.md) | Iteratively work through a feature list, implementing one feature at a time with progress tracking |
