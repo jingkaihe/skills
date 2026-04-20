@@ -198,7 +198,7 @@ If the Bash version starts needing real parsing, HTTP calls, multiple data struc
 
 1. Create the parent tools directory if it does not exist.
 2. Write the executable directly to the final path.
-3. Make it executable with `chmod +x`.
+3. Make it executable with `chmod +x <tool-path>`.
 4. Keep the tool focused on one job.
 5. Use task-specific parameters instead of a vague catch-all schema.
 6. Return structured, useful output.
@@ -211,6 +211,7 @@ If the Bash version starts needing real parsing, HTTP calls, multiple data struc
 After creating the tool, always run all three checks:
 
 ```bash
+chmod +x <tool-path>
 <tool-path> description
 echo '<valid-json>' | <tool-path> run
 echo '{}' | <tool-path> run
