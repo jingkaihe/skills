@@ -7,6 +7,7 @@ A collection of CLI tool skill definitions for AI assistants.
 | Skill | Description |
 |-------|-------------|
 | [ast-grep](./skills/ast-grep/SKILL.md) | Structural code search with ast-grep using AST-aware patterns |
+| [custom-tool](./skills/custom-tool/SKILL.md) | Create Kodelet custom executable tools implementing the `description`/`run` protocol |
 | [google-workspace](./skills/google-workspace/SKILL.md) | Google Workspace MCP integration - Gmail search, email management, attachments, and contacts |
 | [librarian](./skills/librarian/SKILL.md) | Maintain a local cache of remote Git repositories for code research and exploration |
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | Manage iCloud calendars, events, and email via the CLI |
@@ -36,11 +37,11 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 ## Installation
 
 ```bash
-# Install all skills to the global kodelet skills directory
-kodelet skill add jingkaihe/skills -g
+# Install this plugin repository globally
+kodelet plugin add jingkaihe/skills -g
 
-# Install a specific skill to the global kodelet skills directory
-kodelet skill add jingkaihe/skills -d waitrose-cli -g
+# Install locally for the current repo
+kodelet plugin add jingkaihe/skills
 ```
 
 ## Usage
