@@ -21,11 +21,15 @@ The wrapper executes a uv project in `skills/schedule`, so dependencies are decl
 | `get NAME` | Get one schedule by name |
 | `create NAME --when WHEN --instruction INSTRUCTION` | Create or replace a schedule |
 | `delete NAME` | Delete one schedule by name |
+| `start` | Install and start a persistent user-level scheduler daemon |
+| `status` | Show daemon, dispatcher, and schedule counts |
 
 Examples:
 
 ```bash
 skills/schedule/scripts/agentic-schedule list
+skills/schedule/scripts/agentic-schedule status
+skills/schedule/scripts/agentic-schedule start
 skills/schedule/scripts/agentic-schedule get daily-repo-health
 skills/schedule/scripts/agentic-schedule delete daily-repo-health
 ```
@@ -81,15 +85,17 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 
 ## Dispatcher behavior
 
-- Creating an enabled schedule starts the background dispatcher automatically; there is no separate start command in normal use.
-- `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot or if the user asks to make sure scheduling is active.
+- Run `skills/schedule/scripts/agentic-schedule start` to install and start a persistent user-level daemon. This uses `systemd --user` on Linux or LaunchAgents on macOS and does not require sudo.
+- Use `skills/schedule/scripts/agentic-schedule status` to inspect daemon state, dispatcher state, and active schedule counts.
+- Creating an enabled schedule still starts a background dispatcher opportunistically if no daemon is running.
+- `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot if a daemon has not been installed yet.
 - Schedules have a fixed execution deadline of 10 minutes. If the dispatcher notices a run more than 10 minutes after its scheduled time, it marks that occurrence `skipped` instead of executing stale work.
 - State lives under the scheduler state directory by default.
-- Set `KODELET_SCHEDULE_DIR` to use a specific state directory.
-- Set `KODELET_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 30 seconds.
+- Set `AGENTIC_SCHEDULE_DIR` to use a specific state directory.
+- Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 30 seconds.
 - Run logs are stored under the scheduler state directory in `logs/<schedule-name>/`.
 
-The dispatcher is a user-level background process, not a system service. If the machine reboots, invoke `skills/schedule/scripts/agentic-schedule list` or create/update any schedule to restart it.
+For reliable reboot/login behavior, install the user-level daemon with `start`.
 
 ## Output and secrets
 

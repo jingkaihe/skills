@@ -17,8 +17,8 @@ def utc(value: str) -> datetime:
 
 @pytest.fixture(autouse=True)
 def isolated_schedule_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("KODELET_SCHEDULE_DIR", str(tmp_path))
-    monkeypatch.setenv("KODELET_SCHEDULE_DISABLE_DISPATCHER", "1")
+    monkeypatch.setenv("AGENTIC_SCHEDULE_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENTIC_SCHEDULE_DISABLE_DISPATCHER", "1")
     monkeypatch.setenv("TZ", "UTC")
 
 
@@ -167,6 +167,101 @@ def test_cli_create_uses_click_options(capsys):
     payload = json.loads(result.output)
     assert payload["schedule"]["name"] == "cli-demo"
     assert payload["schedule"]["environment"] == {"TOKEN": "<redacted>"}
+
+
+
+def test_status_payload_reports_service_and_dispatcher(monkeypatch):
+    monkeypatch.setattr(core, "service_status", lambda: {"manager": "test", "installed": True})
+
+    payload = core.status_payload()
+
+    assert payload["status"] == "success"
+    assert payload["dispatcher"]["running"] is False
+    assert payload["service"] == {"manager": "test", "installed": True}
+    assert payload["total_count"] == 0
+    assert payload["active_count"] == 0
+
+
+def test_current_command_prefers_uv_project_when_wrapper_is_unset(monkeypatch):
+    monkeypatch.delenv("AGENTIC_SCHEDULE_WRAPPER", raising=False)
+    monkeypatch.setattr(core.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    command = core.current_command()
+
+    assert command[:3] == ["/usr/bin/uv", "run", "--project"]
+    assert command[-1] == "agentic-schedule"
+    assert ".venv" not in " ".join(command)
+
+
+def test_systemd_daemon_writes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+    monkeypatch.setenv("AGENTIC_SCHEDULE_WRAPPER", "/example/agentic-schedule")
+
+    result = core.start_systemd_daemon()
+
+    assert result["installed"] is True
+    unit_text = core.systemd_unit_path().read_text(encoding="utf-8")
+    assert "ExecStart=/example/agentic-schedule dispatch-loop --daemon" in unit_text
+    assert "Restart=always" in unit_text
+    assert commands == [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", core.SYSTEMD_UNIT_NAME],
+    ]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_launchd_daemon_writes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch):
+    monkeypatch.setattr(core.Path, "home", staticmethod(lambda: tmp_path))
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+    monkeypatch.setenv("AGENTIC_SCHEDULE_WRAPPER", "/example/agentic-schedule")
+
+    result = core.start_launchd_daemon()
+
+    assert result["installed"] is True
+    plist = core.plistlib.loads(core.launchd_plist_path().read_bytes())
+    assert plist["Label"] == core.LAUNCHD_LABEL
+    assert plist["ProgramArguments"] == ["/example/agentic-schedule", "dispatch-loop", "--daemon"]
+    assert plist["KeepAlive"] is True
+    assert commands == [
+        ["launchctl", "bootstrap", f"gui/{core.os.getuid()}", str(core.launchd_plist_path())],
+        ["launchctl", "kickstart", "-k", f"gui/{core.os.getuid()}/{core.LAUNCHD_LABEL}"],
+    ]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_cli_status_outputs_status_payload(monkeypatch):
+    monkeypatch.setattr(core, "status_payload", lambda: {"status": "success", "service": {"installed": True}})
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["status"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"status": "success", "service": {"installed": True}}
+
+
+def test_cli_start_invokes_daemon_start(monkeypatch):
+    monkeypatch.setattr(core, "start_daemon", lambda: {"installed": True, "manager": "systemd"})
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["start"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "success"
+    assert payload["daemon"] == {"installed": True, "manager": "systemd"}
 
 
 def test_run_record_writes_json_logs_and_updates_schedule(tmp_path, monkeypatch):

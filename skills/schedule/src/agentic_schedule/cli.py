@@ -12,6 +12,10 @@ def emit_payload(handler: Any, payload: dict[str, Any]) -> None:
     raise SystemExit(handler(json.dumps(payload)))
 
 
+def echo_json(payload: dict[str, Any]) -> None:
+    click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def parse_env(values: tuple[str, ...]) -> dict[str, str]:
     environment: dict[str, str] = {}
     for value in values:
@@ -94,9 +98,23 @@ def delete_command(name: str, missing_ok: bool) -> None:
     emit_payload(core.delete_schedule_tool, {"name": name, "missing_ok": missing_ok})
 
 
+@main.command("start")
+def start_command() -> None:
+    """Install and start the user-level daemon/service."""
+    payload = core.start_daemon()
+    echo_json({"status": "success" if payload.get("installed") else "error", "daemon": payload})
+
+
+@main.command("status")
+def status_command() -> None:
+    """Show dispatcher and daemon status."""
+    echo_json(core.status_payload())
+
+
 @main.command("dispatch-loop", hidden=True)
-def dispatch_loop_command() -> None:
-    raise SystemExit(core.dispatcher_loop())
+@click.option("--daemon", is_flag=True, help="Run forever even when no schedules are active.")
+def dispatch_loop_command(daemon: bool) -> None:
+    raise SystemExit(core.dispatcher_loop(daemon=daemon))
 
 
 @main.command("run-record", hidden=True)

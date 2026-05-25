@@ -5,8 +5,10 @@ import copy
 import json
 import logging
 import os
+import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +35,11 @@ STATE_VERSION = 1
 DEFAULT_KODELET_FLAGS = ["--headless"]
 DEFAULT_POLL_SECONDS = 30
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 10 * 60
+SERVICE_NAME = "agentic-schedule"
+SYSTEMD_UNIT_NAME = f"{SERVICE_NAME}.service"
+LAUNCHD_LABEL = "com.agentic-schedule.dispatcher"
+SCHEDULE_ENV_KEYS = ("AGENTIC_SCHEDULE_DIR", "AGENTIC_SCHEDULE_POLL_SECONDS")
+LEGACY_SCHEDULE_ENV_KEYS = ("KODELET_SCHEDULE_DIR", "KODELET_SCHEDULE_POLL_SECONDS")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 INTERVAL_RE = re.compile(r"^every\s+(.+?)(?:\s+starting\s+(.+))?$", re.IGNORECASE)
 CONTEXT_ENV_KEYS = {
@@ -137,9 +144,9 @@ def reject_unknown_keys(payload: dict[str, Any], allowed_keys: set[str]) -> None
 
 
 def schedule_dir() -> Path:
-    raw_path = os.environ.get("KODELET_SCHEDULE_DIR") or os.environ.get("CUSTOM_TOOL_SCHEDULE_DIR")
+    raw_path = os.environ.get("AGENTIC_SCHEDULE_DIR") or os.environ.get("KODELET_SCHEDULE_DIR") or os.environ.get("CUSTOM_TOOL_SCHEDULE_DIR")
     if not raw_path:
-        return Path.home() / ".kodelet" / "schedules"
+        return Path.home() / ".agentic-schedule"
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -702,8 +709,239 @@ def dispatcher_status() -> dict[str, Any]:
     return status
 
 
+def service_log_file() -> Path:
+    return schedule_dir() / "service.log"
+
+
+def service_error_log_file() -> Path:
+    return schedule_dir() / "service.err.log"
+
+
+def detect_service_manager() -> str | None:
+    if sys.platform == "darwin" and shutil.which("launchctl"):
+        return "launchd"
+    if shutil.which("systemctl"):
+        return "systemd"
+    return None
+
+
+def systemd_user_dir() -> Path:
+    raw_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if raw_config_home:
+        return Path(raw_config_home).expanduser() / "systemd" / "user"
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def systemd_unit_path() -> Path:
+    return systemd_user_dir() / SYSTEMD_UNIT_NAME
+
+
+def launchd_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def launchd_plist_path() -> Path:
+    return launchd_agents_dir() / f"{LAUNCHD_LABEL}.plist"
+
+
+def current_command() -> list[str]:
+    wrapper = os.environ.get("AGENTIC_SCHEDULE_WRAPPER")
+    if wrapper:
+        return [wrapper]
+    project_dir = Path(__file__).resolve().parents[2]
+    uv_binary = shutil.which("uv") or "uv"
+    if (project_dir / "pyproject.toml").exists():
+        return [uv_binary, "run", "--project", str(project_dir), "agentic-schedule"]
+    return [sys.executable, "-m", "agentic_schedule.cli"]
+
+
+def service_environment() -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for key in (*SCHEDULE_ENV_KEYS, *LEGACY_SCHEDULE_ENV_KEYS):
+        if key in os.environ:
+            environment[key] = os.environ[key]
+    return environment
+
+
+def systemd_unit_content() -> str:
+    schedule_dir().mkdir(parents=True, exist_ok=True)
+    environment = service_environment()
+    environment_lines = "".join(f"Environment={shlex.quote(f'{key}={value}')}\n" for key, value in sorted(environment.items()))
+    command = shlex.join([*current_command(), "dispatch-loop", "--daemon"])
+    return (
+        "[Unit]\n"
+        "Description=Agentic schedule dispatcher\n"
+        "After=default.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={command}\n"
+        "Restart=always\n"
+        "RestartSec=10\n"
+        f"WorkingDirectory={shlex.quote(str(Path.cwd()))}\n"
+        f"StandardOutput=append:{service_log_file()}\n"
+        f"StandardError=append:{service_error_log_file()}\n"
+        f"{environment_lines}"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def run_command(command: list[str]) -> tuple[int, str, str]:
+    completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def start_systemd_daemon() -> dict[str, Any]:
+    unit_path = systemd_unit_path()
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(systemd_unit_content(), encoding="utf-8")
+
+    commands = [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
+    ]
+    results = []
+    for command in commands:
+        return_code, stdout, stderr = run_command(command)
+        results.append({"command": command, "return_code": return_code, "stdout": stdout, "stderr": stderr})
+        if return_code != 0:
+            return {
+                "installed": False,
+                "manager": "systemd",
+                "unit_path": str(unit_path),
+                "error": stderr or stdout or f"command failed: {shlex.join(command)}",
+                "commands": results,
+            }
+
+    return {"installed": True, "manager": "systemd", "unit_path": str(unit_path), "commands": results}
+
+
+def launchd_plist_payload() -> dict[str, Any]:
+    schedule_dir().mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [*current_command(), "dispatch-loop", "--daemon"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "WorkingDirectory": str(Path.cwd()),
+        "StandardOutPath": str(service_log_file()),
+        "StandardErrorPath": str(service_error_log_file()),
+    }
+    environment = service_environment()
+    if environment:
+        payload["EnvironmentVariables"] = environment
+    return payload
+
+
+def start_launchd_daemon() -> dict[str, Any]:
+    plist_path = launchd_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with plist_path.open("wb") as handle:
+        plistlib.dump(launchd_plist_payload(), handle, sort_keys=True)
+
+    commands = []
+    bootstrap = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]
+    return_code, stdout, stderr = run_command(bootstrap)
+    commands.append({"command": bootstrap, "return_code": return_code, "stdout": stdout, "stderr": stderr})
+    if return_code != 0 and "already bootstrapped" not in stderr.lower() and "service already loaded" not in stderr.lower():
+        return {
+            "installed": False,
+            "manager": "launchd",
+            "plist_path": str(plist_path),
+            "error": stderr or stdout or f"command failed: {shlex.join(bootstrap)}",
+            "commands": commands,
+        }
+
+    kickstart = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"]
+    return_code, stdout, stderr = run_command(kickstart)
+    commands.append({"command": kickstart, "return_code": return_code, "stdout": stdout, "stderr": stderr})
+    if return_code != 0:
+        return {
+            "installed": False,
+            "manager": "launchd",
+            "plist_path": str(plist_path),
+            "error": stderr or stdout or f"command failed: {shlex.join(kickstart)}",
+            "commands": commands,
+        }
+
+    return {"installed": True, "manager": "launchd", "plist_path": str(plist_path), "commands": commands}
+
+
+def start_daemon() -> dict[str, Any]:
+    manager = detect_service_manager()
+    if manager == "systemd":
+        return start_systemd_daemon()
+    if manager == "launchd":
+        return start_launchd_daemon()
+    return {
+        "installed": False,
+        "manager": None,
+        "error": "no supported user service manager found; expected systemd --user on Linux or launchd on macOS",
+    }
+
+
+def systemd_service_status() -> dict[str, Any]:
+    unit_path = systemd_unit_path()
+    status: dict[str, Any] = {"manager": "systemd", "unit_path": str(unit_path), "installed": unit_path.exists()}
+    if not shutil.which("systemctl"):
+        status["available"] = False
+        return status
+    status["available"] = True
+    for field, command in {
+        "active_state": ["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME],
+        "enabled_state": ["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME],
+    }.items():
+        return_code, stdout, stderr = run_command(command)
+        status[field] = stdout or stderr or "unknown"
+        status[f"{field}_return_code"] = return_code
+    return status
+
+
+def launchd_service_status() -> dict[str, Any]:
+    plist_path = launchd_plist_path()
+    status: dict[str, Any] = {"manager": "launchd", "plist_path": str(plist_path), "installed": plist_path.exists()}
+    if not shutil.which("launchctl"):
+        status["available"] = False
+        return status
+    status["available"] = True
+    command = ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"]
+    return_code, stdout, stderr = run_command(command)
+    status["loaded"] = return_code == 0
+    status["return_code"] = return_code
+    status["details"] = stdout if return_code == 0 else stderr
+    return status
+
+
+def service_status() -> dict[str, Any]:
+    if sys.platform == "darwin":
+        return launchd_service_status()
+    return systemd_service_status()
+
+
+def status_payload() -> dict[str, Any]:
+    try:
+        with state_lock():
+            state = load_state_unlocked()
+            total_count = len(state.get("schedules", {}))
+            active_count = active_schedule_count(state)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    return {
+        "status": "success",
+        "schedule_file": str(schedule_file()),
+        "dispatcher": dispatcher_status(),
+        "service": service_status(),
+        "total_count": total_count,
+        "active_count": active_count,
+    }
+
+
 def dispatcher_disabled() -> bool:
-    return os.environ.get("KODELET_SCHEDULE_DISABLE_DISPATCHER", "").strip().lower() in {"1", "true", "yes", "on"}
+    raw_value = os.environ.get("AGENTIC_SCHEDULE_DISABLE_DISPATCHER") or os.environ.get("KODELET_SCHEDULE_DISABLE_DISPATCHER", "")
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def clean_env() -> dict[str, str]:
@@ -717,7 +955,7 @@ def ensure_dispatcher_running() -> dict[str, Any]:
     if dispatcher_disabled():
         status = dispatcher_status()
         status["disabled"] = True
-        status["reason"] = "KODELET_SCHEDULE_DISABLE_DISPATCHER is set"
+        status["reason"] = "AGENTIC_SCHEDULE_DISABLE_DISPATCHER is set"
         return status
 
     with state_lock():
@@ -744,7 +982,7 @@ def ensure_dispatcher_running() -> dict[str, Any]:
 
 
 def poll_seconds() -> int:
-    raw_value = os.environ.get("KODELET_SCHEDULE_POLL_SECONDS", str(DEFAULT_POLL_SECONDS))
+    raw_value = os.environ.get("AGENTIC_SCHEDULE_POLL_SECONDS") or os.environ.get("KODELET_SCHEDULE_POLL_SECONDS", str(DEFAULT_POLL_SECONDS))
     try:
         return max(1, int(raw_value))
     except ValueError:
@@ -916,7 +1154,7 @@ def dispatch_due_schedules() -> tuple[int, int]:
     return len(due_runs), active_count
 
 
-def dispatcher_loop() -> int:
+def dispatcher_loop(daemon: bool = False) -> int:
     own_pid = os.getpid()
     schedule_dir().mkdir(parents=True, exist_ok=True)
     with state_lock():
@@ -933,7 +1171,7 @@ def dispatcher_loop() -> int:
                 due_count, active_count = dispatch_due_schedules()
                 if due_count:
                     logger().info("schedules_dispatched", due_count=due_count, active_count=active_count)
-                if active_count == 0:
+                if active_count == 0 and not daemon:
                     logger().info("dispatcher_exiting", reason="no_active_schedules")
                     return 0
             except Exception as exc:  # Keep the scheduler alive after per-iteration failures.
