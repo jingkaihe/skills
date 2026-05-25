@@ -105,6 +105,20 @@ def start_command() -> None:
     echo_json({"status": "success" if payload.get("installed") else "error", "daemon": payload})
 
 
+@main.command("stop")
+def stop_command() -> None:
+    """Stop the user-level daemon/service without removing its config."""
+    payload = core.stop_daemon()
+    echo_json({"status": "success" if payload.get("stopped") else "error", "daemon": payload})
+
+
+@main.command("uninstall")
+def uninstall_command() -> None:
+    """Stop and remove the user-level daemon/service config."""
+    payload = core.uninstall_daemon()
+    echo_json({"status": "success" if payload.get("uninstalled") else "error", "daemon": payload})
+
+
 @main.command("status")
 def status_command() -> None:
     """Show dispatcher and daemon status."""

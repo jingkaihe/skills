@@ -22,6 +22,8 @@ The wrapper executes a uv project in `skills/schedule`, so dependencies are decl
 | `create NAME --when WHEN --instruction INSTRUCTION` | Create or replace a schedule |
 | `delete NAME` | Delete one schedule by name |
 | `start` | Install and start a persistent user-level scheduler daemon |
+| `stop` | Stop the scheduler daemon without removing its user-level config |
+| `uninstall` | Stop the scheduler daemon and remove its user-level config |
 | `status` | Show daemon, dispatcher, and schedule counts |
 
 Examples:
@@ -30,6 +32,8 @@ Examples:
 skills/schedule/scripts/agentic-schedule list
 skills/schedule/scripts/agentic-schedule status
 skills/schedule/scripts/agentic-schedule start
+skills/schedule/scripts/agentic-schedule stop
+skills/schedule/scripts/agentic-schedule uninstall
 skills/schedule/scripts/agentic-schedule get daily-repo-health
 skills/schedule/scripts/agentic-schedule delete daily-repo-health
 ```
@@ -87,6 +91,8 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 
 - Run `skills/schedule/scripts/agentic-schedule start` to install and start a persistent user-level daemon. This uses `systemd --user` on Linux or LaunchAgents on macOS and does not require sudo.
 - Use `skills/schedule/scripts/agentic-schedule status` to inspect daemon state, dispatcher state, and active schedule counts.
+- Use `skills/schedule/scripts/agentic-schedule stop` to stop the daemon while keeping its config installed.
+- Use `skills/schedule/scripts/agentic-schedule uninstall` to stop the daemon and remove its user-level config. This does not delete stored schedules or logs.
 - Creating an enabled schedule still starts a background dispatcher opportunistically if no daemon is running.
 - `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot if a daemon has not been installed yet.
 - Schedules have a fixed execution deadline of 10 minutes. If the dispatcher notices a run more than 10 minutes after its scheduled time, it marks that occurrence `skipped` instead of executing stale work.

@@ -793,6 +793,23 @@ def run_command(command: list[str]) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 
+def service_already_absent(return_code: int, stdout: str, stderr: str) -> bool:
+    if return_code == 0:
+        return False
+    output = f"{stdout}\n{stderr}".lower()
+    return any(
+        phrase in output
+        for phrase in (
+            "could not be found",
+            "does not exist",
+            "not found",
+            "not loaded",
+            "no such process",
+            "service is not loaded",
+        )
+    )
+
+
 def start_systemd_daemon() -> dict[str, Any]:
     unit_path = systemd_unit_path()
     unit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -877,6 +894,111 @@ def start_daemon() -> dict[str, Any]:
         return start_launchd_daemon()
     return {
         "installed": False,
+        "manager": None,
+        "error": "no supported user service manager found; expected systemd --user on Linux or launchd on macOS",
+    }
+
+
+def stop_systemd_daemon() -> dict[str, Any]:
+    command = ["systemctl", "--user", "stop", SYSTEMD_UNIT_NAME]
+    return_code, stdout, stderr = run_command(command)
+    stopped = return_code == 0 or service_already_absent(return_code, stdout, stderr)
+    return {
+        "stopped": stopped,
+        "manager": "systemd",
+        "unit_path": str(systemd_unit_path()),
+        "commands": [{"command": command, "return_code": return_code, "stdout": stdout, "stderr": stderr}],
+        **({} if stopped else {"error": stderr or stdout or f"command failed: {shlex.join(command)}"}),
+    }
+
+
+def uninstall_systemd_daemon() -> dict[str, Any]:
+    results = []
+    success = True
+    error = None
+
+    disable_command = ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME]
+    return_code, stdout, stderr = run_command(disable_command)
+    results.append({"command": disable_command, "return_code": return_code, "stdout": stdout, "stderr": stderr})
+    if return_code != 0 and not service_already_absent(return_code, stdout, stderr):
+        success = False
+        error = stderr or stdout or f"command failed: {shlex.join(disable_command)}"
+
+    unit_path = systemd_unit_path()
+    removed = False
+    if unit_path.exists():
+        unit_path.unlink()
+        removed = True
+
+    reload_command = ["systemctl", "--user", "daemon-reload"]
+    return_code, stdout, stderr = run_command(reload_command)
+    results.append({"command": reload_command, "return_code": return_code, "stdout": stdout, "stderr": stderr})
+    if return_code != 0 and error is None:
+        success = False
+        error = stderr or stdout or f"command failed: {shlex.join(reload_command)}"
+
+    return {
+        "uninstalled": success,
+        "manager": "systemd",
+        "unit_path": str(unit_path),
+        "removed_unit": removed,
+        "commands": results,
+        **({} if success else {"error": error}),
+    }
+
+
+def stop_launchd_daemon() -> dict[str, Any]:
+    command = ["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"]
+    return_code, stdout, stderr = run_command(command)
+    already_stopped = service_already_absent(return_code, stdout, stderr)
+    stopped = return_code == 0 or already_stopped
+    return {
+        "stopped": stopped,
+        "manager": "launchd",
+        "plist_path": str(launchd_plist_path()),
+        "commands": [{"command": command, "return_code": return_code, "stdout": stdout, "stderr": stderr}],
+        **({} if stopped else {"error": stderr or stdout or f"command failed: {shlex.join(command)}"}),
+    }
+
+
+def uninstall_launchd_daemon() -> dict[str, Any]:
+    stop_result = stop_launchd_daemon()
+    plist_path = launchd_plist_path()
+    removed = False
+    if plist_path.exists():
+        plist_path.unlink()
+        removed = True
+    return {
+        "uninstalled": bool(stop_result.get("stopped")),
+        "manager": "launchd",
+        "plist_path": str(plist_path),
+        "removed_plist": removed,
+        "commands": stop_result.get("commands", []),
+        **({} if stop_result.get("stopped") else {"error": stop_result.get("error", "failed to stop launchd service")}),
+    }
+
+
+def stop_daemon() -> dict[str, Any]:
+    manager = detect_service_manager()
+    if manager == "systemd":
+        return stop_systemd_daemon()
+    if manager == "launchd":
+        return stop_launchd_daemon()
+    return {
+        "stopped": False,
+        "manager": None,
+        "error": "no supported user service manager found; expected systemd --user on Linux or launchd on macOS",
+    }
+
+
+def uninstall_daemon() -> dict[str, Any]:
+    manager = detect_service_manager()
+    if manager == "systemd":
+        return uninstall_systemd_daemon()
+    if manager == "launchd":
+        return uninstall_launchd_daemon()
+    return {
+        "uninstalled": False,
         "manager": None,
         "error": "no supported user service manager found; expected systemd --user on Linux or launchd on macOS",
     }

@@ -242,6 +242,94 @@ def test_launchd_daemon_writes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch
     assert all("sudo" not in command for command in commands for command in command)
 
 
+def test_stop_systemd_daemon_uses_user_service_and_no_sudo(monkeypatch):
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+
+    result = core.stop_systemd_daemon()
+
+    assert result["stopped"] is True
+    assert commands == [["systemctl", "--user", "stop", core.SYSTEMD_UNIT_NAME]]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_stop_systemd_daemon_is_idempotent_for_absent_service(monkeypatch):
+    monkeypatch.setattr(core, "run_command", lambda command: (1, "", f"Unit {core.SYSTEMD_UNIT_NAME} not loaded."))
+
+    result = core.stop_systemd_daemon()
+
+    assert result["stopped"] is True
+    assert "error" not in result
+
+
+def test_uninstall_systemd_daemon_removes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    unit_path = core.systemd_unit_path()
+    unit_path.parent.mkdir(parents=True)
+    unit_path.write_text("[Unit]\nDescription=test\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+
+    result = core.uninstall_systemd_daemon()
+
+    assert result["uninstalled"] is True
+    assert result["removed_unit"] is True
+    assert not unit_path.exists()
+    assert commands == [
+        ["systemctl", "--user", "disable", "--now", core.SYSTEMD_UNIT_NAME],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_stop_launchd_daemon_uses_user_agent_and_no_sudo(monkeypatch):
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+
+    result = core.stop_launchd_daemon()
+
+    assert result["stopped"] is True
+    assert commands == [["launchctl", "bootout", f"gui/{core.os.getuid()}/{core.LAUNCHD_LABEL}"]]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_uninstall_launchd_daemon_removes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch):
+    monkeypatch.setattr(core.Path, "home", staticmethod(lambda: tmp_path))
+    plist_path = core.launchd_plist_path()
+    plist_path.parent.mkdir(parents=True)
+    plist_path.write_text("plist", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> tuple[int, str, str]:
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(core, "run_command", fake_run_command)
+
+    result = core.uninstall_launchd_daemon()
+
+    assert result["uninstalled"] is True
+    assert result["removed_plist"] is True
+    assert not plist_path.exists()
+    assert commands == [["launchctl", "bootout", f"gui/{core.os.getuid()}/{core.LAUNCHD_LABEL}"]]
+    assert all("sudo" not in command for command in commands for command in command)
+
+
 def test_cli_status_outputs_status_payload(monkeypatch):
     monkeypatch.setattr(core, "status_payload", lambda: {"status": "success", "service": {"installed": True}})
     runner = CliRunner()
@@ -262,6 +350,30 @@ def test_cli_start_invokes_daemon_start(monkeypatch):
     payload = json.loads(result.output)
     assert payload["status"] == "success"
     assert payload["daemon"] == {"installed": True, "manager": "systemd"}
+
+
+def test_cli_stop_invokes_daemon_stop(monkeypatch):
+    monkeypatch.setattr(core, "stop_daemon", lambda: {"stopped": True, "manager": "systemd"})
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["stop"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "success"
+    assert payload["daemon"] == {"stopped": True, "manager": "systemd"}
+
+
+def test_cli_uninstall_invokes_daemon_uninstall(monkeypatch):
+    monkeypatch.setattr(core, "uninstall_daemon", lambda: {"uninstalled": True, "manager": "systemd"})
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["uninstall"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "success"
+    assert payload["daemon"] == {"uninstalled": True, "manager": "systemd"}
 
 
 def test_run_record_writes_json_logs_and_updates_schedule(tmp_path, monkeypatch):
