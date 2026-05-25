@@ -747,9 +747,6 @@ def launchd_plist_path() -> Path:
 
 
 def current_command() -> list[str]:
-    wrapper = os.environ.get("AGENTIC_SCHEDULE_WRAPPER")
-    if wrapper:
-        return [wrapper]
     project_dir = Path(__file__).resolve().parents[2]
     uv_binary = shutil.which("uv") or "uv"
     if (project_dir / "pyproject.toml").exists():

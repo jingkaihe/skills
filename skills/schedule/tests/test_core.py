@@ -277,8 +277,7 @@ def test_status_payload_reports_service_and_dispatcher(monkeypatch):
     assert payload["active_count"] == 0
 
 
-def test_current_command_prefers_uv_project_when_wrapper_is_unset(monkeypatch):
-    monkeypatch.delenv("AGENTIC_SCHEDULE_WRAPPER", raising=False)
+def test_current_command_prefers_uv_project(monkeypatch):
     monkeypatch.setattr(core.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
     command = core.current_command()
@@ -297,14 +296,16 @@ def test_systemd_daemon_writes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch)
         return 0, "", ""
 
     monkeypatch.setattr(core, "run_command", fake_run_command)
-    monkeypatch.setenv("AGENTIC_SCHEDULE_WRAPPER", "/example/agentic-schedule")
+    monkeypatch.setattr(core.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
     result = core.start_systemd_daemon()
 
     assert result["installed"] is True
     unit_text = core.systemd_unit_path().read_text(encoding="utf-8")
-    assert "ExecStart=/example/agentic-schedule dispatch-loop" in unit_text
+    assert "ExecStart=/usr/bin/uv run --project" in unit_text
+    assert "agentic-schedule dispatch-loop" in unit_text
     assert "--daemon" not in unit_text
+    assert ".venv" not in unit_text
     assert "Restart=always" in unit_text
     assert commands == [
         ["systemctl", "--user", "daemon-reload"],
@@ -322,14 +323,16 @@ def test_launchd_daemon_writes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch
         return 0, "", ""
 
     monkeypatch.setattr(core, "run_command", fake_run_command)
-    monkeypatch.setenv("AGENTIC_SCHEDULE_WRAPPER", "/example/agentic-schedule")
+    monkeypatch.setattr(core.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
     result = core.start_launchd_daemon()
 
     assert result["installed"] is True
     plist = core.plistlib.loads(core.launchd_plist_path().read_bytes())
     assert plist["Label"] == core.LAUNCHD_LABEL
-    assert plist["ProgramArguments"] == ["/example/agentic-schedule", "dispatch-loop"]
+    assert plist["ProgramArguments"][:3] == ["/usr/bin/uv", "run", "--project"]
+    assert plist["ProgramArguments"][-2:] == ["agentic-schedule", "dispatch-loop"]
+    assert ".venv" not in " ".join(plist["ProgramArguments"])
     assert plist["KeepAlive"] is True
     assert commands == [
         ["launchctl", "bootstrap", f"gui/{core.os.getuid()}", str(core.launchd_plist_path())],
