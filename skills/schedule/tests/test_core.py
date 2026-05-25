@@ -79,6 +79,47 @@ def test_create_rejects_invalid_retention(capsys):
     assert "invalid duration" in payload["error"]
 
 
+def test_create_does_not_start_dispatcher(capsys, monkeypatch):
+    def fail_dispatcher_start() -> dict[str, object]:
+        raise AssertionError("create must not start the dispatcher")
+
+    monkeypatch.setattr(core, "ensure_dispatcher_running", fail_dispatcher_start)
+
+    assert core.create_schedule_tool(json.dumps({"name": "passive-create", "instruction": "Say hello", "when": "now"})) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dispatcher"]["running"] is False
+
+
+def test_list_does_not_start_dispatcher(capsys, monkeypatch):
+    def fail_dispatcher_start() -> dict[str, object]:
+        raise AssertionError("list must not start the dispatcher")
+
+    monkeypatch.setattr(core, "ensure_dispatcher_running", fail_dispatcher_start)
+    schedule = core.build_schedule({"name": "passive-list", "instruction": "Say hello", "when": "now"})
+    with core.state_lock():
+        core.save_state_unlocked({"version": 1, "schedules": {"passive-list": schedule}})
+
+    assert core.list_schedule_tool("{}") == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["active_count"] == 1
+    assert payload["dispatcher"]["running"] is False
+
+
+def test_poll_seconds_defaults_to_five_seconds(monkeypatch):
+    monkeypatch.delenv("AGENTIC_SCHEDULE_POLL_SECONDS", raising=False)
+    monkeypatch.delenv("KODELET_SCHEDULE_POLL_SECONDS", raising=False)
+
+    assert core.poll_seconds() == 5
+
+
+def test_poll_seconds_invalid_value_uses_default(monkeypatch):
+    monkeypatch.setenv("AGENTIC_SCHEDULE_POLL_SECONDS", "invalid")
+
+    assert core.poll_seconds() == 5
+
+
 def test_prepare_due_runs_skips_stale_one_time_schedule():
     now = utc("2026-05-25T12:00:00Z")
     scheduled_for = now - timedelta(minutes=11)

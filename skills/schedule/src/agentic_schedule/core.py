@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - Python 3.11 includes zoneinfo.
 
 STATE_VERSION = 1
 DEFAULT_KODELET_FLAGS = ["--headless"]
-DEFAULT_POLL_SECONDS = 30
+DEFAULT_POLL_SECONDS = 5
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 10 * 60
 DEFAULT_RETENTION = "5d"
 DEFAULT_RETENTION_SECONDS = 5 * 24 * 60 * 60
@@ -561,16 +561,12 @@ def create_schedule_tool(raw_input: str) -> int:
         schedules[schedule["name"]] = schedule
         save_state_unlocked(state)
 
-    dispatcher = dispatcher_status()
-    if schedule["enabled"]:
-        dispatcher = ensure_dispatcher_running()
-
     emit_json(
         {
             "status": "success",
             "message": f"Schedule {schedule['name']} has been created",
             "schedule_file": str(schedule_file()),
-            "dispatcher": dispatcher,
+            "dispatcher": dispatcher_status(),
             "schedule": redact_schedule(schedule),
         }
     )
@@ -596,15 +592,11 @@ def list_schedule_tool(raw_input: str) -> int:
     except ValueError as exc:
         return emit_error(str(exc))
 
-    dispatcher = dispatcher_status()
-    if active_count > 0:
-        dispatcher = ensure_dispatcher_running()
-
     emit_json(
         {
             "status": "success",
             "schedule_file": str(schedule_file()),
-            "dispatcher": dispatcher,
+            "dispatcher": dispatcher_status(),
             "count": len(schedules),
             "active_count": active_count,
             "schedules": [redact_schedule(schedule, include_environment) for schedule in schedules],

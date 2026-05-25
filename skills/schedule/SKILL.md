@@ -17,7 +17,7 @@ The wrapper executes a uv project in `skills/schedule`, so dependencies are decl
 
 | Command | Purpose |
 | --- | --- |
-| `list` | List schedules and ensure the dispatcher is running when active schedules exist |
+| `list` | List schedules |
 | `get NAME` | Get one schedule by name |
 | `create NAME --when WHEN --instruction INSTRUCTION` | Create or replace a schedule |
 | `delete NAME` | Delete one schedule by name |
@@ -94,13 +94,12 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 - Use `skills/schedule/scripts/agentic-schedule status` to inspect daemon state, dispatcher state, and active schedule counts.
 - Use `skills/schedule/scripts/agentic-schedule stop` to stop the daemon while keeping its config installed.
 - Use `skills/schedule/scripts/agentic-schedule uninstall` to stop the daemon and remove its user-level config. This does not delete stored schedules or logs.
-- Creating an enabled schedule still starts a background dispatcher opportunistically if no daemon is running.
-- `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot if a daemon has not been installed yet.
+- Creating, listing, getting, and deleting schedules do not start the dispatcher. Use `start` to run due schedules.
 - Schedules have a fixed execution deadline of 10 minutes. If the dispatcher notices a run more than 10 minutes after its scheduled time, it marks that occurrence `skipped` instead of executing stale work.
 - Finished run records and logs are cleaned up according to each schedule's retention setting; new schedules default to `5d`.
 - State lives under the scheduler state directory by default.
 - Set `AGENTIC_SCHEDULE_DIR` to use a specific state directory.
-- Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 30 seconds.
+- Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 5 seconds.
 - Run logs are stored under the scheduler state directory in `logs/<schedule-name>/`.
 
 For reliable reboot/login behavior, install the user-level daemon with `start`.

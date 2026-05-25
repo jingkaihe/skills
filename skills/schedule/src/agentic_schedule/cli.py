@@ -35,7 +35,7 @@ def main() -> None:
 @click.option("--active-only", is_flag=True, help="Only include active schedules.")
 @click.option("--include-environment", is_flag=True, help="Include stored environment values instead of redacting them.")
 def list_command(active_only: bool, include_environment: bool) -> None:
-    """List schedules and ensure the dispatcher is running when needed."""
+    """List schedules."""
     emit_payload(
         core.list_schedule_tool,
         {
