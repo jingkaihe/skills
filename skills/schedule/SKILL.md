@@ -62,10 +62,22 @@ Use `skills/schedule/scripts/agentic-schedule create` with:
 
 The scheduler intentionally hides execution flags, so agents only need to decide the natural-language instruction and timing. Keep timing exclusively in `--when`; keep `--instruction` focused on the task itself.
 
-Instruction example:
+Instruction examples:
 
-```text
-Fetch the current top 10 news stories from bbc.com. Create a concise Markdown digest with each story's headline, a 1-2 sentence summary, and link. Publish the digest as ~/news/bbc-com-YY-MM-DD and include the path to the file in the final response.
+Good — timing is only in `--when`; `--instruction` contains only the work:
+
+```bash
+skills/schedule/scripts/agentic-schedule create bbc-news-digest \
+  --when "daily 09:00" \
+  --instruction "Fetch the top 10 stories from bbc.com. Create a concise Markdown digest with each headline, a 1-2 sentence summary and link. Write it to ~/news/bbc-com-YYYY-MM-DD."
+```
+
+Bad — the instruction repeats schedule/timing context:
+
+```bash
+skills/schedule/scripts/agentic-schedule create bbc-news-digest \
+  --when "daily 09:00" \
+  --instruction "At the scheduled time, fetch the top 10 stories from bbc.com. Create a concise Markdown digest with each headline, a 1-2 sentence summary and link. Write it to ~/news/bbc-com-YYYY-MM-DD."
 ```
 
 Supported `--when` formats:
