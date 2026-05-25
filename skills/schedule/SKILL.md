@@ -52,7 +52,7 @@ Use this skill when the user wants an agentic task to happen later or repeatedly
 Use `skills/schedule/scripts/agentic-schedule create` with:
 
 - positional `NAME`: stable snake/kebab/dot-style name using only letters, numbers, `.`, `_`, `-`.
-- `--instruction`: natural-language task for the scheduled agentic work.
+- `--instruction`: natural-language task for the scheduled agentic work. Put only the work to perform here; do not add any preamble about the schedule or timing.
 - `--when`: one of the supported schedule expressions below.
 - Optional `--timezone`: IANA name such as `America/New_York` for timezone-less times.
 - Optional `--working-directory`: where the scheduled task should run. Defaults to the current working directory.
@@ -60,7 +60,13 @@ Use `skills/schedule/scripts/agentic-schedule create` with:
 - Optional `--overwrite` to replace an existing schedule.
 - Optional repeated `--env KEY=VALUE` for extra environment variables.
 
-The scheduler intentionally hides execution flags, so agents only need to decide the natural-language instruction and timing.
+The scheduler intentionally hides execution flags, so agents only need to decide the natural-language instruction and timing. Keep timing exclusively in `--when`; keep `--instruction` focused on the task itself.
+
+Instruction example:
+
+```text
+Fetch the current top 10 news stories from bbc.com. Create a concise Markdown digest with each story's headline, a 1-2 sentence summary, and link. Publish the digest as ~/news/bbc-com-YY-MM-DD and include the path to the file in the final response.
+```
 
 Supported `--when` formats:
 
