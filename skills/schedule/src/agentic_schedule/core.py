@@ -769,7 +769,7 @@ def systemd_unit_content() -> str:
     schedule_dir().mkdir(parents=True, exist_ok=True)
     environment = service_environment()
     environment_lines = "".join(f"Environment={shlex.quote(f'{key}={value}')}\n" for key, value in sorted(environment.items()))
-    command = shlex.join([*current_command(), "dispatch-loop", "--daemon"])
+    command = shlex.join([*current_command(), "dispatch-loop"])
     return (
         "[Unit]\n"
         "Description=Agentic schedule dispatcher\n"
@@ -841,7 +841,7 @@ def launchd_plist_payload() -> dict[str, Any]:
     schedule_dir().mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [*current_command(), "dispatch-loop", "--daemon"],
+        "ProgramArguments": [*current_command(), "dispatch-loop"],
         "RunAtLoad": True,
         "KeepAlive": True,
         "WorkingDirectory": str(Path.cwd()),
@@ -1333,7 +1333,7 @@ def dispatch_due_schedules() -> tuple[int, int]:
     return len(due_runs), active_count
 
 
-def dispatcher_loop(daemon: bool = False) -> int:
+def dispatcher_loop() -> int:
     own_pid = os.getpid()
     schedule_dir().mkdir(parents=True, exist_ok=True)
     with state_lock():
@@ -1350,9 +1350,6 @@ def dispatcher_loop(daemon: bool = False) -> int:
                 due_count, active_count = dispatch_due_schedules()
                 if due_count:
                     logger().info("schedules_dispatched", due_count=due_count, active_count=active_count)
-                if active_count == 0 and not daemon:
-                    logger().info("dispatcher_exiting", reason="no_active_schedules")
-                    return 0
             except Exception as exc:  # Keep the scheduler alive after per-iteration failures.
                 logger().error("dispatcher_iteration_failed", error=str(exc))
             time.sleep(poll_seconds())

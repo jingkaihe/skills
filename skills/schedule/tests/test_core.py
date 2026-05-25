@@ -303,7 +303,8 @@ def test_systemd_daemon_writes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch)
 
     assert result["installed"] is True
     unit_text = core.systemd_unit_path().read_text(encoding="utf-8")
-    assert "ExecStart=/example/agentic-schedule dispatch-loop --daemon" in unit_text
+    assert "ExecStart=/example/agentic-schedule dispatch-loop" in unit_text
+    assert "--daemon" not in unit_text
     assert "Restart=always" in unit_text
     assert commands == [
         ["systemctl", "--user", "daemon-reload"],
@@ -328,7 +329,7 @@ def test_launchd_daemon_writes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch
     assert result["installed"] is True
     plist = core.plistlib.loads(core.launchd_plist_path().read_bytes())
     assert plist["Label"] == core.LAUNCHD_LABEL
-    assert plist["ProgramArguments"] == ["/example/agentic-schedule", "dispatch-loop", "--daemon"]
+    assert plist["ProgramArguments"] == ["/example/agentic-schedule", "dispatch-loop"]
     assert plist["KeepAlive"] is True
     assert commands == [
         ["launchctl", "bootstrap", f"gui/{core.os.getuid()}", str(core.launchd_plist_path())],

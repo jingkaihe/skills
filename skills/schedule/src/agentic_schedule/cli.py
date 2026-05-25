@@ -129,9 +129,8 @@ def status_command() -> None:
 
 
 @main.command("dispatch-loop", hidden=True)
-@click.option("--daemon", is_flag=True, help="Run forever even when no schedules are active.")
-def dispatch_loop_command(daemon: bool) -> None:
-    raise SystemExit(core.dispatcher_loop(daemon=daemon))
+def dispatch_loop_command() -> None:
+    raise SystemExit(core.dispatcher_loop())
 
 
 @main.command("run-record", hidden=True)
