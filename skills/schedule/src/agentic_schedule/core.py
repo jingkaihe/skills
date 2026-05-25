@@ -35,6 +35,8 @@ STATE_VERSION = 1
 DEFAULT_KODELET_FLAGS = ["--headless"]
 DEFAULT_POLL_SECONDS = 30
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 10 * 60
+DEFAULT_RETENTION = "5d"
+DEFAULT_RETENTION_SECONDS = 5 * 24 * 60 * 60
 SERVICE_NAME = "agentic-schedule"
 SYSTEMD_UNIT_NAME = f"{SERVICE_NAME}.service"
 LAUNCHD_LABEL = "com.agentic-schedule.dispatcher"
@@ -266,6 +268,10 @@ def parse_duration_seconds(raw_value: str) -> int:
     return seconds
 
 
+def parse_retention_seconds(raw_value: str) -> int:
+    return parse_duration_seconds(raw_value)
+
+
 def parse_datetime(raw_value: str, timezone_name: str | None, relative_base: datetime | None = None) -> datetime:
     value = raw_value.strip()
     if not value:
@@ -471,6 +477,8 @@ def build_schedule(payload: dict[str, Any]) -> dict[str, Any]:
     if working_directory is None:
         working_directory = os.environ.get("KODELET_WORKING_DIR") or os.getcwd()
     working_directory = str(Path(working_directory).expanduser())
+    retention = optional_string(payload, "retention", DEFAULT_RETENTION) or DEFAULT_RETENTION
+    retention_seconds = parse_retention_seconds(retention)
 
     now = format_dt(utc_now())
     status = "active" if enabled else "disabled"
@@ -491,6 +499,8 @@ def build_schedule(payload: dict[str, Any]) -> dict[str, Any]:
         "environment": validate_environment(payload.get("environment")),
         "next_run_at": format_dt(next_run_at),
         "execution_deadline_seconds": DEFAULT_EXECUTION_DEADLINE_SECONDS,
+        "retention": retention,
+        "retention_seconds": retention_seconds,
         "created_at": now,
         "updated_at": now,
         "run_count": 0,
@@ -534,7 +544,7 @@ def create_schedule_tool(raw_input: str) -> int:
         payload = load_payload(raw_input)
         reject_unknown_keys(
             payload,
-            {"name", "instruction", "when", "timezone", "working_directory", "environment", "overwrite", "enabled"},
+            {"name", "instruction", "when", "timezone", "working_directory", "environment", "overwrite", "enabled", "retention"},
         )
         schedule = build_schedule(payload)
         overwrite = optional_bool(payload, "overwrite", False)
@@ -1124,6 +1134,58 @@ def log_path_for(name: str, run_id: str) -> Path:
     return logs_dir() / name / f"{run_id}.log"
 
 
+def cleanup_empty_parent(path: Path, stop_at: Path) -> None:
+    current = path.parent
+    stop_at = stop_at.resolve()
+    while current.resolve() != stop_at and current.exists():
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def cleanup_finished_runs(state: dict[str, Any], now: datetime) -> int:
+    root = run_records_dir()
+    if not root.exists():
+        return 0
+
+    removed = 0
+    schedules = state.get("schedules", {})
+    if not isinstance(schedules, dict):
+        schedules = {}
+
+    for record_path in root.glob("*/*.json"):
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        name = str(record.get("name") or record_path.parent.name)
+        schedule = schedules.get(name)
+        if not isinstance(schedule, dict):
+            schedule = record.get("schedule") if isinstance(record.get("schedule"), dict) else {}
+        retention_seconds = int(schedule.get("retention_seconds") or DEFAULT_RETENTION_SECONDS)
+        finished_at = parse_utc(record.get("finished_at"))
+        if finished_at is None or finished_at > now - timedelta(seconds=retention_seconds):
+            continue
+
+        log_path = Path(str(record.get("log_path") or ""))
+        try:
+            record_path.unlink()
+            removed += 1
+            cleanup_empty_parent(record_path, root)
+        except FileNotFoundError:
+            pass
+        if log_path.exists():
+            try:
+                log_path.unlink()
+                cleanup_empty_parent(log_path, logs_dir())
+            except OSError:
+                pass
+
+    return removed
+
+
 def prepare_due_runs(state: dict[str, Any], now: datetime) -> tuple[list[dict[str, Any]], bool]:
     due_runs: list[dict[str, Any]] = []
     changed = False
@@ -1265,6 +1327,9 @@ def dispatch_due_schedules() -> tuple[int, int]:
     now = utc_now()
     with state_lock():
         state = load_state_unlocked()
+        removed_count = cleanup_finished_runs(state, now)
+        if removed_count:
+            logger().info("finished_run_retention_cleanup", removed_count=removed_count)
         due_runs, changed = prepare_due_runs(state, now)
         if changed:
             save_state_unlocked(state)
@@ -1321,18 +1386,26 @@ def build_kodelet_command(schedule: dict[str, Any]) -> list[str]:
 
 
 def mark_run_finished(name: str, run_id: str, exit_code: int, error: str | None = None) -> None:
+    finished_at = format_dt(utc_now())
     with state_lock():
         state = load_state_unlocked()
         schedule = state.get("schedules", {}).get(name)
         if isinstance(schedule, dict) and schedule.get("last_run_id") == run_id:
-            schedule["last_finished_at"] = format_dt(utc_now())
+            schedule["last_finished_at"] = finished_at
             schedule["last_run_status"] = "succeeded" if exit_code == 0 else "failed"
             schedule["last_exit_code"] = exit_code
             schedule["last_error"] = error
             if schedule.get("schedule", {}).get("kind") == "once":
                 schedule["status"] = "completed" if exit_code == 0 else "failed"
-            schedule["updated_at"] = format_dt(utc_now())
+            schedule["updated_at"] = finished_at
             save_state_unlocked(state)
+    try:
+        path = run_record_path(name, run_id)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update({"finished_at": finished_at, "exit_code": exit_code, "error": error, "status": "succeeded" if exit_code == 0 else "failed"})
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        logger().warning("run_record_finish_update_failed", schedule_name=name, run_id=run_id)
 
 
 def run_record(record_path: str) -> int:

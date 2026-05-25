@@ -56,6 +56,7 @@ Use `skills/schedule/scripts/agentic-schedule create` with:
 - `--when`: one of the supported schedule expressions below.
 - Optional `--timezone`: IANA name such as `America/New_York` for timezone-less times.
 - Optional `--working-directory`: where the scheduled task should run. Defaults to the current working directory.
+- Optional `--retention`: how long to keep finished run records and logs. Defaults to `5d`; supports compact durations such as `30d`, `30h`, and `30min`.
 - Optional `--overwrite` to replace an existing schedule.
 - Optional repeated `--env KEY=VALUE` for extra environment variables.
 
@@ -96,6 +97,7 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 - Creating an enabled schedule still starts a background dispatcher opportunistically if no daemon is running.
 - `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot if a daemon has not been installed yet.
 - Schedules have a fixed execution deadline of 10 minutes. If the dispatcher notices a run more than 10 minutes after its scheduled time, it marks that occurrence `skipped` instead of executing stale work.
+- Finished run records and logs are cleaned up according to each schedule's retention setting; new schedules default to `5d`.
 - State lives under the scheduler state directory by default.
 - Set `AGENTIC_SCHEDULE_DIR` to use a specific state directory.
 - Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 30 seconds.

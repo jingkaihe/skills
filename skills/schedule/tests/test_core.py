@@ -38,6 +38,8 @@ def test_create_list_get_delete_round_trip(capsys):
     assert created["status"] == "success"
     assert created["schedule"]["schedule"] == {"kind": "daily", "time": "09:00:00", "timezone": "UTC"}
     assert created["schedule"]["environment"] == {"TOKEN": "<redacted>"}
+    assert created["schedule"]["retention"] == "5d"
+    assert created["schedule"]["retention_seconds"] == 5 * 24 * 60 * 60
     assert "kodelet_flags" not in created["schedule"]
 
     assert core.list_schedule_tool("{}") == 0
@@ -61,6 +63,20 @@ def test_create_rejects_hidden_kodelet_flags(capsys):
     payload = json.loads(capsys.readouterr().out)
     assert "unsupported parameter" in payload["error"]
     assert "kodelet_flags" in payload["error"]
+
+
+def test_build_schedule_accepts_compact_retention_duration():
+    schedule = core.build_schedule({"name": "retention-demo", "instruction": "Say hello", "when": "in 90 minutes", "retention": "30min"})
+
+    assert schedule["retention"] == "30min"
+    assert schedule["retention_seconds"] == 30 * 60
+
+
+def test_create_rejects_invalid_retention(capsys):
+    assert core.create_schedule_tool(json.dumps({"name": "bad", "instruction": "Say hello", "when": "in 90 minutes", "retention": "0d"})) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "invalid duration" in payload["error"]
 
 
 def test_prepare_due_runs_skips_stale_one_time_schedule():
@@ -158,6 +174,8 @@ def test_cli_create_uses_click_options(capsys):
             "in 90 minutes",
             "--timezone",
             "UTC",
+            "--retention",
+            "30h",
             "--env",
             "TOKEN=secret",
         ],
@@ -166,7 +184,43 @@ def test_cli_create_uses_click_options(capsys):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schedule"]["name"] == "cli-demo"
+    assert payload["schedule"]["retention"] == "30h"
+    assert payload["schedule"]["retention_seconds"] == 30 * 60 * 60
     assert payload["schedule"]["environment"] == {"TOKEN": "<redacted>"}
+
+
+def test_cleanup_finished_runs_removes_records_and_logs_older_than_retention():
+    now = utc("2026-05-25T12:00:00Z")
+    old_run_id = "20260520T110000Z-old"
+    fresh_run_id = "20260525T110000Z-fresh"
+    state = {"version": 1, "schedules": {"cleanup-demo": {"name": "cleanup-demo", "retention_seconds": 24 * 60 * 60}}}
+
+    old_record_path = core.run_record_path("cleanup-demo", old_run_id)
+    old_log_path = core.log_path_for("cleanup-demo", old_run_id)
+    fresh_record_path = core.run_record_path("cleanup-demo", fresh_run_id)
+    fresh_log_path = core.log_path_for("cleanup-demo", fresh_run_id)
+    old_record_path.parent.mkdir(parents=True)
+    old_log_path.parent.mkdir(parents=True)
+    fresh_record_path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_log_path.parent.mkdir(parents=True, exist_ok=True)
+    old_record_path.write_text(
+        json.dumps({"name": "cleanup-demo", "run_id": old_run_id, "finished_at": "2026-05-20T11:00:00Z", "log_path": str(old_log_path)}),
+        encoding="utf-8",
+    )
+    fresh_record_path.write_text(
+        json.dumps({"name": "cleanup-demo", "run_id": fresh_run_id, "finished_at": "2026-05-25T11:00:00Z", "log_path": str(fresh_log_path)}),
+        encoding="utf-8",
+    )
+    old_log_path.write_text("old", encoding="utf-8")
+    fresh_log_path.write_text("fresh", encoding="utf-8")
+
+    removed_count = core.cleanup_finished_runs(state, now)
+
+    assert removed_count == 1
+    assert not old_record_path.exists()
+    assert not old_log_path.exists()
+    assert fresh_record_path.exists()
+    assert fresh_log_path.exists()
 
 
 
@@ -395,7 +449,8 @@ def test_run_record_writes_json_logs_and_updates_schedule(tmp_path, monkeypatch)
     with core.state_lock():
         core.save_state_unlocked(state)
 
-    record_path = tmp_path / "record.json"
+    record_path = core.run_record_path("run-demo", "run-1")
+    record_path.parent.mkdir(parents=True)
     log_path = tmp_path / "run.log"
     record_path.write_text(
         json.dumps(
@@ -411,6 +466,11 @@ def test_run_record_writes_json_logs_and_updates_schedule(tmp_path, monkeypatch)
     )
 
     assert core.run_record(str(record_path)) == 0
+
+    updated_record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert updated_record["status"] == "succeeded"
+    assert updated_record["exit_code"] == 0
+    assert updated_record["finished_at"]
 
     log_events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert [event["event"] for event in log_events] == [

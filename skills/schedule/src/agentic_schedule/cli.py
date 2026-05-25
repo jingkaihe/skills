@@ -59,6 +59,7 @@ def get_command(name: str, include_environment: bool) -> None:
 @click.option("--when", "when_value", required=True, help="Schedule expression, e.g. 'in 90 minutes', 'daily 09:00'.")
 @click.option("--timezone", help="IANA timezone for timezone-less schedule expressions.")
 @click.option("--working-directory", help="Directory where the scheduled task should run.")
+@click.option("--retention", default=core.DEFAULT_RETENTION, show_default=True, help="Finished run retention, e.g. 5d, 30h, 30min.")
 @click.option("--env", "environment", multiple=True, help="Extra environment variable as KEY=VALUE. May be repeated.")
 @click.option("--overwrite", is_flag=True, help="Replace an existing schedule with the same name.")
 @click.option("--disabled", is_flag=True, help="Create the schedule disabled.")
@@ -68,6 +69,7 @@ def create_command(
     when_value: str,
     timezone: str | None,
     working_directory: str | None,
+    retention: str,
     environment: tuple[str, ...],
     overwrite: bool,
     disabled: bool,
@@ -79,6 +81,7 @@ def create_command(
         "when": when_value,
         "overwrite": overwrite,
         "enabled": not disabled,
+        "retention": retention,
     }
     if timezone:
         payload["timezone"] = timezone
