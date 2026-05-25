@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SKILL_DIR=$(dirname -- "$SCRIPT_DIR")
+
+exec uv run --project "$SKILL_DIR" kodelet-schedule "$@"
