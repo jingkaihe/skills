@@ -1,7 +1,7 @@
 [project]
-name = "kodelet-schedule"
+name = "agentic-schedule"
 version = "0.1.0"
-description = "Skill-local scheduler for background Kodelet agentic tasks"
+description = "Skill-local scheduler for background agentic tasks"
 requires-python = ">=3.11"
 dependencies = [
   "click>=8.1,<9",
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kodelet-schedule = "kodelet_schedule.cli:main"
+agentic-schedule = "agentic_schedule.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.2,<0.12"]

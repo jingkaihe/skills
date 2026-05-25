@@ -1,23 +1,17 @@
 ---
 name: schedule
-description: Manage scheduled, background Kodelet agentic tasks. Use when users ask to create, list, inspect, or delete schedules, recurring agent tasks, reminders that should run Kodelet, or background dispatch of natural-language instructions.
+description: Manage scheduled, background agentic tasks. Use when users ask to create, list, inspect, or delete schedules, recurring agent tasks, reminders, or background dispatch of natural-language instructions.
 ---
 
-# Kodelet Schedule Manager
+# Agentic Schedule Manager
 
-Use the skill-local scheduler command to manage background agentic work. A schedule stores a natural-language instruction and, when due, the dispatcher runs:
-
-```bash
-kodelet run --headless "<instruction>"
-```
-
-Run commands from this skill directory through the wrapper script:
+Use the skill-local scheduler command to manage background agentic work. Run commands from this skill directory through the wrapper script:
 
 ```bash
-skills/schedule/scripts/kodelet-schedule <command> [options]
+skills/schedule/scripts/agentic-schedule <command> [options]
 ```
 
-The wrapper executes a uv project in `skills/schedule`, so dependencies are declared in `skills/schedule/pyproject.toml` and the Python source lives under `skills/schedule/src/kodelet_schedule/`.
+The wrapper executes a uv project in `skills/schedule`, so dependencies are declared in `skills/schedule/pyproject.toml` and the Python source lives under `skills/schedule/src/`.
 
 ## Commands
 
@@ -31,14 +25,14 @@ The wrapper executes a uv project in `skills/schedule`, so dependencies are decl
 Examples:
 
 ```bash
-skills/schedule/scripts/kodelet-schedule list
-skills/schedule/scripts/kodelet-schedule get daily-repo-health
-skills/schedule/scripts/kodelet-schedule delete daily-repo-health
+skills/schedule/scripts/agentic-schedule list
+skills/schedule/scripts/agentic-schedule get daily-repo-health
+skills/schedule/scripts/agentic-schedule delete daily-repo-health
 ```
 
 ## When to use
 
-Use this skill when the user wants Kodelet to do something later or repeatedly, for example:
+Use this skill when the user wants an agentic task to happen later or repeatedly, for example:
 
 - “Run this check every morning”
 - “Create a weekly agent task”
@@ -47,17 +41,17 @@ Use this skill when the user wants Kodelet to do something later or repeatedly, 
 
 ## Creating schedules
 
-Use `skills/schedule/scripts/kodelet-schedule create` with:
+Use `skills/schedule/scripts/agentic-schedule create` with:
 
 - positional `NAME`: stable snake/kebab/dot-style name using only letters, numbers, `.`, `_`, `-`.
-- `--instruction`: natural-language task for the scheduled agentic `kodelet run`.
+- `--instruction`: natural-language task for the scheduled agentic work.
 - `--when`: one of the supported schedule expressions below.
 - Optional `--timezone`: IANA name such as `America/New_York` for timezone-less times.
-- Optional `--working-directory`: where Kodelet should run. Defaults to the current working directory.
+- Optional `--working-directory`: where the scheduled task should run. Defaults to the current working directory.
 - Optional `--overwrite` to replace an existing schedule.
 - Optional repeated `--env KEY=VALUE` for extra environment variables.
 
-The scheduler intentionally does not expose Kodelet CLI flags as parameters. Scheduled jobs run with the scheduler's internal safe default flags, currently `--headless`, so agents only need to decide the natural-language instruction and timing.
+The scheduler intentionally hides execution flags, so agents only need to decide the natural-language instruction and timing.
 
 Supported `--when` formats:
 
@@ -79,7 +73,7 @@ If the user gives a relative or informal time (“tomorrow morning”, “every 
 Create example:
 
 ```bash
-skills/schedule/scripts/kodelet-schedule create daily-repo-health \
+skills/schedule/scripts/agentic-schedule create daily-repo-health \
   --instruction "Inspect this repository for failing tests or obvious regressions and summarize what needs attention." \
   --when "daily 09:00" \
   --timezone America/New_York
@@ -90,15 +84,15 @@ skills/schedule/scripts/kodelet-schedule create daily-repo-health \
 - Creating an enabled schedule starts the background dispatcher automatically; there is no separate start command in normal use.
 - `list` also starts the dispatcher if active schedules exist and it is not running. Use this after a reboot or if the user asks to make sure scheduling is active.
 - Schedules have a fixed execution deadline of 10 minutes. If the dispatcher notices a run more than 10 minutes after its scheduled time, it marks that occurrence `skipped` instead of executing stale work.
-- State lives under `~/.kodelet/schedules` by default.
-- Set `KODELET_SCHEDULE_DIR` to use another state directory.
+- State lives under the scheduler state directory by default.
+- Set `KODELET_SCHEDULE_DIR` to use a specific state directory.
 - Set `KODELET_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 30 seconds.
-- Run logs are stored under `~/.kodelet/schedules/logs/<schedule-name>/`.
+- Run logs are stored under the scheduler state directory in `logs/<schedule-name>/`.
 
-The dispatcher is a user-level background process, not a system service. If the machine reboots, invoke `skills/schedule/scripts/kodelet-schedule list` or create/update any schedule to restart it.
+The dispatcher is a user-level background process, not a system service. If the machine reboots, invoke `skills/schedule/scripts/agentic-schedule list` or create/update any schedule to restart it.
 
 ## Output and secrets
 
 Schedule output is JSON and includes next run times, recent run status, log paths, and dispatcher status. Environment values are redacted by default. Only pass `--include-environment` to `list` or `get` if the user explicitly needs to inspect stored environment values.
 
-Deleting a schedule does not stop an already-running Kodelet process that was launched before deletion.
+Deleting a schedule does not stop already-running work that was launched before deletion.

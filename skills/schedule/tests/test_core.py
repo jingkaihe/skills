@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from click.testing import CliRunner
 
-from kodelet_schedule import core
-from kodelet_schedule.cli import main
+from agentic_schedule import core
+from agentic_schedule.cli import main
 
 
 def utc(value: str) -> datetime:

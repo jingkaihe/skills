@@ -5,7 +5,7 @@ from typing import Any
 
 import click
 
-from kodelet_schedule import core
+from agentic_schedule import core
 
 
 def emit_payload(handler: Any, payload: dict[str, Any]) -> None:
@@ -24,7 +24,7 @@ def parse_env(values: tuple[str, ...]) -> dict[str, str]:
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 def main() -> None:
-    """Manage background Kodelet schedules."""
+    """Manage background agentic schedules."""
 
 
 @main.command("list")
@@ -51,10 +51,10 @@ def get_command(name: str, include_environment: bool) -> None:
 
 @main.command("create")
 @click.argument("name")
-@click.option("--instruction", required=True, help="Natural-language task passed to `kodelet run` when due.")
+@click.option("--instruction", required=True, help="Natural-language task to run when due.")
 @click.option("--when", "when_value", required=True, help="Schedule expression, e.g. 'in 90 minutes', 'daily 09:00'.")
 @click.option("--timezone", help="IANA timezone for timezone-less schedule expressions.")
-@click.option("--working-directory", help="Directory where the scheduled Kodelet process should run.")
+@click.option("--working-directory", help="Directory where the scheduled task should run.")
 @click.option("--env", "environment", multiple=True, help="Extra environment variable as KEY=VALUE. May be repeated.")
 @click.option("--overwrite", is_flag=True, help="Replace an existing schedule with the same name.")
 @click.option("--disabled", is_flag=True, help="Create the schedule disabled.")

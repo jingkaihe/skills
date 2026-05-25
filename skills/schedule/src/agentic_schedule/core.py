@@ -94,7 +94,7 @@ def configure_json_logging() -> None:
 
 def logger() -> Any:
     configure_json_logging()
-    return structlog.get_logger("kodelet_schedule")
+    return structlog.get_logger("agentic_schedule")
 
 
 def load_payload(raw_input: str) -> dict[str, Any]:
@@ -727,7 +727,7 @@ def ensure_dispatcher_running() -> dict[str, Any]:
 
         schedule_dir().mkdir(parents=True, exist_ok=True)
         dispatcher_log_file().parent.mkdir(parents=True, exist_ok=True)
-        command = [sys.executable, "-m", "kodelet_schedule.cli", "dispatch-loop"]
+        command = [sys.executable, "-m", "agentic_schedule.cli", "dispatch-loop"]
         with dispatcher_log_file().open("ab") as log_handle:
             process = subprocess.Popen(
                 command,
@@ -871,7 +871,7 @@ def mark_run_failed_to_start(name: str, run_id: str, error: str) -> None:
 
 def start_runner(record: dict[str, Any]) -> None:
     write_run_record(record)
-    command = [sys.executable, "-m", "kodelet_schedule.cli", "run-record", str(record["record_path"])]
+    command = [sys.executable, "-m", "agentic_schedule.cli", "run-record", str(record["record_path"])]
     try:
         with dispatcher_log_file().open("ab") as log_handle:
             process = subprocess.Popen(
