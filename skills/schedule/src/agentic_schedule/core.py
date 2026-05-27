@@ -32,7 +32,11 @@ except ImportError:  # pragma: no cover - Python 3.11 includes zoneinfo.
 
 
 STATE_VERSION = 1
+DEFAULT_HARNESS = "kodelet"
+SUPPORTED_HARNESSES = ("kodelet", "claude", "codex")
 DEFAULT_KODELET_FLAGS = ["--headless"]
+DEFAULT_CLAUDE_FLAGS = ["--dangerously-skip-permissions", "-p", "--output-format", "stream-json"]
+DEFAULT_CODEX_FLAGS = ["--yolo", "exec", "--json"]
 DEFAULT_POLL_SECONDS = 5
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 10 * 60
 DEFAULT_RETENTION = "5d"
@@ -40,7 +44,7 @@ DEFAULT_RETENTION_SECONDS = 5 * 24 * 60 * 60
 SERVICE_NAME = "agentic-schedule"
 SYSTEMD_UNIT_NAME = f"{SERVICE_NAME}.service"
 LAUNCHD_LABEL = "com.agentic-schedule.dispatcher"
-SCHEDULE_ENV_KEYS = ("AGENTIC_SCHEDULE_DIR", "AGENTIC_SCHEDULE_POLL_SECONDS")
+SCHEDULE_ENV_KEYS = ("AGENTIC_SCHEDULE_DIR", "AGENTIC_SCHEDULE_POLL_SECONDS", "SCHEDULE_SKILL_HARNESS")
 LEGACY_SCHEDULE_ENV_KEYS = ("KODELET_SCHEDULE_DIR", "KODELET_SCHEDULE_POLL_SECONDS")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 INTERVAL_RE = re.compile(r"^every\s+(.+?)(?:\s+starting\s+(.+))?$", re.IGNORECASE)
@@ -462,10 +466,26 @@ def validate_environment(value: Any) -> dict[str, str]:
     return environment
 
 
+def validate_harness(value: str | None) -> str:
+    harness = (value or DEFAULT_HARNESS).strip().lower()
+    if not harness:
+        harness = DEFAULT_HARNESS
+    if harness not in SUPPORTED_HARNESSES:
+        raise ValueError(f"harness must be one of: {', '.join(SUPPORTED_HARNESSES)}")
+    return harness
+
+
+def schedule_harness_from_payload(payload: dict[str, Any]) -> str:
+    explicit_harness = optional_string(payload, "harness", None)
+    env_harness = os.environ.get("SCHEDULE_SKILL_HARNESS")
+    return validate_harness(explicit_harness or env_harness or DEFAULT_HARNESS)
+
+
 def build_schedule(payload: dict[str, Any]) -> dict[str, Any]:
     name = required_string(payload, "name")
     validate_name(name)
     instruction = required_string(payload, "instruction")
+    harness = schedule_harness_from_payload(payload)
     when = required_string(payload, "when")
     timezone_name = optional_string(payload, "timezone", None)
     if timezone_name:
@@ -488,6 +508,7 @@ def build_schedule(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": name,
         "instruction": instruction,
+        "harness": harness,
         "when": when,
         "schedule": spec,
         "timezone": timezone_name or "local",
@@ -544,7 +565,7 @@ def create_schedule_tool(raw_input: str) -> int:
         payload = load_payload(raw_input)
         reject_unknown_keys(
             payload,
-            {"name", "instruction", "when", "timezone", "working_directory", "environment", "overwrite", "enabled", "retention"},
+            {"name", "instruction", "harness", "when", "timezone", "working_directory", "environment", "overwrite", "enabled", "retention"},
         )
         schedule = build_schedule(payload)
         overwrite = optional_bool(payload, "overwrite", False)
@@ -1365,10 +1386,34 @@ def build_kodelet_command(schedule: dict[str, Any]) -> list[str]:
     flags = schedule.get("kodelet_flags") or []
     if not isinstance(flags, list) or any(not isinstance(item, str) or item == "" for item in flags):
         raise ValueError("schedule has invalid kodelet_flags")
+    instruction = schedule_instruction(schedule)
+    return [command_name, "run", *flags, instruction]
+
+
+def schedule_instruction(schedule: dict[str, Any]) -> str:
     instruction = schedule.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("schedule has no instruction")
-    return [command_name, "run", *flags, instruction]
+    return instruction
+
+
+def build_claude_command(schedule: dict[str, Any]) -> list[str]:
+    return ["claude", *DEFAULT_CLAUDE_FLAGS, schedule_instruction(schedule)]
+
+
+def build_codex_command(schedule: dict[str, Any]) -> list[str]:
+    return ["codex", *DEFAULT_CODEX_FLAGS, schedule_instruction(schedule)]
+
+
+def build_harness_command(schedule: dict[str, Any]) -> list[str]:
+    harness = validate_harness(str(schedule.get("harness") or DEFAULT_HARNESS))
+    if harness == "kodelet":
+        return build_kodelet_command(schedule)
+    if harness == "claude":
+        return build_claude_command(schedule)
+    if harness == "codex":
+        return build_codex_command(schedule)
+    raise ValueError(f"unsupported harness: {harness}")
 
 
 def mark_run_finished(name: str, run_id: str, exit_code: int, error: str | None = None) -> None:
@@ -1412,7 +1457,7 @@ def run_record(record_path: str) -> int:
     cwd: Path | None = None
     started_at = utc_now()
     try:
-        command = build_kodelet_command(schedule)
+        command = build_harness_command(schedule)
         working_directory = str(schedule.get("working_directory") or "")
         cwd = Path(working_directory).expanduser() if working_directory else None
         environment = clean_env()
@@ -1425,6 +1470,7 @@ def run_record(record_path: str) -> int:
             run_logger = logger().bind(schedule_name=name, run_id=run_id, log_path=str(log_path))
             run_logger.info(
                 "scheduled_run_started",
+                harness=validate_harness(str(schedule.get("harness") or DEFAULT_HARNESS)),
                 working_directory=str(cwd) if cwd else None,
                 command=shlex.join(command),
             )

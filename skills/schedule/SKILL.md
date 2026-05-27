@@ -53,6 +53,7 @@ Use `skills/schedule/scripts/agentic-schedule create` with:
 
 - positional `NAME`: stable snake/kebab/dot-style name using only letters, numbers, `.`, `_`, `-`.
 - `--instruction`: natural-language task for the scheduled agentic work. Put only the work to perform here; do not add any preamble about the schedule or timing.
+- Optional `--harness`: agent harness to use, one of `kodelet`, `claude`, or `codex`. Defaults to `SCHEDULE_SKILL_HARNESS` if set, otherwise `kodelet`.
 - `--when`: one of the supported schedule expressions below.
 - Optional `--timezone`: IANA name such as `America/New_York` for timezone-less times.
 - Optional `--working-directory`: where the scheduled task should run. Defaults to the current working directory.
@@ -61,6 +62,14 @@ Use `skills/schedule/scripts/agentic-schedule create` with:
 - Optional repeated `--env KEY=VALUE` for extra environment variables.
 
 The scheduler intentionally hides execution flags, so agents only need to decide the natural-language instruction and timing. Keep timing exclusively in `--when`; keep `--instruction` focused on the task itself.
+
+Harness execution commands are fixed internally and include JSON/JSONL streaming where available:
+
+| Harness | Command |
+| --- | --- |
+| `kodelet` | `kodelet run --headless INSTRUCTION` |
+| `claude` | `claude --dangerously-skip-permissions -p --output-format stream-json INSTRUCTION` |
+| `codex` | `codex --yolo exec --json INSTRUCTION` |
 
 Instruction examples:
 
@@ -118,6 +127,7 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 - State lives under the scheduler state directory by default.
 - Set `AGENTIC_SCHEDULE_DIR` to use a specific state directory.
 - Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 5 seconds.
+- Set `SCHEDULE_SKILL_HARNESS` to choose the default harness for newly created schedules; explicit `create --harness` wins.
 - Run logs are stored under the scheduler state directory in `logs/<schedule-name>/`.
 
 For reliable reboot/login behavior, install the user-level daemon with `start`.

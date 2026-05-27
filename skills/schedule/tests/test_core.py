@@ -19,6 +19,7 @@ def utc(value: str) -> datetime:
 def isolated_schedule_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTIC_SCHEDULE_DIR", str(tmp_path))
     monkeypatch.setenv("AGENTIC_SCHEDULE_DISABLE_DISPATCHER", "1")
+    monkeypatch.delenv("SCHEDULE_SKILL_HARNESS", raising=False)
     monkeypatch.setenv("TZ", "UTC")
 
 
@@ -196,10 +197,50 @@ def test_recurring_stale_schedule_skips_to_next_occurrence():
 def test_build_kodelet_command_uses_internal_headless_default():
     schedule = core.build_schedule({"name": "demo", "instruction": "Say hello", "when": "in 90 minutes"})
 
+    assert schedule["harness"] == "kodelet"
     assert core.build_kodelet_command(schedule) == ["kodelet", "run", "--headless", "Say hello"]
+    assert core.build_harness_command(schedule) == ["kodelet", "run", "--headless", "Say hello"]
     redacted = core.redact_schedule(schedule)
     assert "kodelet_command" not in redacted
     assert "kodelet_flags" not in redacted
+
+
+def test_build_harness_command_supports_claude_and_codex():
+    claude_schedule = core.build_schedule({"name": "claude-demo", "instruction": "Say hello", "harness": "claude", "when": "in 90 minutes"})
+    codex_schedule = core.build_schedule({"name": "codex-demo", "instruction": "Say hello", "harness": "codex", "when": "in 90 minutes"})
+
+    assert core.build_harness_command(claude_schedule) == [
+        "claude",
+        "--dangerously-skip-permissions",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "Say hello",
+    ]
+    assert core.build_harness_command(codex_schedule) == ["codex", "--yolo", "exec", "--json", "Say hello"]
+
+
+def test_build_schedule_uses_harness_environment(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_SKILL_HARNESS", "claude")
+
+    schedule = core.build_schedule({"name": "env-harness", "instruction": "Say hello", "when": "in 90 minutes"})
+
+    assert schedule["harness"] == "claude"
+
+
+def test_build_schedule_explicit_harness_overrides_environment(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_SKILL_HARNESS", "claude")
+
+    schedule = core.build_schedule({"name": "explicit-harness", "instruction": "Say hello", "harness": "codex", "when": "in 90 minutes"})
+
+    assert schedule["harness"] == "codex"
+
+
+def test_build_schedule_rejects_invalid_harness_environment(monkeypatch):
+    monkeypatch.setenv("SCHEDULE_SKILL_HARNESS", "unknown")
+
+    with pytest.raises(ValueError, match="harness must be one of"):
+        core.build_schedule({"name": "bad-harness", "instruction": "Say hello", "when": "in 90 minutes"})
 
 
 def test_cli_create_uses_click_options(capsys):
@@ -211,6 +252,8 @@ def test_cli_create_uses_click_options(capsys):
             "cli-demo",
             "--instruction",
             "Say hello",
+            "--harness",
+            "codex",
             "--when",
             "in 90 minutes",
             "--timezone",
@@ -225,6 +268,7 @@ def test_cli_create_uses_click_options(capsys):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schedule"]["name"] == "cli-demo"
+    assert payload["schedule"]["harness"] == "codex"
     assert payload["schedule"]["retention"] == "30h"
     assert payload["schedule"]["retention_seconds"] == 30 * 60 * 60
     assert payload["schedule"]["environment"] == {"TOKEN": "<redacted>"}
@@ -529,3 +573,45 @@ def test_run_record_writes_json_logs_and_updates_schedule(tmp_path, monkeypatch)
         stored = core.load_state_unlocked()["schedules"]["run-demo"]
     assert stored["last_run_status"] == "succeeded"
     assert stored["last_exit_code"] == 0
+
+
+def test_run_record_uses_configured_harness(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/usr/bin/env bash\necho fake-codex args: \"$@\"\n", encoding="utf-8")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{core.os.environ['PATH']}")
+
+    schedule = core.build_schedule(
+        {
+            "name": "codex-run-demo",
+            "instruction": "Say hello",
+            "harness": "codex",
+            "when": "now",
+            "working_directory": str(tmp_path),
+        }
+    )
+    schedule["last_run_id"] = "run-1"
+    with core.state_lock():
+        core.save_state_unlocked({"version": 1, "schedules": {"codex-run-demo": copy.deepcopy(schedule)}})
+
+    record_path = core.run_record_path("codex-run-demo", "run-1")
+    record_path.parent.mkdir(parents=True)
+    log_path = tmp_path / "codex-run.log"
+    record_path.write_text(
+        json.dumps(
+            {
+                "name": "codex-run-demo",
+                "run_id": "run-1",
+                "schedule": schedule,
+                "log_path": str(log_path),
+                "record_path": str(record_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert core.run_record(str(record_path)) == 0
+
+    log_events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert log_events[0]["harness"] == "codex"
+    assert log_events[1]["output"] == "fake-codex args: --yolo exec --json Say hello"

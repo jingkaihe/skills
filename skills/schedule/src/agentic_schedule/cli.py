@@ -56,6 +56,11 @@ def get_command(name: str, include_environment: bool) -> None:
 @main.command("create")
 @click.argument("name")
 @click.option("--instruction", required=True, help="Natural-language task to run when due.")
+@click.option(
+    "--harness",
+    type=click.Choice(core.SUPPORTED_HARNESSES, case_sensitive=False),
+    help="Agent harness to run. Defaults to SCHEDULE_SKILL_HARNESS or kodelet.",
+)
 @click.option("--when", "when_value", required=True, help="Schedule expression, e.g. 'in 90 minutes', 'daily 09:00'.")
 @click.option("--timezone", help="IANA timezone for timezone-less schedule expressions.")
 @click.option("--working-directory", help="Directory where the scheduled task should run.")
@@ -66,6 +71,7 @@ def get_command(name: str, include_environment: bool) -> None:
 def create_command(
     name: str,
     instruction: str,
+    harness: str | None,
     when_value: str,
     timezone: str | None,
     working_directory: str | None,
@@ -83,6 +89,8 @@ def create_command(
         "enabled": not disabled,
         "retention": retention,
     }
+    if harness:
+        payload["harness"] = harness
     if timezone:
         payload["timezone"] = timezone
     if working_directory:
