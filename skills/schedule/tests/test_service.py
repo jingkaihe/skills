@@ -33,6 +33,7 @@ def test_current_command_prefers_uv_project(monkeypatch):
 
 def test_systemd_daemon_writes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("PATH", "/opt/demo/bin:/usr/bin")
     commands: list[list[str]] = []
 
     def fake_run_command(command: list[str]) -> tuple[int, str, str]:
@@ -53,11 +54,32 @@ def test_systemd_daemon_writes_user_unit_and_uses_no_sudo(tmp_path, monkeypatch)
     assert "--daemon" not in unit_text
     assert ".venv" not in unit_text
     assert "Restart=always" in unit_text
+    assert "Environment=PATH=/opt/demo/bin:/usr/bin" in unit_text
+    assert "PassEnvironment=PATH" not in unit_text
     assert commands == [
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", config.SYSTEMD_UNIT_NAME],
+        ["systemctl", "--user", "import-environment", "PATH"],
+        ["systemctl", "--user", "enable", config.SYSTEMD_UNIT_NAME],
+        ["systemctl", "--user", "restart", config.SYSTEMD_UNIT_NAME],
     ]
     assert all("sudo" not in command for command in commands for command in command)
+
+
+def test_systemd_unit_snapshots_scheduler_environment_and_path(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("PATH", "/opt/tools:/usr/bin")
+    monkeypatch.setenv("SCHEDULE_SKILL_HARNESS", "codex")
+    monkeypatch.setattr(
+        service.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    unit_text = service.systemd_unit_content()
+
+    assert "Environment=SCHEDULE_SKILL_HARNESS=codex" in unit_text
+    assert "Environment=PATH=/opt/tools:/usr/bin" in unit_text
+    assert "PassEnvironment=PATH" not in unit_text
 
 
 def test_launchd_daemon_writes_user_plist_and_uses_no_sudo(tmp_path, monkeypatch):

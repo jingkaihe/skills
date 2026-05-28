@@ -14,6 +14,7 @@ from .config import (
     LAUNCHD_LABEL,
     LEGACY_SCHEDULE_ENV_KEYS,
     SCHEDULE_ENV_KEYS,
+    SYSTEMD_IMPORT_ENVIRONMENT_KEYS,
     SYSTEMD_UNIT_NAME,
 )
 from .models import active_schedule_count
@@ -117,10 +118,21 @@ def current_command() -> list[str]:
 
 def service_environment() -> dict[str, str]:
     environment: dict[str, str] = {}
-    for key in (*SCHEDULE_ENV_KEYS, *LEGACY_SCHEDULE_ENV_KEYS):
+    for key in (
+        *SCHEDULE_ENV_KEYS,
+        *LEGACY_SCHEDULE_ENV_KEYS,
+        *SYSTEMD_IMPORT_ENVIRONMENT_KEYS,
+    ):
         if key in os.environ:
             environment[key] = os.environ[key]
     return environment
+
+
+def systemd_import_environment_command() -> list[str] | None:
+    keys = [key for key in SYSTEMD_IMPORT_ENVIRONMENT_KEYS if key in os.environ]
+    if not keys:
+        return None
+    return ["systemctl", "--user", "import-environment", *keys]
 
 
 def systemd_unit_content() -> str:
@@ -180,10 +192,16 @@ def start_systemd_daemon() -> dict[str, Any]:
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     unit_path.write_text(systemd_unit_content(), encoding="utf-8")
 
-    commands = [
-        ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
-    ]
+    commands = [["systemctl", "--user", "daemon-reload"]]
+    import_environment_command = systemd_import_environment_command()
+    if import_environment_command:
+        commands.append(import_environment_command)
+    commands.extend(
+        [
+            ["systemctl", "--user", "enable", SYSTEMD_UNIT_NAME],
+            ["systemctl", "--user", "restart", SYSTEMD_UNIT_NAME],
+        ]
+    )
     results = []
     for command in commands:
         return_code, stdout, stderr = run_command(command)

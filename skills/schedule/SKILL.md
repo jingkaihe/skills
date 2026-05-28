@@ -128,6 +128,7 @@ skills/schedule/scripts/agentic-schedule create daily-repo-health \
 - Set `AGENTIC_SCHEDULE_DIR` to use a specific state directory.
 - Set `AGENTIC_SCHEDULE_POLL_SECONDS` to change dispatcher polling frequency; default is 5 seconds.
 - Set `SCHEDULE_SKILL_HARNESS` to choose the default harness for newly created schedules; explicit `create --harness` wins.
+- If the executable environment changes after installing or updating a harness/helper CLI, run `start` again so the persistent daemon picks up the updated environment.
 - Run logs are stored under the scheduler state directory in `logs/<schedule-name>/`.
 
 For reliable reboot/login behavior, install the user-level daemon with `start`.
