@@ -1,0 +1,162 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "google-genai",
+#   "kodelet-sdk",
+#   "pillow",
+# ]
+# ///
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from google import genai
+from google.genai import types
+from kodelet_sdk import BaseModel, Extension, Field, ToolContext, ToolExecutionResult
+
+
+DESCRIPTION = (
+    "Generate an image from a prompt using Google Gemini Nano Banana and save it "
+    "under $HOME/.cache/nano-banana."
+)
+DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+CACHE_DIR = Path.home() / ".cache" / "nano-banana"
+VALID_ASPECT_RATIOS = {
+    "1:1",
+    "1:4",
+    "1:8",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:1",
+    "4:3",
+    "4:5",
+    "5:4",
+    "8:1",
+    "9:16",
+    "16:9",
+    "21:9",
+}
+VALID_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
+
+ext = Extension(name="nano-banana", version="0.1.0")
+
+
+class NanoBananaInput(BaseModel):
+    prompt: str = Field(min_length=1, description="Text prompt describing the image to generate.")
+    aspect_ratio: str | None = Field(
+        default=None,
+        description="Optional aspect ratio. One of 1:1, 1:4, 1:8, 2:3, 3:2, 3:4, 4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9.",
+    )
+    image_size: str | None = Field(
+        default=None,
+        description="Optional output size. One of 512, 1K, 2K, 4K.",
+    )
+    model: str | None = Field(
+        default=None,
+        description="Optional Gemini image generation model. Defaults to gemini-3.1-flash-image-preview.",
+    )
+
+
+def slugify(value: str, max_length: int = 48) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    if not slug:
+        slug = "image"
+    return slug[:max_length].rstrip("-") or "image"
+
+
+def build_client() -> genai.Client:
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", DEFAULT_LOCATION)
+
+    if project:
+        return genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+        )
+
+    return genai.Client()
+
+
+def save_generated_image(response: Any, prompt: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    prefix = slugify(prompt)
+
+    for part in getattr(response, "parts", []) or []:
+        if getattr(part, "inline_data", None) is None:
+            continue
+        image = part.as_image()
+        suffix = uuid.uuid4().hex[:8]
+        output_path = CACHE_DIR / f"{timestamp}-{prefix}-{suffix}.png"
+        image.save(output_path)
+        return output_path
+
+    raise RuntimeError("The model response did not contain an image.")
+
+
+def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
+    prompt = input.prompt.strip()
+    if not prompt:
+        raise ValueError("Missing required parameter: prompt")
+
+    if input.aspect_ratio is not None and input.aspect_ratio not in VALID_ASPECT_RATIOS:
+        raise ValueError(
+            f"Invalid aspect_ratio. Expected one of: {', '.join(sorted(VALID_ASPECT_RATIOS))}"
+        )
+
+    if input.image_size is not None and input.image_size not in VALID_IMAGE_SIZES:
+        raise ValueError(f"Invalid image_size. Expected one of: {', '.join(sorted(VALID_IMAGE_SIZES))}")
+
+    model = input.model.strip() if input.model is not None else DEFAULT_MODEL
+    if not model:
+        raise ValueError("model must be a non-empty string when provided")
+
+    client = build_client()
+    config = types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
+    if input.aspect_ratio or input.image_size:
+        config.image_config = types.ImageConfig(
+            aspect_ratio=input.aspect_ratio,
+            image_size=input.image_size,
+        )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=config,
+    )
+    output_path = save_generated_image(response, prompt)
+    return output_path, model
+
+
+@ext.tool(
+    "nano_banana",
+    description=DESCRIPTION,
+    input_schema=NanoBananaInput,
+    timeout_in_sec=0,
+)
+async def nano_banana(input: NanoBananaInput, _ctx: ToolContext) -> ToolExecutionResult:
+    try:
+        output_path, model = await asyncio.to_thread(generate_image, input)
+        content = f"Generated image saved to {output_path} using {model}."
+        return {
+            "content": content,
+            "data": {"success": True, "image_path": str(output_path), "model": model},
+        }
+    except Exception as exc:
+        message = f"Image generation failed: {exc}"
+        return {"content": message, "data": {"success": False, "error": message}, "error": message}
+
+
+if __name__ == "__main__":
+    ext.run_sync()

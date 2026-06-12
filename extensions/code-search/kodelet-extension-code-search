@@ -1,0 +1,198 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# ///
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import textwrap
+from pathlib import Path
+
+from kodelet_sdk import BaseModel, Client, Extension, Field, Profile, ToolContext, ToolExecutionResult
+
+
+DESCRIPTION = textwrap.dedent(
+    """
+    Intelligently search your codebase: use it for complex, multi-step search tasks
+    where you need to find code based on functionality or concepts rather than exact
+    matches. Use this when you would otherwise chain multiple grep calls. Best for
+    behavior/concept questions, correlating multiple areas of the codebase, or
+    filtering broad terms by context. Be specific and goal-oriented in the query.
+    """
+).strip()
+
+ext = Extension(name="code-search", version="0.1.0")
+
+
+class CodeSearchInput(BaseModel):
+    query: str = Field(
+        min_length=1,
+        description=(
+            "A precise engineering search request. Be specific and include "
+            "technical terms, file types, APIs, code patterns, or success "
+            "criteria so the agent knows when it has found the right code."
+        ),
+    )
+    cwd: str | None = Field(
+        default=None,
+        description=(
+            "Optional directory to search from. Defaults to the current "
+            "workspace directory. Relative paths are resolved against the "
+            "current workspace directory."
+        ),
+    )
+    max_turns: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum number of search turns to suggest to the search agent. Defaults to 3.",
+    )
+
+
+def resolve_search_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
+    if raw_cwd is None:
+        return Path(workspace_cwd).resolve()
+    if not raw_cwd.strip():
+        raise ValueError("cwd must be a non-empty string when provided")
+
+    candidate = Path(raw_cwd).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(workspace_cwd) / candidate
+
+    resolved = candidate.resolve()
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd is not a directory: {resolved}")
+    return resolved
+
+
+def build_sysprompt_text(max_turns: int) -> str:
+    return (
+        textwrap.dedent(
+            f"""
+        You are a fast, parallel code search agent.
+        {{{{include "templates/sections/context_runtime.tmpl" .}}}}
+
+        ## Goal
+        - Use only `grep_tool`, `glob_tool`, and `file_read`.
+        - Find the most relevant files and line ranges for the user's request.
+        - Search efficiently; do not explore the whole repo or write a long essay.
+        - Always finish with a final assistant message, not raw tool output.
+
+        ## Search Strategy
+        - Maximize parallelism with diverse, scoped searches whenever possible.
+        - Try to finish within {max_turns} turns and stop once you have enough evidence.
+        - Prioritize source code over documentation unless the query is explicitly about docs.
+        - Be exhaustive when the request implies completeness, such as all usages, call sites, or implementations.
+        - Prefer `grep_tool` first and narrow globs to likely directories. Avoid repeated repo-wide scans.
+        - Read candidate files to confirm relevance before returning them.
+
+        ## Response
+        - Start with a 1 or 2 line summary.
+        - Then list the relevant files as markdown links in this format: `[relativePath#L{{start}}-L{{end}}](file://{{absolutePath}}#L{{start}}-L{{end}})`
+        - Include useful line ranges that cover the full relevant function, method, class, or block with a little context.
+        - If nothing relevant is found, say so briefly instead of guessing.
+        - On your last turn, stop searching and provide the best final answer you have.
+        """
+        ).strip()
+        + "\n"
+    )
+
+
+def build_search_profile(sysprompt_path: Path) -> Profile:
+    return Profile(
+        {
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "openai": {"api_mode": "responses", "service_tier": "fast"},
+            "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
+            "conversation_summary_mode": "first_message",
+            "enable_fs_search_tools": True,
+            "disable_subagent": True,
+            "is_sub_agent": True,
+            "extensions": {"enabled": False},
+            "mcp": {"enabled": False},
+            "no_skills": True,
+            "no_workflows": True,
+            "skills": {"enabled": False},
+            "sysprompt": str(sysprompt_path),
+            "tool_mode": "full",
+        }
+    )
+
+
+async def run_search_agent(query: str, search_cwd: Path, sysprompt_path: Path) -> str:
+    client = Client(command="kodelet", cwd=str(search_cwd))
+    try:
+        async def run_once() -> object:
+            session = await client.create_session(
+                profile=build_search_profile(sysprompt_path),
+                cwd=str(search_cwd),
+                streaming=True,
+            )
+            return await session.run_and_wait(query)
+
+        response = await asyncio.wait_for(run_once(), timeout=110)
+    except TimeoutError:
+        raise TimeoutError("code_search timed out while waiting for kodelet to finish") from None
+    finally:
+        await client.close()
+
+    content = response.get("content")
+    return content if isinstance(content, str) else ""
+
+
+@ext.tool(
+    "code_search",
+    description=DESCRIPTION,
+    input_schema=CodeSearchInput,
+    timeout_in_sec=120,
+)
+async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecutionResult:
+    query = input.query.strip()
+    if not query:
+        message = "query is required and must be a non-empty string"
+        return {"content": message, "error": message}
+
+    try:
+        search_cwd = resolve_search_cwd(input.cwd, ctx.cwd)
+    except ValueError as exc:
+        return {"content": str(exc), "error": str(exc)}
+
+    sysprompt_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".tmpl", encoding="utf-8", delete=False
+        ) as handle:
+            handle.write(build_sysprompt_text(input.max_turns))
+            sysprompt_path = Path(handle.name)
+
+        stdout = await run_search_agent(query, search_cwd, sysprompt_path)
+    except TimeoutError as exc:
+        return {"content": str(exc), "error": str(exc)}
+    except OSError as exc:
+        message = f"Failed to execute kodelet: {exc}"
+        return {"content": message, "error": message}
+    except Exception as exc:
+        message = f"code_search failed: {exc}"
+        return {"content": message, "error": message}
+    finally:
+        if sysprompt_path is not None:
+            try:
+                sysprompt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    stdout = stdout.strip()
+    if not stdout:
+        message = "code_search returned an empty response"
+        return {"content": message, "error": message}
+
+    return {"content": stdout}
+
+
+if __name__ == "__main__":
+    ext.run_sync()

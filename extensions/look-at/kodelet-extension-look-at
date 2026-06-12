@@ -1,20 +1,20 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #   "filetype",
 #   "google-genai",
+#   "kodelet-sdk",
 # ]
 # ///
 
 from __future__ import annotations
 
-import json
+import asyncio
 import mimetypes
 import os
 import platform
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,8 +22,9 @@ from urllib.parse import urlparse
 import filetype
 from google import genai
 from google.genai import types
+from kodelet_sdk import BaseModel, Extension, Field, ToolContext, ToolExecutionResult
 
-TOOL_NAME = "look_at"
+
 DESCRIPTION = """Extract specific information from a local file, including PDFs, images, audio, video, and documents.
 
 Use this tool when you need analysis or summarization rather than the literal file contents. Always provide a clear objective describing what you want to learn. Pass reference files when you want a comparison.
@@ -89,70 +90,39 @@ SYSTEM_PROMPT = """Analyze the provided file for a software engineer.
 - Use GitHub-flavored Markdown when helpful, including code fences for code snippets.
 """
 
-
-def get_description() -> dict[str, Any]:
-    return {
-        "name": TOOL_NAME,
-        "description": DESCRIPTION,
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the file to analyze.",
-                },
-                "objective": {
-                    "type": "string",
-                    "description": "Natural-language description of the analysis goal (e.g., summarize, extract data, describe image).",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "The broader goal and context for the analysis. Include relevant background information about what you are trying to achieve and why this analysis is needed.",
-                },
-                "referenceFiles": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of absolute paths to reference files for comparison (e.g., to compare two screenshots or documents).",
-                },
-            },
-            "required": ["path", "objective", "context"],
-        },
-    }
+ext = Extension(name="look-at", version="0.1.0")
 
 
-def fail(message: str, *, exit_code: int = 1) -> None:
-    print(message, file=sys.stderr)
-    sys.exit(exit_code)
+class LookAtInput(BaseModel):
+    path: str = Field(description="Absolute path to the file to analyze.")
+    objective: str = Field(
+        min_length=1,
+        description="Natural-language description of the analysis goal (e.g., summarize, extract data, describe image).",
+    )
+    context: str = Field(
+        min_length=1,
+        description="The broader goal and context for the analysis. Include relevant background information about what you are trying to achieve and why this analysis is needed.",
+    )
+    referenceFiles: list[str] = Field(
+        default_factory=list,
+        description="Optional list of absolute paths to reference files for comparison (e.g., to compare two screenshots or documents).",
+    )
 
 
-def ensure_non_empty_string(value: Any, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        fail(f"Missing required parameter: {field_name}")
-    return value.strip()
-
-
-def ensure_string_list(value: Any, field_name: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
-        fail(f"{field_name} must be an array of non-empty strings")
-    return [item.strip() for item in value]
-
-
-def normalize_local_path(raw_path: str) -> Path:
+def normalize_local_path(raw_path: str, cwd: str) -> Path:
     parsed = urlparse(raw_path)
     if parsed.scheme in {"http", "https"}:
-        fail("look_at only supports local files")
+        raise ValueError("look_at only supports local files")
     if parsed.scheme == "file":
         if parsed.netloc not in {"", "localhost"}:
-            fail(f"Unsupported file URI host: {parsed.netloc}")
+            raise ValueError(f"Unsupported file URI host: {parsed.netloc}")
         path = Path(parsed.path)
     else:
         path = Path(raw_path)
 
     path = Path(os.path.expanduser(str(path)))
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
+        path = (Path(cwd) / path).resolve()
     else:
         path = path.resolve()
     return path
@@ -160,9 +130,9 @@ def normalize_local_path(raw_path: str) -> Path:
 
 def ensure_regular_file(path: Path) -> Path:
     if not path.exists():
-        fail(f"File not found: {path}")
+        raise ValueError(f"File not found: {path}")
     if not path.is_file():
-        fail(f"Path is not a file: {path}")
+        raise ValueError(f"Path is not a file: {path}")
     return path
 
 
@@ -214,7 +184,7 @@ def is_inline_mime_type(mime_type: str) -> bool:
     )
 
 
-def build_environment_context() -> str:
+def build_environment_context(cwd: str) -> str:
     lines: list[str] = []
     os_name = platform.system().strip()
     os_version = platform.release().strip()
@@ -224,13 +194,13 @@ def build_environment_context() -> str:
         else:
             lines.append(f"Operating system: {os_name}")
 
-    cwd = str(Path.cwd())
     if cwd:
         lines.append(f"Working directory: {cwd}")
 
     try:
         repo_url = subprocess.run(
             ["git", "config", "--get", "remote.origin.url"],
+            cwd=cwd,
             capture_output=True,
             text=True,
             check=False,
@@ -256,7 +226,9 @@ def build_client() -> genai.Client:
     return genai.Client()
 
 
-def build_parts(main_path: Path, objective: str, context: str, reference_files: list[Path]) -> list[types.Part]:
+def build_parts(
+    main_path: Path, objective: str, context: str, reference_files: list[Path]
+) -> list[types.Part]:
     parts: list[types.Part] = []
 
     def append_file(path: Path, label: str) -> None:
@@ -300,11 +272,15 @@ def extract_response_text(response: Any) -> str:
     return "\n\n".join(chunks).strip()
 
 
-def analyze_file(main_path: Path, objective: str, context: str, reference_files: list[Path]) -> str:
+def analyze_file(
+    main_path: Path, objective: str, context: str, reference_files: list[Path], cwd: str
+) -> str:
     client = build_client()
-    contents = [types.Content(role="user", parts=build_parts(main_path, objective, context, reference_files))]
+    contents = [
+        types.Content(role="user", parts=build_parts(main_path, objective, context, reference_files))
+    ]
     config = types.GenerateContentConfig(
-        systemInstruction=SYSTEM_PROMPT + build_environment_context(),
+        systemInstruction=SYSTEM_PROMPT + build_environment_context(cwd),
         maxOutputTokens=MAX_OUTPUT_TOKENS,
         temperature=1,
     )
@@ -315,44 +291,42 @@ def analyze_file(main_path: Path, objective: str, context: str, reference_files:
     )
     result = extract_response_text(response)
     if not result:
-        fail("No response from analysis")
+        raise RuntimeError("No response from analysis")
     return result
 
 
-def run_tool() -> None:
+@ext.tool(
+    "look_at",
+    description=DESCRIPTION,
+    input_schema=LookAtInput,
+    timeout_in_sec=0,
+)
+async def look_at(input: LookAtInput, ctx: ToolContext) -> ToolExecutionResult:
     try:
-        input_data = json.load(sys.stdin)
-    except json.JSONDecodeError as exc:
-        fail(f"Invalid JSON input: {exc}")
-
-    path = ensure_regular_file(normalize_local_path(ensure_non_empty_string(input_data.get("path"), "path")))
-    objective = ensure_non_empty_string(input_data.get("objective"), "objective")
-    context = ensure_non_empty_string(input_data.get("context"), "context")
-    reference_files = [
-        ensure_regular_file(normalize_local_path(raw_path))
-        for raw_path in ensure_string_list(input_data.get("referenceFiles"), "referenceFiles")
-    ]
-
-    try:
-        print(analyze_file(path, objective, context, reference_files))
+        objective = input.objective.strip()
+        context = input.context.strip()
+        if not objective:
+            raise ValueError("Missing required parameter: objective")
+        if not context:
+            raise ValueError("Missing required parameter: context")
+        path = ensure_regular_file(normalize_local_path(input.path, ctx.cwd))
+        reference_files = [
+            ensure_regular_file(normalize_local_path(raw_path, ctx.cwd))
+            for raw_path in input.referenceFiles
+        ]
+        result = await asyncio.to_thread(
+            analyze_file,
+            path,
+            objective,
+            context,
+            reference_files,
+            ctx.cwd,
+        )
+        return {"content": result}
     except Exception as exc:
-        fail(f"Failed to analyze file: {exc}")
-
-
-def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {TOOL_NAME} [description|run]", file=sys.stderr)
-        sys.exit(1)
-
-    command = sys.argv[1]
-    if command == "description":
-        print(json.dumps(get_description(), indent=2))
-    elif command == "run":
-        run_tool()
-    else:
-        print(f"Unknown command: {command}", file=sys.stderr)
-        sys.exit(1)
+        message = f"Failed to analyze file: {exc}"
+        return {"content": message, "error": message}
 
 
 if __name__ == "__main__":
-    main()
+    ext.run_sync()

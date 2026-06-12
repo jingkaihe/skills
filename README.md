@@ -7,7 +7,6 @@ A collection of CLI tool skill definitions for AI assistants.
 | Skill | Description |
 |-------|-------------|
 | [ast-grep](./skills/ast-grep/SKILL.md) | Structural code search with ast-grep using AST-aware patterns |
-| [custom-tool](./skills/custom-tool/SKILL.md) | Create Kodelet custom executable tools implementing the `description`/`run` protocol |
 | [google-workspace](./skills/google-workspace/SKILL.md) | Google Workspace MCP integration - Gmail search, email management, attachments, and contacts |
 | [librarian](./skills/librarian/SKILL.md) | Maintain a local cache of remote Git repositories for code research and exploration |
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | Manage iCloud calendars, events, and email via the CLI |
@@ -27,6 +26,14 @@ A collection of CLI tool skill definitions for AI assistants.
 | [ralph/init](./recipes/ralph/init.md) | Generate a PRD (Product Requirements Document) based on discussion and design docs for autonomous development |
 | [ralph/iterate](./recipes/ralph/iterate.md) | Iteratively work through a feature list, implementing one feature at a time with progress tracking |
 
+## Available Extensions
+
+| Extension | Tools | Description |
+|-----------|-------|-------------|
+| [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
+| [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
+| [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
+
 ## Structure
 
 Each skill is contained in its own directory with a `SKILL.md` file that provides:
@@ -34,6 +41,8 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 - Prerequisites and setup instructions
 - Command reference and usage examples
 - Common workflows and troubleshooting tips
+
+Extensions live under `extensions/` as executable `kodelet-extension-*` Python SDK scripts with inline `uv` dependency metadata.
 
 ## Installation
 
