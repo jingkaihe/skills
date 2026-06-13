@@ -107,7 +107,11 @@ def build_search_profile(sysprompt_path: Path) -> Profile:
         {
             "provider": "openai",
             "model": "gpt-5.4-mini",
-            "openai": {"api_mode": "responses", "service_tier": "fast"},
+            "openai": {
+                "api_mode": "responses",
+                "service_tier": "fast",
+                "platform": "codex",
+            },
             "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
             "conversation_summary_mode": "first_message",
             "enable_fs_search_tools": True,
