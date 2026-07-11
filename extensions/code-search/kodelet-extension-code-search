@@ -24,6 +24,9 @@ DESCRIPTION = textwrap.dedent(
     """
 ).strip()
 
+TOOL_TIMEOUT_SECONDS = 5 * 60
+AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
+
 ext = Extension(name="code-search", version="0.1.0")
 
 
@@ -106,7 +109,8 @@ def build_search_profile(sysprompt_path: Path) -> Profile:
     return Profile(
         {
             "provider": "openai",
-            "model": "gpt-5.4-mini",
+            "model": "gpt-5.5",
+            "reasoning_effort": "none",
             "openai": {
                 "api_mode": "responses",
                 "service_tier": "fast",
@@ -139,7 +143,7 @@ async def run_search_agent(query: str, search_cwd: Path, sysprompt_path: Path) -
             )
             return await session.run_and_wait(query)
 
-        response = await asyncio.wait_for(run_once(), timeout=110)
+        response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
     except TimeoutError:
         raise TimeoutError("code_search timed out while waiting for kodelet to finish") from None
     finally:
@@ -153,7 +157,7 @@ async def run_search_agent(query: str, search_cwd: Path, sysprompt_path: Path) -
     "code_search",
     description=DESCRIPTION,
     input_schema=CodeSearchInput,
-    timeout_in_sec=120,
+    timeout_in_sec=TOOL_TIMEOUT_SECONDS,
 )
 async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecutionResult:
     query = input.query.strip()
