@@ -1,0 +1,149 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# ///
+
+from __future__ import annotations
+
+import asyncio
+import os
+import textwrap
+from pathlib import Path
+
+from kodelet_sdk import (
+    BaseModel,
+    Client,
+    Extension,
+    Field,
+    Profile,
+    ToolContext,
+    ToolExecutionResult,
+)
+
+
+DESCRIPTION = textwrap.dedent(
+    """
+    Delegate a self-contained task to an independent Kodelet agent. Use this for
+    complex implementation, investigation, review, or troubleshooting work that
+    benefits from its own context and tool loop. The child uses Kodelet's reserved
+    `default` profile and cannot invoke `subagent` recursively. Include all relevant
+    context and the expected outcome because each invocation starts a new session.
+    """
+).strip()
+
+TOOL_TIMEOUT_SECONDS = 60 * 60
+AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
+RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
+
+ext = Extension(name="subagent", version="0.1.0")
+
+
+class SubagentInput(BaseModel):
+    task: str = Field(
+        min_length=1,
+        description=(
+            "A complete, self-contained task for the subagent. Include the relevant "
+            "context, constraints, desired outcome, and expected response format."
+        ),
+    )
+    cwd: str | None = Field(
+        default=None,
+        description=(
+            "Optional directory for the subagent. Defaults to the current workspace "
+            "directory. Relative paths are resolved against the current workspace."
+        ),
+    )
+
+
+def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
+    if raw_cwd is None:
+        return Path(workspace_cwd).resolve()
+    if not raw_cwd.strip():
+        raise ValueError("cwd must be a non-empty string when provided")
+
+    candidate = Path(raw_cwd).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(workspace_cwd) / candidate
+
+    resolved = candidate.resolve()
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd is not a directory: {resolved}")
+    return resolved
+
+
+async def run_subagent(task: str, agent_cwd: Path) -> str:
+    client = Client(
+        command="kodelet",
+        cwd=str(agent_cwd),
+        env={RECURSION_GUARD_ENV: "1"},
+    )
+    try:
+
+        async def run_once() -> object:
+            session = await client.create_session(
+                profile=Profile.named("default"),
+                cwd=str(agent_cwd),
+                streaming=True,
+            )
+            return await session.run_and_wait(task)
+
+        response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
+    except TimeoutError:
+        raise TimeoutError(
+            "subagent timed out while waiting for kodelet to finish"
+        ) from None
+    finally:
+        await client.close()
+
+    content = response.get("content")
+    return content if isinstance(content, str) else ""
+
+
+async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResult:
+    if os.environ.get(RECURSION_GUARD_ENV) == "1":
+        message = "subagent recursion is disabled"
+        return {"content": message, "error": message}
+
+    task = input.task.strip()
+    if not task:
+        message = "task is required and must be a non-empty string"
+        return {"content": message, "error": message}
+
+    try:
+        agent_cwd = resolve_subagent_cwd(input.cwd, ctx.cwd)
+    except ValueError as exc:
+        return {"content": str(exc), "error": str(exc)}
+
+    try:
+        stdout = await run_subagent(task, agent_cwd)
+    except TimeoutError as exc:
+        return {"content": str(exc), "error": str(exc)}
+    except OSError as exc:
+        message = f"Failed to execute kodelet: {exc}"
+        return {"content": message, "error": message}
+    except Exception as exc:
+        message = f"subagent failed: {exc}"
+        return {"content": message, "error": message}
+
+    stdout = stdout.strip()
+    if not stdout:
+        message = "subagent returned an empty response"
+        return {"content": message, "error": message}
+
+    return {"content": stdout}
+
+
+if os.environ.get(RECURSION_GUARD_ENV) != "1":
+    ext.tool(
+        "subagent",
+        description=DESCRIPTION,
+        input_schema=SubagentInput,
+        timeout_in_sec=TOOL_TIMEOUT_SECONDS,
+    )(subagent)
+
+
+if __name__ == "__main__":
+    ext.run_sync()
