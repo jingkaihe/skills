@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk"]
+# dependencies = ["kodelet-sdk>=0.1.7"]
 # ///
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from kodelet_sdk import (
     Extension,
     Field,
     Profile,
+    TaskProgress,
     ToolContext,
     ToolExecutionResult,
 )
@@ -74,7 +75,11 @@ def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
     return resolved
 
 
-async def run_subagent(task: str, agent_cwd: Path) -> str:
+async def run_subagent(
+    task: str,
+    agent_cwd: Path,
+    progress: TaskProgress,
+) -> str:
     client = Client(
         command="kodelet",
         cwd=str(agent_cwd),
@@ -88,6 +93,7 @@ async def run_subagent(task: str, agent_cwd: Path) -> str:
                 cwd=str(agent_cwd),
                 streaming=True,
             )
+            progress.attach(session)
             return await session.run_and_wait(task)
 
         response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
@@ -117,23 +123,41 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
     except ValueError as exc:
         return {"content": str(exc), "error": str(exc)}
 
+    progress = TaskProgress(
+        ctx,
+        kind="subagent",
+        task=task,
+        cwd=str(agent_cwd),
+        running_title="Delegated task",
+        completed_title="Delegated task",
+        failed_title="Delegated task failed",
+        responding_detail="writing response",
+    )
+    await progress.start()
+
     try:
-        stdout = await run_subagent(task, agent_cwd)
+        stdout = await run_subagent(task, agent_cwd, progress)
     except TimeoutError as exc:
-        return {"content": str(exc), "error": str(exc)}
+        message = str(exc)
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     except OSError as exc:
         message = f"Failed to execute kodelet: {exc}"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     except Exception as exc:
         message = f"subagent failed: {exc}"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
 
     stdout = stdout.strip()
     if not stdout:
         message = "subagent returned an empty response"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
 
-    return {"content": stdout}
+    snapshot = await progress.finish(success=True)
+    return {"content": stdout, "data": {"taskRun": snapshot}}
 
 
 if os.environ.get(RECURSION_GUARD_ENV) != "1":

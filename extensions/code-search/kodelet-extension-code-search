@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk"]
+# dependencies = ["kodelet-sdk>=0.1.7"]
 # ///
 
 from __future__ import annotations
@@ -11,7 +11,16 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-from kodelet_sdk import BaseModel, Client, Extension, Field, Profile, ToolContext, ToolExecutionResult
+from kodelet_sdk import (
+    BaseModel,
+    Client,
+    Extension,
+    Field,
+    Profile,
+    TaskProgress,
+    ToolContext,
+    ToolExecutionResult,
+)
 
 
 DESCRIPTION = textwrap.dedent(
@@ -132,7 +141,12 @@ def build_search_profile(sysprompt_path: Path) -> Profile:
     )
 
 
-async def run_search_agent(query: str, search_cwd: Path, sysprompt_path: Path) -> str:
+async def run_search_agent(
+    query: str,
+    search_cwd: Path,
+    sysprompt_path: Path,
+    progress: TaskProgress,
+) -> str:
     client = Client(command="kodelet", cwd=str(search_cwd))
     try:
         async def run_once() -> object:
@@ -141,6 +155,7 @@ async def run_search_agent(query: str, search_cwd: Path, sysprompt_path: Path) -
                 cwd=str(search_cwd),
                 streaming=True,
             )
+            progress.attach(session)
             return await session.run_and_wait(query)
 
         response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
@@ -170,6 +185,18 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     except ValueError as exc:
         return {"content": str(exc), "error": str(exc)}
 
+    progress = TaskProgress(
+        ctx,
+        kind="code_search",
+        task=query,
+        cwd=str(search_cwd),
+        running_title="Searching code",
+        completed_title="Searched code",
+        failed_title="Code search failed",
+        responding_detail="writing summary",
+    )
+    await progress.start()
+
     sysprompt_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -178,15 +205,19 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
             handle.write(build_sysprompt_text(input.max_turns))
             sysprompt_path = Path(handle.name)
 
-        stdout = await run_search_agent(query, search_cwd, sysprompt_path)
+        stdout = await run_search_agent(query, search_cwd, sysprompt_path, progress)
     except TimeoutError as exc:
-        return {"content": str(exc), "error": str(exc)}
+        message = str(exc)
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     except OSError as exc:
         message = f"Failed to execute kodelet: {exc}"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     except Exception as exc:
         message = f"code_search failed: {exc}"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     finally:
         if sysprompt_path is not None:
             try:
@@ -197,9 +228,11 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     stdout = stdout.strip()
     if not stdout:
         message = "code_search returned an empty response"
-        return {"content": message, "error": message}
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
 
-    return {"content": stdout}
+    snapshot = await progress.finish(success=True)
+    return {"content": stdout, "data": {"taskRun": snapshot}}
 
 
 if __name__ == "__main__":
