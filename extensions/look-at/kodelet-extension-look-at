@@ -4,7 +4,7 @@
 # dependencies = [
 #   "filetype",
 #   "google-genai",
-#   "kodelet-sdk",
+#   "kodelet-sdk>=0.1.8",
 # ]
 # ///
 
