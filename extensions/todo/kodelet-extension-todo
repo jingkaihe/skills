@@ -1,0 +1,420 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk>=0.1.12"]
+# ///
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import uuid
+from pathlib import Path
+from typing import Any, Literal, Self
+
+from kodelet_sdk import (
+    AgentStartEvent,
+    BaseModel,
+    EventContext,
+    Extension,
+    Field,
+    ToolContext,
+    ToolExecutionResult,
+    UIFrameLine,
+    UIStyledSpan,
+)
+from pydantic import ConfigDict, ValidationError, model_validator
+
+TodoStatus = Literal["pending", "in_progress", "completed", "canceled"]
+TodoPriority = Literal["high", "medium", "low"]
+
+WIDGET_ID = "todo-progress"
+MAX_WIDGET_LINES = 10
+TERMINAL_STATUSES = {"completed", "canceled"}
+CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+STATUS_ORDER = {
+    "canceled": 0,
+    "completed": 1,
+    "in_progress": 2,
+    "pending": 3,
+}
+PRIORITY_ORDER = {
+    "high": 0,
+    "medium": 1,
+    "low": 2,
+}
+ext = Extension(name="todo", version="0.1.0")
+_todo_locks: dict[str, asyncio.Lock] = {}
+
+
+class TodoItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    content: str = Field(
+        min_length=1,
+        description="The content of the todo in 1-2 sentences.",
+    )
+    status: TodoStatus = Field(description="The current status of the todo.")
+    priority: TodoPriority = Field(description="The priority of the todo.")
+
+
+class TodoList(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    todos: list[TodoItem] = Field(
+        min_length=1,
+        description=(
+            "The full todo list, including pending, in_progress, completed, and "
+            "canceled items."
+        ),
+    )
+
+
+class TodoWriteInput(TodoList):
+    @model_validator(mode="after")
+    def validate_active_todo_count(self) -> Self:
+        if sum(todo.status == "in_progress" for todo in self.todos) > 1:
+            raise ValueError("todos must contain at most one in_progress item")
+        return self
+
+
+class TodoReadInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TodoStorageError(RuntimeError):
+    pass
+
+
+def todo_file(ctx: ToolContext | EventContext) -> Path:
+    conversation_id = (ctx.conversation_id or "").strip()
+    if not conversation_id:
+        raise ValueError("conversation ID is required")
+    if CONVERSATION_ID_PATTERN.fullmatch(conversation_id) is None:
+        raise ValueError("conversation ID contains unsupported characters")
+
+    raw_dir = ctx.env.get("CUSTOM_TOOL_TODO_DIR")
+    if raw_dir:
+        todo_dir = Path(raw_dir).expanduser()
+        if not todo_dir.is_absolute():
+            todo_dir = Path(ctx.cwd) / todo_dir
+        todo_dir = todo_dir.resolve()
+    else:
+        # Keep the existing custom-tool location so users retain their current lists.
+        todo_dir = Path.home() / ".kodelet" / "todos" / "custom-tools"
+
+    return todo_dir / f"{conversation_id}.json"
+
+
+def todo_lock(path: Path) -> asyncio.Lock:
+    key = str(path)
+    lock = _todo_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _todo_locks[key] = lock
+    return lock
+
+
+async def load_todos(path: Path) -> list[TodoItem] | None:
+    def read() -> list[TodoItem] | None:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise TodoStorageError(f"failed to read todo file {path}: {exc}") from exc
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TodoStorageError(f"failed to parse todo file {path}: {exc}") from exc
+
+        try:
+            return TodoList.model_validate(payload).todos
+        except ValidationError as exc:
+            raise TodoStorageError(
+                f"todo file has invalid format: {path}: {exc}"
+            ) from exc
+
+    return await asyncio.to_thread(read)
+
+
+def save_todos(path: Path, todos: list[TodoItem]) -> None:
+    payload = {"todos": [todo.model_dump() for todo in todos]}
+    encoded = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+    temporary_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary_path.write_text(encoded, encoding="utf-8")
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        raise TodoStorageError(f"failed to write todos to {path}: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def sort_todos(todos: list[TodoItem]) -> list[TodoItem]:
+    return sorted(
+        todos,
+        key=lambda todo: (
+            STATUS_ORDER[todo.status],
+            PRIORITY_ORDER[todo.priority],
+        ),
+    )
+
+
+def calculate_statistics(todos: list[TodoItem]) -> dict[str, int]:
+    statistics = {
+        "total": len(todos),
+        "completed": 0,
+        "in_progress": 0,
+        "pending": 0,
+        "canceled": 0,
+    }
+    for todo in todos:
+        statistics[todo.status] += 1
+    return statistics
+
+
+def snapshot(
+    action: Literal["read", "write"], path: Path, todos: list[TodoItem]
+) -> dict[str, Any]:
+    statistics = calculate_statistics(todos)
+    return {
+        "action": action,
+        "file_path": str(path),
+        "todos": [
+            {"id": str(index), **todo.model_dump()}
+            for index, todo in enumerate(todos, start=1)
+        ],
+        "statistics": statistics,
+    }
+
+
+def format_todos(todos: list[TodoItem]) -> str:
+    lines = ["Current todos:", "ID\tStatus\tPriority\tContent"]
+    lines.extend(
+        f"{index}\t{todo.status}\t{todo.priority}\t{todo.content}"
+        for index, todo in enumerate(todos, start=1)
+    )
+    return "\n".join(lines)
+
+
+def all_todos_finished(todos: list[TodoItem]) -> bool:
+    return bool(todos) and all(todo.status in TERMINAL_STATUSES for todo in todos)
+
+
+def widget_item_line(todo: TodoItem) -> UIFrameLine:
+    # Deliberately avoid fixed colors: the host's foreground remains readable in
+    # both Catppuccin Latte and Mocha, while weight/dimming convey status.
+    icon: UIStyledSpan
+    content: UIStyledSpan
+    if todo.status == "in_progress":
+        icon = {"text": "→ ", "style": {"bold": True}}
+        content = {"text": todo.content, "style": {"bold": True}}
+    elif todo.status == "completed":
+        icon = {"text": "✓ ", "style": {"dim": True}}
+        content = {
+            "text": todo.content,
+            "style": {"dim": True, "strikethrough": True},
+        }
+    elif todo.status == "canceled":
+        icon = {"text": "× ", "style": {"dim": True}}
+        content = {
+            "text": todo.content,
+            "style": {"dim": True, "strikethrough": True},
+        }
+    else:
+        icon = {"text": "○ ", "style": {"dim": True}}
+        content = {"text": todo.content}
+
+    priority: UIStyledSpan = {
+        "text": f"  [{todo.priority[0].upper()}]",
+        "style": {"dim": True},
+    }
+    return {"spans": [icon, content, priority]}
+
+
+def visible_widget_todos(todos: list[TodoItem], limit: int) -> list[TodoItem]:
+    if len(todos) <= limit:
+        return todos
+
+    focus_index = next(
+        (index for index, todo in enumerate(todos) if todo.status == "in_progress"),
+        next(
+            (index for index, todo in enumerate(todos) if todo.status == "pending"),
+            0,
+        ),
+    )
+    start = max(0, min(focus_index - limit // 2, len(todos) - limit))
+    return todos[start : start + limit]
+
+
+def widget_lines(todos: list[TodoItem]) -> list[UIFrameLine]:
+    statistics = calculate_statistics(todos)
+    finished = statistics["completed"] + statistics["canceled"]
+    total = statistics["total"]
+    bar_width = 10
+    filled = min(bar_width, (finished * bar_width) // total) if total else 0
+
+    header_spans: list[UIStyledSpan] = [
+        {"text": "Todos", "style": {"bold": True}},
+        {"text": f"  {finished}/{total} finished  ", "style": {"dim": True}},
+        {"text": "█" * filled, "style": {"bold": True}},
+        {"text": "░" * (bar_width - filled), "style": {"dim": True}},
+    ]
+    lines: list[UIFrameLine] = [{"spans": header_spans}]
+
+    available = MAX_WIDGET_LINES - 1
+    lines.extend(
+        widget_item_line(todo) for todo in visible_widget_todos(todos, available)
+    )
+    return lines
+
+
+async def sync_widget(ctx: ToolContext | EventContext, todos: list[TodoItem]) -> None:
+    if all_todos_finished(todos):
+        await ctx.ui.set_widget(WIDGET_ID, None)
+        return
+    await ctx.ui.set_widget(
+        WIDGET_ID,
+        widget_lines(todos),
+        {"placement": "aboveComposer"},
+    )
+
+
+async def publish_progress(
+    ctx: ToolContext,
+    action: Literal["read", "write"],
+    path: Path,
+    todos: list[TodoItem],
+) -> None:
+    progress = snapshot(action, path, todos)
+    statistics = progress["statistics"]
+    finished = statistics["completed"] + statistics["canceled"]
+
+    try:
+        await ctx.update(
+            f"Todo progress: {finished}/{statistics['total']} finished",
+            {"todo": progress},
+        )
+    except RuntimeError as exc:
+        ctx.log.warn(f"failed to stream todo progress: {exc}")  # noqa: G010
+
+    try:
+        await sync_widget(ctx, todos)
+    except RuntimeError as exc:
+        ctx.log.warn(f"failed to update todo widget: {exc}")  # noqa: G010
+
+
+def error_result(message: str) -> ToolExecutionResult:
+    return {
+        "content": message,
+        "error": message,
+        "data": {"success": False, "error": message},
+    }
+
+
+@ext.tool(
+    "todo_read",
+    description=(
+        "Read the current conversation's todo list. Use it to review progress, find the "
+        "active item, or recover context when work has gone off track."
+    ),
+    input_schema=TodoReadInput,
+)
+async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionResult:
+    try:
+        path = todo_file(ctx)
+    except ValueError as exc:
+        return error_result(str(exc))
+
+    async with todo_lock(path):
+        try:
+            todos = await load_todos(path)
+        except TodoStorageError as exc:
+            try:
+                await ctx.ui.set_widget(WIDGET_ID, None)
+            except RuntimeError as widget_exc:
+                ctx.log.warn(  # noqa: G010
+                    f"failed to remove invalid todo widget: {widget_exc}"
+                )
+            return error_result(str(exc))
+        if todos is None:
+            try:
+                await ctx.ui.set_widget(WIDGET_ID, None)
+            except RuntimeError as exc:
+                ctx.log.warn(f"failed to remove missing todo widget: {exc}")  # noqa: G010
+            return error_result(f"todo file not found: {path}")
+
+        sorted_todos = sort_todos(todos)
+        await publish_progress(ctx, "read", path, todos)
+    return {
+        "content": format_todos(sorted_todos),
+        "data": snapshot("read", path, sorted_todos),
+    }
+
+
+@ext.tool(
+    "todo_write",
+    description=(
+        "Create or replace the full todo list for the current conversation. Use it for "
+        "non-trivial work, user-provided task lists, or whenever explicit progress tracking "
+        "will help. Always send the complete list, preserve existing items and their order, "
+        "keep at most one item in_progress, and mark items completed or canceled as soon as "
+        "their state changes."
+    ),
+    input_schema=TodoWriteInput,
+)
+async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionResult:
+    try:
+        path = todo_file(ctx)
+    except ValueError as exc:
+        return error_result(str(exc))
+
+    todos = list(input.todos)
+    async with todo_lock(path):
+        try:
+            save_todos(path, todos)
+        except TodoStorageError as exc:
+            return error_result(str(exc))
+        await publish_progress(ctx, "write", path, todos)
+    return {
+        "content": "Todo list updated.",
+        "data": snapshot("write", path, todos),
+    }
+
+
+@ext.on("agent.start")
+async def restore_widget(_event: AgentStartEvent, ctx: EventContext) -> None:
+    try:
+        path = todo_file(ctx)
+    except ValueError:
+        await ctx.ui.set_widget(WIDGET_ID, None)
+        return
+
+    async with todo_lock(path):
+        try:
+            todos = await load_todos(path)
+        except TodoStorageError as exc:
+            ctx.log.warn(f"failed to restore todo widget: {exc}")  # noqa: G010
+            await ctx.ui.set_widget(WIDGET_ID, None)
+            return
+        if todos is None:
+            await ctx.ui.set_widget(WIDGET_ID, None)
+            return
+        await sync_widget(ctx, todos)
+
+
+if __name__ == "__main__":
+    ext.run_sync()
