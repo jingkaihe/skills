@@ -45,6 +45,12 @@ PRIORITY_ORDER = {
     "medium": 1,
     "low": 2,
 }
+WIDGET_STATUS_ORDER = {
+    "in_progress": 0,
+    "pending": 1,
+    "completed": 2,
+    "canceled": 3,
+}
 ext = Extension(name="todo", version="0.1.0")
 _todo_locks: dict[str, asyncio.Lock] = {}
 
@@ -245,21 +251,6 @@ def widget_item_line(todo: TodoItem) -> UIFrameLine:
     return {"spans": [icon, content, priority]}
 
 
-def visible_widget_todos(todos: list[TodoItem], limit: int) -> list[TodoItem]:
-    if len(todos) <= limit:
-        return todos
-
-    focus_index = next(
-        (index for index, todo in enumerate(todos) if todo.status == "in_progress"),
-        next(
-            (index for index, todo in enumerate(todos) if todo.status == "pending"),
-            0,
-        ),
-    )
-    start = max(0, min(focus_index - limit // 2, len(todos) - limit))
-    return todos[start : start + limit]
-
-
 def widget_lines(todos: list[TodoItem]) -> list[UIFrameLine]:
     statistics = calculate_statistics(todos)
     finished = statistics["completed"] + statistics["canceled"]
@@ -275,10 +266,27 @@ def widget_lines(todos: list[TodoItem]) -> list[UIFrameLine]:
     ]
     lines: list[UIFrameLine] = [{"spans": header_spans}]
 
+    ordered = sorted(todos, key=lambda todo: WIDGET_STATUS_ORDER[todo.status])
     available = MAX_WIDGET_LINES - 1
-    lines.extend(
-        widget_item_line(todo) for todo in visible_widget_todos(todos, available)
-    )
+    if len(ordered) > available:
+        visible = ordered[: available - 1]
+        hidden_count = len(ordered) - len(visible)
+    else:
+        visible = ordered
+        hidden_count = 0
+
+    lines.extend(widget_item_line(todo) for todo in visible)
+    if hidden_count:
+        lines.append(
+            {
+                "spans": [
+                    {
+                        "text": f"… {hidden_count} more item{'s' if hidden_count != 1 else ''}",
+                        "style": {"dim": True},
+                    }
+                ]
+            }
+        )
     return lines
 
 
