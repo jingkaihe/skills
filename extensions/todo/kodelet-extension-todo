@@ -31,7 +31,6 @@ TodoStatus = Literal["pending", "in_progress", "completed", "canceled"]
 TodoPriority = Literal["high", "medium", "low"]
 
 WIDGET_ID = "todo-progress"
-MAX_WIDGET_LINES = 10
 TERMINAL_STATUSES = {"completed", "canceled"}
 CONVERSATION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 STATUS_ORDER = {
@@ -267,26 +266,7 @@ def widget_lines(todos: list[TodoItem]) -> list[UIFrameLine]:
     lines: list[UIFrameLine] = [{"spans": header_spans}]
 
     ordered = sorted(todos, key=lambda todo: WIDGET_STATUS_ORDER[todo.status])
-    available = MAX_WIDGET_LINES - 1
-    if len(ordered) > available:
-        visible = ordered[: available - 1]
-        hidden_count = len(ordered) - len(visible)
-    else:
-        visible = ordered
-        hidden_count = 0
-
-    lines.extend(widget_item_line(todo) for todo in visible)
-    if hidden_count:
-        lines.append(
-            {
-                "spans": [
-                    {
-                        "text": f"… {hidden_count} more item{'s' if hidden_count != 1 else ''}",
-                        "style": {"dim": True},
-                    }
-                ]
-            }
-        )
+    lines.extend(widget_item_line(todo) for todo in ordered)
     return lines
 
 
