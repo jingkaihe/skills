@@ -20,6 +20,7 @@ from kodelet_sdk import (
     EventContext,
     Extension,
     Field,
+    SessionStartEvent,
     ToolContext,
     ToolExecutionResult,
     UIFrameLine,
@@ -383,8 +384,11 @@ async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionRe
     }
 
 
+@ext.on("session.start")
 @ext.on("agent.start")
-async def restore_widget(_event: AgentStartEvent, ctx: EventContext) -> None:
+async def restore_widget(
+    _event: SessionStartEvent | AgentStartEvent, ctx: EventContext
+) -> None:
     try:
         path = todo_file(ctx)
     except ValueError:
