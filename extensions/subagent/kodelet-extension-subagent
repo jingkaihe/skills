@@ -98,17 +98,46 @@ def build_subagent_profile() -> Profile:
     )
 
 
+def build_subagent_progress(
+    ctx: ToolContext,
+    task: str,
+    agent_cwd: Path,
+    context_mode: str | None = None,
+) -> TaskProgress:
+    context_suffix = f" · {context_mode} context" if context_mode else ""
+    return TaskProgress(
+        ctx,
+        kind="subagent",
+        task=task,
+        cwd=str(agent_cwd),
+        running_title=f"Delegated task{context_suffix}",
+        completed_title=f"Delegated task{context_suffix}",
+        failed_title=f"Delegated task failed{context_suffix}",
+        responding_detail="writing response",
+    )
+
+
+async def inherit_parent_context(parent_context: ToolContext) -> str | None:
+    try:
+        return await parent_context.fork_conversation()
+    except ConversationForkUnavailableError as exc:
+        parent_context.log.warn(  # noqa: G010, PLE1205
+            "subagent falling back to fresh context",
+            {
+                "contextMode": "fresh",
+                "parentConversationId": parent_context.conversation_id,
+                "reason": str(exc),
+            },
+        )
+        return None
+
+
 async def run_subagent(
     task: str,
     agent_cwd: Path,
-    parent_context: ToolContext,
+    inherited_conversation_id: str | None,
     progress: TaskProgress,
 ) -> str:
-    try:
-        inherited_conversation_id = await parent_context.fork_conversation()
-    except ConversationForkUnavailableError:
-        inherited_conversation_id = None
-
     client = Client(
         command="kodelet",
         cwd=str(agent_cwd),
@@ -159,20 +188,26 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
     except ValueError as exc:
         return {"content": str(exc), "error": str(exc)}
 
-    progress = TaskProgress(
-        ctx,
-        kind="subagent",
-        task=task,
-        cwd=str(agent_cwd),
-        running_title="Delegated task",
-        completed_title="Delegated task",
-        failed_title="Delegated task failed",
-        responding_detail="writing response",
-    )
+    try:
+        inherited_conversation_id = await inherit_parent_context(ctx)
+    except RuntimeError as exc:
+        message = f"subagent failed: {exc}"
+        progress = build_subagent_progress(ctx, task, agent_cwd)
+        await progress.start()
+        snapshot = await progress.finish(success=False, error=message)
+        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
+
+    context_mode = "inherited" if inherited_conversation_id is not None else "fresh"
+    progress = build_subagent_progress(ctx, task, agent_cwd, context_mode)
     await progress.start()
 
     try:
-        stdout = await run_subagent(task, agent_cwd, ctx, progress)
+        stdout = await run_subagent(
+            task,
+            agent_cwd,
+            inherited_conversation_id,
+            progress,
+        )
     except TimeoutError as exc:
         message = str(exc)
         snapshot = await progress.finish(success=False, error=message)
@@ -181,7 +216,7 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
         message = f"Failed to execute kodelet: {exc}"
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         message = f"subagent failed: {exc}"
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
