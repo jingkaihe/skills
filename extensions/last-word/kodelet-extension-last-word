@@ -1,0 +1,136 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk>=0.1.16"]
+# ///
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from kodelet_sdk import (
+    BaseModel,
+    CommandContext,
+    CommandResult,
+    EventContext,
+    Extension,
+    Field,
+    TurnEndEvent,
+)
+from pydantic import AliasChoices, ConfigDict
+
+DEFAULT_OUTPUT_PATH = "last-word.md"
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
+
+ext = Extension(name="last-word", version="0.1.0")
+
+
+class LastWordInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    path: str = Field(
+        default=DEFAULT_OUTPUT_PATH,
+        validation_alias=AliasChoices("path", "text"),
+        description="Workspace-relative Markdown file to write. Defaults to last-word.md.",
+    )
+
+
+def response_storage_path(conversation_id: str | None) -> str:
+    normalized = (conversation_id or "").strip()
+    if not normalized:
+        raise ValueError("conversation ID is unavailable")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"responses/{digest}.md"
+
+
+def resolve_output_path(raw_path: str, ctx: CommandContext) -> Path:
+    output_path = raw_path.strip()
+    if not output_path:
+        raise ValueError("path must be a non-empty workspace-relative path")
+
+    suffix = Path(output_path).suffix.lower()
+    if not suffix:
+        output_path = f"{output_path}.md"
+    elif suffix not in MARKDOWN_SUFFIXES:
+        raise ValueError("path must end in .md or .markdown")
+
+    return Path(ctx.path.resolve_workspace_path(output_path))
+
+
+async def requested_output_path(input: LastWordInput, ctx: CommandContext) -> str:
+    if ctx.input.get("args"):
+        return input.path
+
+    try:
+        selected_path = await ctx.ui.input(
+            {
+                "id": "last-word-path",
+                "title": "Save last agent response",
+                "message": "Choose a Markdown file in the current workspace.",
+                "placeholder": DEFAULT_OUTPUT_PATH,
+                "defaultValue": DEFAULT_OUTPUT_PATH,
+                "submitButtonText": "Save",
+                "cancelButtonText": "Use default",
+                "required": True,
+            }
+        )
+    except RuntimeError as exc:
+        ctx.log.warn(f"path prompt unavailable; using default: {exc}")  # noqa: G010
+        return DEFAULT_OUTPUT_PATH
+    return selected_path or DEFAULT_OUTPUT_PATH
+
+
+@ext.on("turn.end")
+async def remember_last_word(event: TurnEndEvent, ctx: EventContext) -> None:
+    if not event.response.strip():
+        return
+
+    try:
+        cache_path = response_storage_path(ctx.conversation_id)
+        await ctx.storage.write_text(cache_path, event.response)
+    except (OSError, ValueError) as exc:
+        ctx.log.warn(f"failed to cache the final agent response: {exc}")  # noqa: G010
+
+
+@ext.command(
+    "last-word",
+    aliases=["/last-word"],
+    description="Save the most recent completed agent response to a Markdown file",
+    input_schema=LastWordInput,
+)
+async def last_word(input: LastWordInput, ctx: CommandContext) -> CommandResult:
+    try:
+        cache_path = response_storage_path(ctx.conversation_id)
+        content = await ctx.storage.read_text(cache_path)
+    except (OSError, ValueError) as exc:
+        return {
+            "action": "respond",
+            "response": f"Could not read the last agent response: {exc}.",
+        }
+
+    if content is None:
+        return {
+            "action": "respond",
+            "response": "No completed agent response is available in this conversation yet.",
+        }
+
+    try:
+        requested_path = await requested_output_path(input, ctx)
+        output_path = resolve_output_path(requested_path, ctx)
+        await ctx.fs.write_text(str(output_path), content)
+    except (OSError, ValueError) as exc:
+        return {
+            "action": "respond",
+            "response": f"Could not save the last agent response: {exc}.",
+        }
+
+    relative_path = ctx.path.relative_to_workspace(str(output_path))
+    return {
+        "action": "respond",
+        "response": f"Saved the last agent response to `{relative_path}`.",
+    }
+
+
+if __name__ == "__main__":
+    ext.run_sync()
