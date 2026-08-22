@@ -17,7 +17,6 @@ from kodelet_sdk import (
     ConversationForkUnavailableError,
     Extension,
     Field,
-    Profile,
     TaskProgress,
     ToolContext,
     ToolExecutionResult,
@@ -76,28 +75,6 @@ def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
     return resolved
 
 
-def build_subagent_profile() -> Profile:
-    return Profile(
-        {
-            "max_tokens": 128000,
-            "model": "gpt-5.6-sol",
-            "openai": {
-                "api_mode": "responses",
-                "platform": "codex",
-                "service_tier": "fast",
-            },
-            "profile": "default",
-            "provider": "openai",
-            "reasoning_effort": "max",
-            "allowed_reasoning_efforts": ["medium", "high", "xhigh", "max"],
-            "sysprompt": "~/.kodelet/sysprompt.tmpl",
-            "tool_mode": "patch",
-            "weak_model": "gpt-5.4-mini",
-            "weak_model_max_tokens": 8192,
-        }
-    )
-
-
 def build_subagent_progress(
     ctx: ToolContext,
     task: str,
@@ -154,7 +131,6 @@ async def run_subagent(
                 )
             else:
                 session = await client.create_session(
-                    profile=build_subagent_profile(),
                     cwd=str(agent_cwd),
                     streaming=True,
                 )
