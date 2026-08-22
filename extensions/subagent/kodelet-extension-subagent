@@ -12,9 +12,12 @@ import textwrap
 from pathlib import Path
 
 from kodelet_sdk import (
+    AgentInitEvent,
     BaseModel,
     Client,
     ConversationForkUnavailableError,
+    EventContext,
+    EventResult,
     Extension,
     Field,
     TaskProgress,
@@ -36,8 +39,9 @@ DESCRIPTION = textwrap.dedent(
 TOOL_TIMEOUT_SECONDS = 60 * 60
 AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
+SUBAGENT_TOOL_NAME = "subagent"
 
-ext = Extension(name="subagent", version="0.1.0")
+ext = Extension(name=SUBAGENT_TOOL_NAME, version="0.1.0")
 
 
 class SubagentInput(BaseModel):
@@ -55,6 +59,16 @@ class SubagentInput(BaseModel):
             "directory. Relative paths are resolved against the current workspace."
         ),
     )
+
+
+@ext.on("agent.init")
+async def disable_recursive_subagent(
+    _event: AgentInitEvent,
+    ctx: EventContext,
+) -> EventResult | None:
+    if ctx.invoked_by == SUBAGENT_TOOL_NAME:
+        return {"tools": {"disable": [SUBAGENT_TOOL_NAME]}}
+    return None
 
 
 def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
@@ -98,6 +112,10 @@ async def inherit_parent_context(parent_context: ToolContext) -> str | None:
     try:
         return await parent_context.fork_conversation()
     except ConversationForkUnavailableError as exc:
+        if os.environ.get("KODELET_SERVER", "").strip():
+            raise RuntimeError(
+                "server-backed subagent requires live conversation forking"
+            ) from exc
         parent_context.log.warn(  # noqa: G010, PLE1205
             "subagent falling back to fresh context",
             {
@@ -209,7 +227,7 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
 
 if os.environ.get(RECURSION_GUARD_ENV) != "1":
     ext.tool(
-        "subagent",
+        SUBAGENT_TOOL_NAME,
         description=DESCRIPTION,
         input_schema=SubagentInput,
         timeout_in_sec=TOOL_TIMEOUT_SECONDS,
