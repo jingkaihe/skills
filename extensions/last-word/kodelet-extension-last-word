@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.16"]
+# dependencies = ["kodelet-sdk>=0.1.17"]
 # ///
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from kodelet_sdk import (
     EventContext,
     Extension,
     Field,
+    SharedContext,
+    ShortcutContext,
     TurnEndEvent,
 )
 from pydantic import AliasChoices, ConfigDict
@@ -44,7 +46,7 @@ def response_storage_path(conversation_id: str | None) -> str:
     return f"responses/{digest}.md"
 
 
-def resolve_output_path(raw_path: str, ctx: CommandContext) -> Path:
+def resolve_output_path(raw_path: str, ctx: SharedContext) -> Path:
     output_path = raw_path.strip()
     if not output_path:
         raise ValueError("path must be a non-empty workspace-relative path")
@@ -58,10 +60,7 @@ def resolve_output_path(raw_path: str, ctx: CommandContext) -> Path:
     return Path(ctx.path.resolve_workspace_path(output_path))
 
 
-async def requested_output_path(input: LastWordInput, ctx: CommandContext) -> str:
-    if ctx.input.get("args"):
-        return input.path
-
+async def prompt_output_path(ctx: SharedContext) -> str:
     try:
         selected_path = await ctx.ui.input(
             {
@@ -79,6 +78,32 @@ async def requested_output_path(input: LastWordInput, ctx: CommandContext) -> st
         ctx.log.warn(f"path prompt unavailable; using default: {exc}")  # noqa: G010
         return DEFAULT_OUTPUT_PATH
     return selected_path or DEFAULT_OUTPUT_PATH
+
+
+async def requested_output_path(input: LastWordInput, ctx: CommandContext) -> str:
+    if ctx.input.get("args"):
+        return input.path
+    return await prompt_output_path(ctx)
+
+
+async def save_last_word_to_path(raw_path: str, ctx: SharedContext) -> str:
+    try:
+        cache_path = response_storage_path(ctx.conversation_id)
+        content = await ctx.storage.read_text(cache_path)
+    except (OSError, ValueError) as exc:
+        return f"Could not read the last agent response: {exc}."
+
+    if content is None:
+        return "No completed agent response is available in this conversation yet."
+
+    try:
+        output_path = resolve_output_path(raw_path, ctx)
+        await ctx.fs.write_text(str(output_path), content)
+    except (OSError, ValueError) as exc:
+        return f"Could not save the last agent response: {exc}."
+
+    relative_path = ctx.path.relative_to_workspace(str(output_path))
+    return f"Saved the last agent response to `{relative_path}`."
 
 
 @ext.on("turn.end")
@@ -100,36 +125,21 @@ async def remember_last_word(event: TurnEndEvent, ctx: EventContext) -> None:
     input_schema=LastWordInput,
 )
 async def last_word(input: LastWordInput, ctx: CommandContext) -> CommandResult:
-    try:
-        cache_path = response_storage_path(ctx.conversation_id)
-        content = await ctx.storage.read_text(cache_path)
-    except (OSError, ValueError) as exc:
-        return {
-            "action": "respond",
-            "response": f"Could not read the last agent response: {exc}.",
-        }
-
-    if content is None:
-        return {
-            "action": "respond",
-            "response": "No completed agent response is available in this conversation yet.",
-        }
-
-    try:
-        requested_path = await requested_output_path(input, ctx)
-        output_path = resolve_output_path(requested_path, ctx)
-        await ctx.fs.write_text(str(output_path), content)
-    except (OSError, ValueError) as exc:
-        return {
-            "action": "respond",
-            "response": f"Could not save the last agent response: {exc}.",
-        }
-
-    relative_path = ctx.path.relative_to_workspace(str(output_path))
+    requested_path = await requested_output_path(input, ctx)
     return {
         "action": "respond",
-        "response": f"Saved the last agent response to `{relative_path}`.",
+        "response": await save_last_word_to_path(requested_path, ctx),
     }
+
+
+@ext.shortcut(
+    "ctrl+alt+w",
+    description="Save the most recent completed agent response to a Markdown file",
+)
+async def last_word_shortcut(ctx: ShortcutContext) -> None:
+    requested_path = await prompt_output_path(ctx)
+    response = await save_last_word_to_path(requested_path, ctx)
+    await ctx.ui.notify({"title": "Last word", "message": response})
 
 
 if __name__ == "__main__":

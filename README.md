@@ -31,12 +31,12 @@ A collection of CLI tool skill definitions for AI assistants.
 | Extension | Tools / Commands | Description |
 |-----------|------------------|-------------|
 | [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
-| [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word` | Save the most recent completed agent response to a Markdown file |
+| [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
 | [subagent](./extensions/subagent/kodelet-extension-subagent) | `subagent` | Delegate self-contained tasks to an independent Kodelet session |
 
-`/last-word` prompts for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
+`/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 
 ## Structure
 
