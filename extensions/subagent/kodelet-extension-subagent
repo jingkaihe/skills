@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.17"]
+# dependencies = ["kodelet-sdk>=0.1.19"]
 # ///
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ TOOL_TIMEOUT_SECONDS = 60 * 60
 AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
 SUBAGENT_TOOL_NAME = "subagent"
+CONVERSATION_NAME_MAX_LENGTH = 100
 
 ext = Extension(name=SUBAGENT_TOOL_NAME, version="0.1.0")
 
@@ -108,9 +109,16 @@ def build_subagent_progress(
     )
 
 
-async def inherit_parent_context(parent_context: ToolContext) -> str | None:
+def conversation_name_from_task(task: str) -> str:
+    name = " ".join(task.split())
+    if len(name) <= CONVERSATION_NAME_MAX_LENGTH:
+        return name
+    return f"{name[: CONVERSATION_NAME_MAX_LENGTH - 3]}..."
+
+
+async def inherit_parent_context(parent_context: ToolContext, task: str) -> str | None:
     try:
-        return await parent_context.fork_conversation()
+        return await parent_context.fork_conversation(name=conversation_name_from_task(task))
     except ConversationForkUnavailableError as exc:
         if os.environ.get("KODELET_SERVER", "").strip():
             raise RuntimeError(
@@ -183,7 +191,7 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
         return {"content": str(exc), "error": str(exc)}
 
     try:
-        inherited_conversation_id = await inherit_parent_context(ctx)
+        inherited_conversation_id = await inherit_parent_context(ctx, task)
     except RuntimeError as exc:
         message = f"subagent failed: {exc}"
         progress = build_subagent_progress(ctx, task, agent_cwd)
