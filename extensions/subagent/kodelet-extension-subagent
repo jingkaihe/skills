@@ -9,7 +9,11 @@ from __future__ import annotations
 import asyncio
 import os
 import textwrap
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from kodelet_sdk import (
     AgentInitEvent,
@@ -20,59 +24,165 @@ from kodelet_sdk import (
     EventResult,
     Extension,
     Field,
-    TaskProgress,
     ToolContext,
     ToolExecutionResult,
 )
 
-DESCRIPTION = textwrap.dedent(
+SPAWN_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Delegate a task to an independent Kodelet agent. When available, the subagent
-    inherits the caller's live conversation context in an isolated fork; otherwise
-    it starts with a fresh context. Use this for complex implementation,
-    investigation, review, or troubleshooting work that benefits from its own tool
-    loop. Include task-specific constraints, the desired outcome, and the expected
-    response format.
+    Start an independent Kodelet agent in the background and return immediately.
+    By default, the child inherits the caller's live conversation context in an
+    isolated fork. Set context_mode to fresh to start with no parent conversation
+    memory. Use this for work that can proceed independently while the main agent
+    continues. Call wait_agent before relying on the result or finishing work that
+    requires it. Background agents live only for the current Kodelet session.
     """
 ).strip()
 
-TOOL_TIMEOUT_SECONDS = 60 * 60
-AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
+WAIT_AGENT_DESCRIPTION = textwrap.dedent(
+    """
+    Wait for a background agent owned by this conversation. Returns the final
+    response when the agent finishes, or its current status when the timeout
+    expires. Use a zero timeout to poll without waiting.
+    """
+).strip()
+
+LIST_AGENTS_DESCRIPTION = textwrap.dedent(
+    """
+    List background agents spawned by this conversation, including their current
+    status and child conversation IDs.
+    """
+).strip()
+
+CANCEL_AGENT_DESCRIPTION = textwrap.dedent(
+    """
+    Cancel a running background agent owned by this conversation. Completed,
+    failed, and already canceled agents are left unchanged.
+    """
+).strip()
+
+AGENT_TIMEOUT_SECONDS = 60 * 60 - 10
+SPAWN_TOOL_TIMEOUT_SECONDS = 60
+WAIT_TOOL_TIMEOUT_SECONDS = 5 * 60 + 10
+CANCEL_TOOL_TIMEOUT_SECONDS = 15
+MAX_WAIT_MILLISECONDS = 5 * 60 * 1000
+MAX_ACTIVE_AGENTS_PER_CONVERSATION = 3
+MAX_ACTIVE_AGENTS_TOTAL = 8
+MAX_RETAINED_AGENTS_PER_CONVERSATION = 32
+MAX_RETAINED_AGENTS_TOTAL = 128
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
-SUBAGENT_TOOL_NAME = "subagent"
 CONVERSATION_NAME_MAX_LENGTH = 100
+AGENT_TOOL_NAMES = (
+    "spawn_agent",
+    "wait_agent",
+    "list_agents",
+    "cancel_agent",
+)
 
-ext = Extension(name=SUBAGENT_TOOL_NAME, version="0.1.0")
+AgentStatus = Literal["pending", "running", "completed", "failed", "canceled"]
+SpawnContextMode = Literal["fork", "fresh"]
+JobContextMode = Literal["pending", "fork", "fresh"]
+TERMINAL_AGENT_STATUSES = {"completed", "failed", "canceled"}
+
+ext = Extension(name="subagent", version="0.2.0")
 
 
-class SubagentInput(BaseModel):
+class SpawnAgentInput(BaseModel):
     task: str = Field(
         min_length=1,
         description=(
-            "A complete, self-contained task for the subagent. Include the relevant "
+            "A complete, self-contained task for the agent. Include the relevant "
             "context, constraints, desired outcome, and expected response format."
         ),
     )
     cwd: str | None = Field(
         default=None,
         description=(
-            "Optional directory for the subagent. Defaults to the current workspace "
+            "Optional directory for the agent. Defaults to the current workspace "
             "directory. Relative paths are resolved against the current workspace."
+        ),
+    )
+    context_mode: SpawnContextMode = Field(
+        default="fork",
+        description=(
+            "How to initialize the child conversation. 'fork' copies the main "
+            "agent's live conversation into an isolated child; 'fresh' starts "
+            "with no parent conversation memory. Defaults to 'fork'."
         ),
     )
 
 
+class WaitAgentInput(BaseModel):
+    agent_id: str = Field(
+        min_length=1,
+        description="The agent ID returned by spawn_agent.",
+    )
+    timeout_ms: int = Field(
+        default=30_000,
+        ge=0,
+        le=MAX_WAIT_MILLISECONDS,
+        description=(
+            "Maximum time to wait in milliseconds. Use 0 to return the current "
+            "status immediately. Defaults to 30000 and is capped at 300000."
+        ),
+    )
+
+
+class ListAgentsInput(BaseModel):
+    pass
+
+
+class CancelAgentInput(BaseModel):
+    agent_id: str = Field(
+        min_length=1,
+        description="The agent ID returned by spawn_agent.",
+    )
+
+
+@dataclass(slots=True)
+class AgentJob:
+    agent_id: str
+    owner_conversation_id: str
+    task: str
+    cwd: Path
+    child_conversation_id: str | None = None
+    context_mode: JobContextMode = "pending"
+    status: AgentStatus = "pending"
+    result: str | None = None
+    error: str | None = None
+    created_at: str = field(default_factory=lambda: utc_now())
+    started_at: str | None = None
+    completed_at: str | None = None
+    runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    client: Client | None = field(default=None, repr=False)
+    done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+
+_jobs: dict[str, AgentJob] = {}
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def is_agent_child(ctx: ToolContext | EventContext) -> bool:
+    if os.environ.get(RECURSION_GUARD_ENV) == "1":
+        return True
+    invoked_by = (getattr(ctx, "invoked_by", None) or "").strip()
+    return bool(invoked_by and invoked_by != "main")
+
+
 @ext.on("agent.init")
-async def disable_recursive_subagent(
+async def disable_recursive_agents(
     _event: AgentInitEvent,
     ctx: EventContext,
 ) -> EventResult | None:
-    if ctx.invoked_by == SUBAGENT_TOOL_NAME:
-        return {"tools": {"disable": [SUBAGENT_TOOL_NAME]}}
+    if is_agent_child(ctx):
+        return {"tools": {"disable": list(AGENT_TOOL_NAMES)}}
     return None
 
 
-def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
+def resolve_agent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
     if raw_cwd is None:
         return Path(workspace_cwd).resolve()
     if not raw_cwd.strip():
@@ -90,25 +200,6 @@ def resolve_subagent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
     return resolved
 
 
-def build_subagent_progress(
-    ctx: ToolContext,
-    task: str,
-    agent_cwd: Path,
-    context_mode: str | None = None,
-) -> TaskProgress:
-    context_suffix = f" · {context_mode} context" if context_mode else ""
-    return TaskProgress(
-        ctx,
-        kind="subagent",
-        task=task,
-        cwd=str(agent_cwd),
-        running_title=f"Delegated task{context_suffix}",
-        completed_title=f"Delegated task{context_suffix}",
-        failed_title=f"Delegated task failed{context_suffix}",
-        responding_detail="writing response",
-    )
-
-
 def conversation_name_from_task(task: str) -> str:
     name = " ".join(task.split())
     if len(name) <= CONVERSATION_NAME_MAX_LENGTH:
@@ -116,69 +207,211 @@ def conversation_name_from_task(task: str) -> str:
     return f"{name[: CONVERSATION_NAME_MAX_LENGTH - 3]}..."
 
 
-async def inherit_parent_context(parent_context: ToolContext, task: str) -> str | None:
+async def fork_parent_context(parent_context: ToolContext, task: str) -> str:
     try:
-        return await parent_context.fork_conversation(name=conversation_name_from_task(task))
-    except ConversationForkUnavailableError as exc:
-        if os.environ.get("KODELET_SERVER", "").strip():
-            raise RuntimeError(
-                "server-backed subagent requires live conversation forking"
-            ) from exc
-        parent_context.log.warn(  # noqa: G010, PLE1205
-            "subagent falling back to fresh context",
-            {
-                "contextMode": "fresh",
-                "parentConversationId": parent_context.conversation_id,
-                "reason": str(exc),
-            },
+        return await parent_context.fork_conversation(
+            name=conversation_name_from_task(task)
         )
-        return None
+    except ConversationForkUnavailableError as exc:
+        raise RuntimeError(
+            "context_mode='fork' requires live conversation forking; use "
+            "context_mode='fresh' to start without parent conversation memory"
+        ) from exc
 
 
-async def run_subagent(
-    task: str,
-    agent_cwd: Path,
-    inherited_conversation_id: str | None,
-    progress: TaskProgress,
-) -> str:
-    client = Client(
-        command="kodelet",
-        cwd=str(agent_cwd),
-        env={RECURSION_GUARD_ENV: "1"},
+def owner_conversation_id(ctx: ToolContext) -> str:
+    conversation_id = (ctx.conversation_id or "").strip()
+    if not conversation_id:
+        raise ValueError("async agents require an active conversation ID")
+    return conversation_id
+
+
+def prune_retained_jobs(owner_id: str | None = None) -> None:
+    finished = sorted(
+        (
+            job
+            for job in _jobs.values()
+            if job.done.is_set()
+            and (owner_id is None or job.owner_conversation_id == owner_id)
+        ),
+        key=lambda job: job.created_at,
+        reverse=True,
     )
+    limit = (
+        MAX_RETAINED_AGENTS_TOTAL
+        if owner_id is None
+        else MAX_RETAINED_AGENTS_PER_CONVERSATION
+    )
+    for job in finished[limit:]:
+        _jobs.pop(job.agent_id, None)
+
+
+def reserve_job(owner_id: str, task: str, cwd: Path) -> AgentJob:
+    prune_retained_jobs(owner_id)
+    prune_retained_jobs()
+    active_jobs = [job for job in _jobs.values() if not job.done.is_set()]
+    owner_active_count = sum(
+        1 for job in active_jobs if job.owner_conversation_id == owner_id
+    )
+    if owner_active_count >= MAX_ACTIVE_AGENTS_PER_CONVERSATION:
+        raise ValueError(
+            "this conversation already has the maximum of "
+            f"{MAX_ACTIVE_AGENTS_PER_CONVERSATION} active agents"
+        )
+    if len(active_jobs) >= MAX_ACTIVE_AGENTS_TOTAL:
+        raise ValueError(
+            "this extension already has the maximum of "
+            f"{MAX_ACTIVE_AGENTS_TOTAL} active agents"
+        )
+
+    while True:
+        agent_id = f"agt_{uuid.uuid4().hex[:12]}"
+        if agent_id not in _jobs:
+            break
+
+    job = AgentJob(
+        agent_id=agent_id,
+        owner_conversation_id=owner_id,
+        task=task,
+        cwd=cwd,
+    )
+    _jobs[agent_id] = job
+    return job
+
+
+def owned_job(ctx: ToolContext, raw_agent_id: str) -> AgentJob | None:
     try:
+        owner_id = owner_conversation_id(ctx)
+    except ValueError:
+        return None
+    agent_id = raw_agent_id.strip()
+    job = _jobs.get(agent_id)
+    if job is None or job.owner_conversation_id != owner_id:
+        return None
+    return job
 
-        async def run_once() -> object:
-            if inherited_conversation_id is not None:
-                session = await client.create_session(
-                    resume=inherited_conversation_id,
-                    cwd=str(agent_cwd),
-                    streaming=True,
-                )
-            else:
-                session = await client.create_session(
-                    cwd=str(agent_cwd),
-                    streaming=True,
-                )
-            progress.attach(session)
-            return await session.run_and_wait(task)
 
-        response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
+def job_snapshot(job: AgentJob, *, include_result: bool = False) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "agent_id": job.agent_id,
+        "conversation_id": job.child_conversation_id,
+        "status": job.status,
+        "task": job.task,
+        "cwd": str(job.cwd),
+        "context_mode": job.context_mode,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+    }
+    if job.error:
+        snapshot["error"] = job.error
+    if include_result and job.result is not None:
+        snapshot["result"] = job.result
+    return snapshot
+
+
+def mark_job_failed(job: AgentJob, message: str) -> None:
+    if job.status == "canceled":
+        return
+    job.status = "failed"
+    job.result = None
+    job.error = message
+
+
+async def run_agent_job(job: AgentJob) -> None:
+    client: Client | None = None
+    try:
+        client = Client(
+            command="kodelet",
+            cwd=str(job.cwd),
+            env={RECURSION_GUARD_ENV: "1"},
+        )
+        job.client = client
+        if job.child_conversation_id is not None:
+            session = await client.create_session(
+                resume=job.child_conversation_id,
+                cwd=str(job.cwd),
+                streaming=True,
+            )
+        else:
+            session = await client.create_session(
+                cwd=str(job.cwd),
+                streaming=True,
+            )
+        job.child_conversation_id = session.id
+
+        response = await asyncio.wait_for(
+            session.run_and_wait(job.task),
+            timeout=AGENT_TIMEOUT_SECONDS,
+        )
+        content = response.get("content")
+        result = content.strip() if isinstance(content, str) else ""
+        if not result:
+            mark_job_failed(job, "agent returned an empty response")
+        elif job.status != "canceled":
+            job.status = "completed"
+            job.result = result
+            job.error = None
+    except asyncio.CancelledError:
+        job.status = "canceled"
+        job.result = None
+        job.error = None
+        raise
     except TimeoutError:
-        raise TimeoutError(
-            "subagent timed out while waiting for kodelet to finish"
-        ) from None
+        mark_job_failed(job, "agent timed out while waiting for kodelet to finish")
+    except OSError as exc:
+        mark_job_failed(job, f"Failed to execute kodelet: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        mark_job_failed(job, f"agent failed: {exc}")
     finally:
-        await client.close()
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:  # noqa: BLE001
+                if job.status not in TERMINAL_AGENT_STATUSES:
+                    mark_job_failed(job, f"failed to close agent client: {exc}")
+        job.client = None
+        if job.status not in TERMINAL_AGENT_STATUSES:
+            mark_job_failed(job, "agent stopped without a result")
+        if job.completed_at is None:
+            job.completed_at = utc_now()
+        job.done.set()
+        prune_retained_jobs(job.owner_conversation_id)
+        prune_retained_jobs()
 
-    content = response.get("content")
-    return content if isinstance(content, str) else ""
+
+def finish_runner_task(job: AgentJob, task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        if not job.done.is_set():
+            job.status = "canceled"
+            job.result = None
+            job.error = None
+            job.completed_at = utc_now()
+            job.done.set()
+            prune_retained_jobs(job.owner_conversation_id)
+            prune_retained_jobs()
+        return
+
+    exception = task.exception()
+    if exception is not None and not job.done.is_set():
+        mark_job_failed(job, f"agent failed: {exception}")
+        job.completed_at = utc_now()
+        job.done.set()
+        prune_retained_jobs(job.owner_conversation_id)
+        prune_retained_jobs()
 
 
-async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResult:
-    if os.environ.get(RECURSION_GUARD_ENV) == "1":
-        message = "subagent recursion is disabled"
-        return {"content": message, "error": message}
+def child_tool_error() -> ToolExecutionResult:
+    message = "async agent tools are only available to the main agent"
+    return {"content": message, "error": message}
+
+
+async def spawn_agent(
+    input: SpawnAgentInput,
+    ctx: ToolContext,
+) -> ToolExecutionResult:
+    if is_agent_child(ctx):
+        return child_tool_error()
 
     task = input.task.strip()
     if not task:
@@ -186,60 +419,196 @@ async def subagent(input: SubagentInput, ctx: ToolContext) -> ToolExecutionResul
         return {"content": message, "error": message}
 
     try:
-        agent_cwd = resolve_subagent_cwd(input.cwd, ctx.cwd)
+        agent_cwd = resolve_agent_cwd(input.cwd, ctx.cwd)
+        owner_id = owner_conversation_id(ctx)
+        job = reserve_job(owner_id, task, agent_cwd)
     except ValueError as exc:
         return {"content": str(exc), "error": str(exc)}
 
     try:
-        inherited_conversation_id = await inherit_parent_context(ctx, task)
-    except RuntimeError as exc:
-        message = f"subagent failed: {exc}"
-        progress = build_subagent_progress(ctx, task, agent_cwd)
-        await progress.start()
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
+        if input.context_mode == "fork":
+            job.child_conversation_id = await fork_parent_context(ctx, task)
+    except asyncio.CancelledError:
+        _jobs.pop(job.agent_id, None)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _jobs.pop(job.agent_id, None)
+        message = f"spawn_agent failed: {exc}"
+        return {"content": message, "error": message}
 
-    context_mode = "inherited" if inherited_conversation_id is not None else "fresh"
-    progress = build_subagent_progress(ctx, task, agent_cwd, context_mode)
-    await progress.start()
+    job.context_mode = input.context_mode
+    job.status = "running"
+    job.started_at = utc_now()
+    try:
+        runner_task = asyncio.create_task(
+            run_agent_job(job),
+            name=f"kodelet-{job.agent_id}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _jobs.pop(job.agent_id, None)
+        message = f"spawn_agent failed: {exc}"
+        return {"content": message, "error": message}
+    job.runner_task = runner_task
+    runner_task.add_done_callback(
+        lambda completed_task, agent_job=job: finish_runner_task(
+            agent_job, completed_task
+        )
+    )
+
+    conversation_detail = (
+        f" in conversation {job.child_conversation_id}"
+        if job.child_conversation_id is not None
+        else " with fresh context"
+    )
+    content = (
+        f"Spawned agent {job.agent_id}{conversation_detail}. Continue with "
+        "independent work and call wait_agent before relying on its result."
+    )
+    return {"content": content, "data": job_snapshot(job)}
+
+
+async def wait_agent(
+    input: WaitAgentInput,
+    ctx: ToolContext,
+) -> ToolExecutionResult:
+    if is_agent_child(ctx):
+        return child_tool_error()
+
+    job = owned_job(ctx, input.agent_id)
+    if job is None:
+        message = f"agent not found: {input.agent_id.strip()}"
+        return {"content": message, "error": message}
+
+    if not job.done.is_set() and input.timeout_ms > 0:
+        try:
+            await asyncio.wait_for(
+                job.done.wait(),
+                timeout=input.timeout_ms / 1000,
+            )
+        except TimeoutError:
+            pass
+
+    snapshot = job_snapshot(job, include_result=job.done.is_set())
+    if not job.done.is_set():
+        return {
+            "content": f"Agent {job.agent_id} is still {job.status}.",
+            "data": snapshot,
+        }
+    if job.status == "completed":
+        return {"content": job.result or "", "data": snapshot}
+    if job.status == "failed":
+        message = f"Agent {job.agent_id} failed: {job.error or 'unknown error'}"
+        return {"content": message, "error": message, "data": snapshot}
+    return {
+        "content": f"Agent {job.agent_id} was canceled.",
+        "data": snapshot,
+    }
+
+
+async def list_agents(
+    _input: ListAgentsInput,
+    ctx: ToolContext,
+) -> ToolExecutionResult:
+    if is_agent_child(ctx):
+        return child_tool_error()
 
     try:
-        stdout = await run_subagent(
-            task,
-            agent_cwd,
-            inherited_conversation_id,
-            progress,
-        )
-    except TimeoutError as exc:
-        message = str(exc)
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    except OSError as exc:
-        message = f"Failed to execute kodelet: {exc}"
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    except Exception as exc:  # noqa: BLE001
-        message = f"subagent failed: {exc}"
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
+        owner_id = owner_conversation_id(ctx)
+    except ValueError as exc:
+        return {"content": str(exc), "error": str(exc)}
 
-    stdout = stdout.strip()
-    if not stdout:
-        message = "subagent returned an empty response"
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
+    jobs = sorted(
+        (job for job in _jobs.values() if job.owner_conversation_id == owner_id),
+        key=lambda job: job.created_at,
+    )
+    if not jobs:
+        return {
+            "content": "No background agents have been spawned by this conversation.",
+            "data": {"agents": []},
+        }
 
-    snapshot = await progress.finish(success=True)
-    return {"content": stdout, "data": {"taskRun": snapshot}}
+    lines = ["Background agents:", "Agent ID\tStatus\tTask"]
+    for job in jobs:
+        task = " ".join(job.task.split())
+        if len(task) > 100:
+            task = f"{task[:97]}..."
+        lines.append(f"{job.agent_id}\t{job.status}\t{task}")
+    return {
+        "content": "\n".join(lines),
+        "data": {"agents": [job_snapshot(job) for job in jobs]},
+    }
+
+
+async def cancel_agent(
+    input: CancelAgentInput,
+    ctx: ToolContext,
+) -> ToolExecutionResult:
+    if is_agent_child(ctx):
+        return child_tool_error()
+
+    job = owned_job(ctx, input.agent_id)
+    if job is None:
+        message = f"agent not found: {input.agent_id.strip()}"
+        return {"content": message, "error": message}
+
+    if job.status in TERMINAL_AGENT_STATUSES:
+        if not job.done.is_set():
+            try:
+                await asyncio.wait_for(job.done.wait(), timeout=10)
+            except TimeoutError:
+                pass
+        return {
+            "content": f"Agent {job.agent_id} is already {job.status}.",
+            "data": job_snapshot(job, include_result=job.done.is_set()),
+        }
+
+    job.status = "canceled"
+    job.result = None
+    job.error = None
+    if job.runner_task is None:
+        job.completed_at = utc_now()
+        job.done.set()
+    else:
+        job.runner_task.cancel()
+        try:
+            await asyncio.wait_for(job.done.wait(), timeout=10)
+        except TimeoutError:
+            return {
+                "content": f"Cancellation requested for agent {job.agent_id}.",
+                "data": job_snapshot(job),
+            }
+
+    return {
+        "content": f"Canceled agent {job.agent_id}.",
+        "data": job_snapshot(job),
+    }
 
 
 if os.environ.get(RECURSION_GUARD_ENV) != "1":
     ext.tool(
-        SUBAGENT_TOOL_NAME,
-        description=DESCRIPTION,
-        input_schema=SubagentInput,
-        timeout_in_sec=TOOL_TIMEOUT_SECONDS,
-    )(subagent)
+        "spawn_agent",
+        description=SPAWN_AGENT_DESCRIPTION,
+        input_schema=SpawnAgentInput,
+        timeout_in_sec=SPAWN_TOOL_TIMEOUT_SECONDS,
+    )(spawn_agent)
+    ext.tool(
+        "wait_agent",
+        description=WAIT_AGENT_DESCRIPTION,
+        input_schema=WaitAgentInput,
+        timeout_in_sec=WAIT_TOOL_TIMEOUT_SECONDS,
+    )(wait_agent)
+    ext.tool(
+        "list_agents",
+        description=LIST_AGENTS_DESCRIPTION,
+        input_schema=ListAgentsInput,
+        timeout_in_sec=10,
+    )(list_agents)
+    ext.tool(
+        "cancel_agent",
+        description=CANCEL_AGENT_DESCRIPTION,
+        input_schema=CancelAgentInput,
+        timeout_in_sec=CANCEL_TOOL_TIMEOUT_SECONDS,
+    )(cancel_agent)
 
 
 if __name__ == "__main__":

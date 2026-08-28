@@ -34,9 +34,15 @@ A collection of CLI tool skill definitions for AI assistants.
 | [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
-| [subagent](./extensions/subagent/kodelet-extension-subagent) | `subagent` | Delegate self-contained tasks to an independent Kodelet session |
+| [subagent](./extensions/subagent/kodelet-extension-subagent) | `spawn_agent`, `wait_agent`, `list_agents`, `cancel_agent` | Run session-scoped background Kodelet agents |
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
+
+The subagent extension lets the main agent start up to three independent agents and continue working while they run, with an extension-wide limit of eight active agents. `spawn_agent` returns an agent ID immediately; use `wait_agent` to collect its result, `list_agents` to inspect current jobs, and `cancel_agent` to stop one. Child agents cannot spawn or manage other agents.
+
+`spawn_agent` defaults to `context_mode: "fork"`, which copies the main agent's live conversation into an isolated child. Use `context_mode: "fresh"` when the child should start with no parent conversation memory. A requested fork fails rather than silently falling back to fresh context.
+
+Background agents and their status registry live only for the current Kodelet extension session. Running agents are stopped when that session closes. The previous synchronous `subagent` tool has been removed; its behavior is replaced by calling `spawn_agent` followed by `wait_agent`.
 
 ## Structure
 
