@@ -80,6 +80,23 @@ class FakeUI:
         return "\n".join(rendered)
 
 
+class FakeBackgroundTaskLease:
+    def __init__(
+        self,
+        description: str | None,
+        failures_remaining: int = 0,
+    ) -> None:
+        self.description = description
+        self.failures_remaining = failures_remaining
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary background lease release failure")
+
+
 class FakeContext:
     def __init__(
         self,
@@ -100,6 +117,19 @@ class FakeContext:
         self.fork_names: list[str | None] = []
         self.fork_started = asyncio.Event()
         self.fork_release = asyncio.Event()
+        self.background_release_failures = 0
+        self.background_leases: list[FakeBackgroundTaskLease] = []
+
+    async def acquire_background_task(
+        self,
+        description: str | None = None,
+    ) -> FakeBackgroundTaskLease:
+        lease = FakeBackgroundTaskLease(
+            description,
+            self.background_release_failures,
+        )
+        self.background_leases.append(lease)
+        return lease
 
     async def fork_conversation(self, name: str | None = None) -> str:
         self.fork_names.append(name)
@@ -423,6 +453,10 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             context,
         )
         forked_data = forked["data"]
+        self.assertEqual(len(context.background_leases), 1)
+        forked_lease = context.background_leases[0]
+        self.assertIn(forked_data["agent_id"], forked_lease.description or "")
+        self.assertEqual(forked_lease.close_calls, 0)
         await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
         store = await extension.store_for_context(context)
         running = await self.wait_for_status(
@@ -453,6 +487,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["content"], "result for inspect authentication")
         self.assertEqual(completed["data"]["status"], "completed")
         self.assertIn("1 completed", context.ui.text(extension.WIDGET_ID))
+        self.assertEqual(forked_lease.close_calls, 1)
 
         FakeClient.block_runs = False
         fresh = await extension.spawn_agent(
@@ -475,6 +510,8 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         fresh_client = FakeClient.instances[1]
         self.assertNotIn("resume", fresh_client.create_session_calls[0])
         self.assertEqual(fresh_result["data"]["context_mode"], "fresh")
+        self.assertEqual(len(context.background_leases), 2)
+        self.assertEqual(context.background_leases[1].close_calls, 1)
 
         listed = await extension.list_agents(extension.ListAgentsInput(), context)
         self.assertEqual(len(listed["data"]["agents"]), 2)
@@ -802,6 +839,9 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             extension.SpawnAgentInput(task="cancel me", context_mode="fresh"),
             context,
         )
+        self.assertEqual(len(context.background_leases), 1)
+        background_lease = context.background_leases[0]
+        self.assertEqual(background_lease.close_calls, 0)
         agent_id = spawned["data"]["agent_id"]
         await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
         store = await extension.store_for_context(context)
@@ -833,6 +873,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.closed)
         self.assertEqual(client.close_calls, 1)
         self.assertEqual(session.close_calls, 1)
+        self.assertEqual(background_lease.close_calls, 1)
 
     async def test_startup_timeout_is_persisted_as_failure(self) -> None:
         context = self.context()
@@ -855,7 +896,44 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(failed.run.status, "failed")
         self.assertIn("timed out while starting", failed.run.error)
+
+        async def background_lease_closed() -> bool:
+            return bool(
+                context.background_leases
+                and context.background_leases[0].close_calls == 1
+            )
+
+        await wait_until(background_lease_closed)
         self.assertTrue(FakeClient.instances[0].closed)
+
+    async def test_background_lease_release_retries_transient_failures(self) -> None:
+        context = self.context()
+        context.background_release_failures = 1
+        with mock.patch.object(
+            extension,
+            "BACKGROUND_LEASE_RELEASE_RETRY_INITIAL_SECONDS",
+            0.001,
+        ):
+            spawned = await extension.spawn_agent(
+                extension.SpawnAgentInput(task="retry lease release", context_mode="fresh"),
+                context,
+            )
+            await extension.wait_agent(
+                extension.WaitAgentInput(
+                    agent_id=spawned["data"]["agent_id"],
+                    run_id=spawned["data"]["run_id"],
+                    timeout_ms=1_000,
+                ),
+                context,
+            )
+
+            async def released() -> bool:
+                return bool(
+                    context.background_leases
+                    and context.background_leases[0].close_calls == 2
+                )
+
+            await wait_until(released)
 
     async def test_terminal_retry_and_idempotency(self) -> None:
         clock = MutableClock()

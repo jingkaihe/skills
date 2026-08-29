@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.20"]
+# dependencies = ["kodelet-sdk>=0.1.21"]
 # ///
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 from kodelet_sdk import (
     AgentInitEvent,
     AgentStartEvent,
+    BackgroundTaskLease,
     BaseModel,
     Client,
     ConversationForkUnavailableError,
@@ -111,6 +112,8 @@ MIN_HEARTBEAT_INTERVAL_SECONDS = 1.0
 HEARTBEAT_RETRY_MAX_SECONDS = 2.0
 WORKER_UPDATE_RETRY_INITIAL_SECONDS = 0.1
 WORKER_UPDATE_RETRY_MAX_SECONDS = 1.0
+BACKGROUND_LEASE_RELEASE_RETRY_INITIAL_SECONDS = 0.1
+BACKGROUND_LEASE_RELEASE_RETRY_MAX_SECONDS = 2.0
 STEERING_POLL_SECONDS = 0.1
 STEERING_RETRY_SECONDS = 0.25
 SQLITE_BUSY_TIMEOUT_MS = 5_000
@@ -268,6 +271,7 @@ class LiveRun:
     heartbeat_error: str | None = None
     terminalizing: bool = False
     ui: Any | None = field(default=None, repr=False)
+    background_lease: BackgroundTaskLease | None = field(default=None, repr=False)
 
 
 SCHEMA = """
@@ -2056,6 +2060,32 @@ async def run_agent_job(
         key = live_run_key(live.store, live.agent_id)
         if _live_runs.get(key) is live:
             _live_runs.pop(key, None)
+        await close_background_lease(live)
+
+
+async def close_background_lease(live: LiveRun) -> None:
+    lease = live.background_lease
+    if lease is None:
+        return
+    retry_delay = BACKGROUND_LEASE_RELEASE_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            await lease.close()
+        except asyncio.CancelledError:
+            if _shutting_down:
+                return
+            raise
+        except Exception:  # noqa: BLE001
+            if _shutting_down:
+                return
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(
+                BACKGROUND_LEASE_RELEASE_RETRY_MAX_SECONDS,
+                retry_delay * 2,
+            )
+            continue
+        live.background_lease = None
+        return
 
 
 def launch_live_run(
@@ -2091,6 +2121,9 @@ async def prepare_claim(
     live.ui = getattr(ctx, "ui", None)
     setup_heartbeat = start_agent_heartbeat(live)
     try:
+        live.background_lease = await ctx.acquire_background_task(
+            f"subagent {live.agent_id}: {' '.join(task.split())[:160]}"
+        )
         if live.conversation_id is None and live.context_mode == "fork":
             live.conversation_id = await fork_parent_context(ctx, task)
             if live.heartbeat_error is not None:
@@ -2117,6 +2150,7 @@ async def prepare_claim(
                 )
         finally:
             await stop_task(setup_heartbeat)
+            await close_background_lease(live)
         raise
     except Exception:
         live.terminalizing = True
@@ -2131,6 +2165,7 @@ async def prepare_claim(
                 )
         finally:
             await stop_task(setup_heartbeat)
+            await close_background_lease(live)
         raise
 
 

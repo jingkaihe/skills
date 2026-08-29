@@ -38,17 +38,7 @@ A collection of CLI tool skill definitions for AI assistants.
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 
-The subagent extension lets the main agent start up to three independent agents and continue working while they run, with an extension-wide limit of eight active agents. `spawn_agent` returns both an agent ID and run ID immediately; use `wait_agent` with that run ID to collect the exact run result, `list_agents` to inspect durable state, `steer_agent` to inject guidance into a running child, `followup_agent` to wake an idle, failed, or interrupted child, and `cancel_agent` to permanently stop one. Child agents cannot spawn or manage other agents.
-
-On hosts that advertise persistent widgets, the extension publishes a conversation-scoped background-agent status panel above the composer. It remains visible after the parent turn completes, updates as child runs transition, and is reconstructed from the extension's SQLite state on a later agent lifecycle event.
-
-`spawn_agent` defaults to `context_mode: "fork"`, which copies the main agent's live conversation into an isolated child. Use `context_mode: "fresh"` when the child should start with no parent conversation memory. A requested fork fails rather than silently falling back to fresh context.
-
-Agent identity, child conversation IDs, run history, results, errors, pending steering messages, and lease state are persisted in the extension-owned `<dataDir>/subagents.sqlite` database and scoped to the parent conversation. Kodelet supplies only the extension data directory, a generic background-runtime capability, and the ACP `_session/steering` extension; it does not own the subagent schema or lifecycle. Once ACP reports a steering message as `injected`, unconsumed guidance remains on the child conversation and may be applied during a later follow-up. If the active turn closes before injection, the extension keeps the message and moves it to the next `followup_agent` run. The extension process keeps only live tasks and clients in memory. A clean extension shutdown marks active runs interrupted immediately; an unclean loss is detected when the 60-second worker lease expires. `followup_agent` starts a new fenced run that resumes the persisted child conversation. If interruption happened before a child was attached, fresh mode starts another blank session and fork mode creates a new fork of the owning parent rather than silently falling back to blank memory.
-
-This MVP is enabled only for local extension runtimes. Runner-backed Kodelet executions currently hide these tools because their extension process and workspace are torn down with the parent run; durable runner workers require a separate runner-level supervisor.
-
-The previous synchronous `subagent` tool remains removed; its behavior is replaced by calling `spawn_agent` followed by `wait_agent`.
+The subagent tools are available in both local and runner-backed extension runtimes.
 
 ## Structure
 
