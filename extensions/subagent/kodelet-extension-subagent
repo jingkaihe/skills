@@ -2234,7 +2234,6 @@ async def wait_agent(
 
     selected_run_id = agent.run.id
     progress: TaskProgress | None = None
-    progress_activity_id = f"subagent:{selected_run_id}"
     if agent.run.status in ACTIVE_RUN_STATUSES and input.timeout_ms > 0:
         progress = TaskProgress(
             ctx,
@@ -2245,12 +2244,6 @@ async def wait_agent(
             completed_title="Finished waiting for background agent",
             failed_title="Background agent failed",
             responding_detail="agent is responding",
-        )
-        progress.start_activity(
-            progress_activity_id,
-            label=f"Agent {agent_id}",
-            detail=agent.run.status,
-            kind="subagent",
         )
         await progress.start()
         loop = asyncio.get_running_loop()
@@ -2272,15 +2265,7 @@ async def wait_agent(
                     break
                 await asyncio.sleep(min(WAIT_POLL_SECONDS, remaining))
                 try:
-                    previous_status = agent.run.status
                     agent = await store.get(owner_id, agent_id, selected_run_id)
-                    if agent.run.status != previous_status:
-                        progress.start_activity(
-                            progress_activity_id,
-                            label=f"Agent {agent_id}",
-                            detail=agent.run.status,
-                            kind="subagent",
-                        )
                 except AgentNotFoundError:
                     await progress.finish(
                         success=False,
