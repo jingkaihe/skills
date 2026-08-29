@@ -112,13 +112,21 @@ class FakeContext:
         self.invoked_by = invoked_by
         self.storage = SimpleNamespace(data_dir=str(data_dir))
         self.ui = FakeUI()
-        self.log = SimpleNamespace(warn=lambda _message: None)
+        self.log = SimpleNamespace(warn=lambda _message, _fields=None: None)
         self.block_fork = block_fork
         self.fork_names: list[str | None] = []
         self.fork_started = asyncio.Event()
         self.fork_release = asyncio.Event()
         self.background_release_failures = 0
         self.background_leases: list[FakeBackgroundTaskLease] = []
+        self.tool_updates: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def update(
+        self,
+        content: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        self.tool_updates.append((content, data))
 
     async def acquire_background_task(
         self,
@@ -148,6 +156,19 @@ class FakeSession:
         self.close_calls = 0
         self.run_started = asyncio.Event()
         self.steer_received = asyncio.Event()
+        self.listeners: dict[str, list[Callable[[Any], Any]]] = {}
+
+    def on(self, event_name: str, listener: Callable[[Any], Any]) -> None:
+        self.listeners.setdefault(event_name, []).append(listener)
+
+    def off(self, event_name: str, listener: Callable[[Any], Any]) -> None:
+        listeners = self.listeners.get(event_name)
+        if listeners is not None and listener in listeners:
+            listeners.remove(listener)
+
+    def emit(self, event_name: str, event: Any) -> None:
+        for listener in list(self.listeners.get(event_name, [])):
+            listener(event)
 
     async def run_and_wait(self, task: str) -> dict[str, str]:
         self.run_calls.append(task)
@@ -375,6 +396,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             {tool["name"] for tool in enabled["tools"]},
             set(extension.AGENT_TOOL_NAMES),
         )
+        wait_tool = next(tool for tool in enabled["tools"] if tool["name"] == "wait_agent")
+        self.assertEqual(
+            set(wait_tool["inputSchema"]["properties"]),
+            {"agent_id", "timeout_ms"},
+        )
 
         for capabilities in (
             {"runtime": {"backgroundTasks": False}},
@@ -479,7 +505,6 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         completed = await extension.wait_agent(
             extension.WaitAgentInput(
                 agent_id=forked_data["agent_id"],
-                run_id=forked_data["run_id"],
                 timeout_ms=1_000,
             ),
             context,
@@ -501,7 +526,6 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         fresh_result = await extension.wait_agent(
             extension.WaitAgentInput(
                 agent_id=fresh_data["agent_id"],
-                run_id=fresh_data["run_id"],
                 timeout_ms=1_000,
             ),
             context,
@@ -536,18 +560,16 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2 completed", restored_text)
         self.assertIn("independent review", restored_text)
 
-    async def test_wait_exact_historical_run_and_followup_resumes_child(self) -> None:
+    async def test_wait_current_run_and_followup_resumes_child(self) -> None:
         context = self.context()
         spawned = await extension.spawn_agent(
             extension.SpawnAgentInput(task="first pass"),
             context,
         )
         agent_id = spawned["data"]["agent_id"]
-        first_run_id = spawned["data"]["run_id"]
         first = await extension.wait_agent(
             extension.WaitAgentInput(
                 agent_id=agent_id,
-                run_id=first_run_id,
                 timeout_ms=1_000,
             ),
             context,
@@ -571,18 +593,6 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             child_id,
         )
 
-        historical = await extension.wait_agent(
-            extension.WaitAgentInput(
-                agent_id=agent_id,
-                run_id=first_run_id,
-                timeout_ms=0,
-            ),
-            context,
-        )
-        self.assertEqual(historical["content"], "result for first pass")
-        self.assertEqual(historical["data"]["run_id"], first_run_id)
-        self.assertEqual(historical["data"]["status"], "completed")
-
         current = await extension.wait_agent(
             extension.WaitAgentInput(agent_id=agent_id, timeout_ms=0),
             context,
@@ -593,12 +603,170 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         second = await extension.wait_agent(
             extension.WaitAgentInput(
                 agent_id=agent_id,
-                run_id=second_run_id,
                 timeout_ms=1_000,
             ),
             context,
         )
         self.assertEqual(second["content"], "result for second pass")
+
+    async def test_wait_keeps_the_run_captured_when_followup_starts(self) -> None:
+        context = self.context()
+        FakeClient.block_runs = True
+        spawned = await extension.spawn_agent(
+            extension.SpawnAgentInput(task="first pass", context_mode="fresh"),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        first_run_id = spawned["data"]["run_id"]
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        store = await extension.store_for_context(context)
+
+        with mock.patch.object(extension, "WAIT_POLL_SECONDS", 0.2):
+            waiting = asyncio.create_task(
+                extension.wait_agent(
+                    extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+                    context,
+                )
+            )
+
+            async def wait_started() -> bool:
+                return bool(context.tool_updates)
+
+            await wait_until(wait_started)
+            FakeClient.run_release.set()
+            await self.wait_for_status(
+                store,
+                context.conversation_id,
+                agent_id,
+                "completed",
+            )
+
+            FakeClient.run_release = asyncio.Event()
+            FakeClient.run_started = asyncio.Event()
+            followup = await extension.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=agent_id,
+                    task="second pass",
+                ),
+                context,
+            )
+            await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+            first = await waiting
+
+        self.assertEqual(first["content"], "result for first pass")
+        self.assertEqual(first["data"]["run_id"], first_run_id)
+        self.assertNotEqual(followup["data"]["run_id"], first_run_id)
+
+        FakeClient.run_release.set()
+        second = await extension.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(second["content"], "result for second pass")
+
+    async def test_wait_streams_live_subagent_task_progress(self) -> None:
+        context = self.context()
+        FakeClient.block_runs = True
+        spawned = await extension.spawn_agent(
+            extension.SpawnAgentInput(task="inspect progress", context_mode="fresh"),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        session = FakeClient.instances[0].sessions[0]
+
+        waiting = asyncio.create_task(
+            extension.wait_agent(
+                extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+                context,
+            )
+        )
+
+        async def progress_attached() -> bool:
+            return bool(session.listeners.get("tool.call"))
+
+        await wait_until(progress_attached)
+        session.emit(
+            "tool.call",
+            {
+                "data": {
+                    "toolCallId": "tool-1",
+                    "toolName": "bash",
+                    "input": {"command": "go test ./..."},
+                }
+            },
+        )
+        session.emit(
+            "tool.update",
+            {"data": {"toolCallId": "tool-1", "result": "tests running"}},
+        )
+        session.emit(
+            "tool.result",
+            {
+                "data": {
+                    "toolCallId": "tool-1",
+                    "status": "completed",
+                    "result": "ok",
+                }
+            },
+        )
+
+        async def tool_activity_published() -> bool:
+            for _content, data in context.tool_updates:
+                task_run = (data or {}).get("taskRun")
+                if not isinstance(task_run, dict):
+                    continue
+                if any(
+                    activity.get("id") == "tool-1"
+                    for activity in task_run.get("activities", [])
+                ):
+                    return True
+            return False
+
+        await wait_until(tool_activity_published)
+        FakeClient.run_release.set()
+        completed = await waiting
+
+        self.assertEqual(completed["content"], "result for inspect progress")
+        task_run = completed["data"]["taskRun"]
+        self.assertEqual(task_run["kind"], "subagent")
+        self.assertEqual(task_run["status"], "completed")
+        tool_activity = next(
+            activity
+            for activity in task_run["activities"]
+            if activity["id"] == "tool-1"
+        )
+        self.assertEqual(tool_activity["kind"], "bash")
+        self.assertEqual(tool_activity["status"], "succeeded")
+        self.assertEqual(session.listeners.get("tool.call"), [])
+
+    async def test_wait_timeout_returns_running_progress_and_detaches(self) -> None:
+        context = self.context()
+        FakeClient.block_runs = True
+        spawned = await extension.spawn_agent(
+            extension.SpawnAgentInput(task="keep working", context_mode="fresh"),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        session = FakeClient.instances[0].sessions[0]
+
+        result = await extension.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=20),
+            context,
+        )
+
+        self.assertEqual(result["data"]["status"], "running")
+        self.assertEqual(result["data"]["taskRun"]["status"], "running")
+        self.assertTrue(context.tool_updates)
+        self.assertEqual(session.listeners.get("tool.call"), [])
+
+        FakeClient.run_release.set()
+        completed = await extension.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(completed["content"], "result for keep working")
 
     async def test_followup_reforks_when_interrupted_before_attachment(self) -> None:
         context = self.context()
@@ -631,7 +799,6 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         completed = await extension.wait_agent(
             extension.WaitAgentInput(
                 agent_id=initial.agent.id,
-                run_id=followup["data"]["run_id"],
                 timeout_ms=1_000,
             ),
             context,
@@ -921,7 +1088,6 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             await extension.wait_agent(
                 extension.WaitAgentInput(
                     agent_id=spawned["data"]["agent_id"],
-                    run_id=spawned["data"]["run_id"],
                     timeout_ms=1_000,
                 ),
                 context,
