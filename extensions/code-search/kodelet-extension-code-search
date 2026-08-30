@@ -118,7 +118,7 @@ def build_search_profile(sysprompt_path: Path) -> Profile:
     return Profile(
         {
             "provider": "openai",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-luna",
             "reasoning_effort": "none",
             "openai": {
                 "api_mode": "responses",
