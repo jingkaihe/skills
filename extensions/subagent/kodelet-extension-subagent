@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import textwrap
@@ -44,7 +45,9 @@ from kodelet_sdk import (
 
 SPAWN_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Start an independent Kodelet agent in the background and return immediately.
+    Start a named independent Kodelet agent in the background and return
+    immediately. The name must contain one to three lowercase kebab-case words and
+    be unique among agents owned by this conversation.
     By default, the child inherits the caller's live conversation context in an
     isolated fork. Set context_mode to fresh to start with no parent conversation
     memory. Agent identity, run history, and recovery state are persisted by this
@@ -120,9 +123,10 @@ STEERING_POLL_SECONDS = 0.1
 STEERING_RETRY_SECONDS = 0.25
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 MAX_STEERING_MESSAGE_LENGTH = 10_000
+AGENT_NAME_MAX_LENGTH = 48
+AGENT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+){0,2}$")
 DATABASE_FILENAME = "subagents.sqlite"
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
-CONVERSATION_NAME_MAX_LENGTH = 100
 WIDGET_ID = "background-agents"
 WIDGET_AGENT_LIMIT = 8
 AGENT_TOOL_NAMES = (
@@ -164,6 +168,19 @@ def database_initialization_lock(path: Path) -> threading.Lock:
     resolved = path.resolve()
     with _database_initialization_locks_guard:
         return _database_initialization_locks.setdefault(resolved, threading.Lock())
+
+
+def validate_agent_name(name: str) -> str:
+    if not name:
+        raise ValueError("name is required")
+    if len(name) > AGENT_NAME_MAX_LENGTH:
+        raise ValueError(f"name must be at most {AGENT_NAME_MAX_LENGTH} characters")
+    if AGENT_NAME_PATTERN.fullmatch(name) is None:
+        raise ValueError(
+            "name must contain one to three lowercase words separated by single "
+            "hyphens, start with a letter, and contain only letters and digits"
+        )
+    return name
 
 
 class SessionSteerResult(TypedDict):
@@ -225,6 +242,7 @@ class RunRecord:
 @dataclass(frozen=True, slots=True)
 class AgentRecord:
     id: str
+    name: str
     owner_conversation_id: str
     conversation_id: str | None
     context_mode: SpawnContextMode
@@ -283,6 +301,7 @@ class LiveRun:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
     owner_conversation_id TEXT NOT NULL,
     child_conversation_id TEXT UNIQUE,
     context_mode TEXT NOT NULL CHECK(context_mode IN ('fork', 'fresh')),
@@ -346,6 +365,9 @@ CREATE TABLE IF NOT EXISTS steering_messages (
 CREATE INDEX IF NOT EXISTS idx_agents_owner_updated
 ON agents(owner_conversation_id, updated_at DESC);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_owner_name
+ON agents(owner_conversation_id, name);
+
 CREATE INDEX IF NOT EXISTS idx_agents_status_lease
 ON agents(status, lease_expires_at);
 
@@ -385,6 +407,7 @@ class AgentStore:
     async def create(
         self,
         owner_id: str,
+        name: str,
         task: str,
         cwd: str,
         context_mode: SpawnContextMode,
@@ -392,6 +415,7 @@ class AgentStore:
         return await asyncio.to_thread(
             self._create_sync,
             owner_id,
+            name,
             task,
             cwd,
             context_mode,
@@ -635,11 +659,13 @@ class AgentStore:
     def _create_sync(
         self,
         owner_id: str,
+        name: str,
         task: str,
         cwd: str,
         context_mode: SpawnContextMode,
     ) -> Claim:
         owner_id = owner_id.strip()
+        name = validate_agent_name(name)
         task = task.strip()
         cwd = cwd.strip()
         if not owner_id:
@@ -659,16 +685,29 @@ class AgentStore:
         with self._immediate_transaction() as connection:
             self._reconcile_expired_tx(connection, now)
             self._check_limits_tx(connection, owner_id)
+            existing = connection.execute(
+                """
+                SELECT 1 FROM agents
+                WHERE owner_conversation_id = ? AND name = ?
+                """,
+                (owner_id, name),
+            ).fetchone()
+            if existing is not None:
+                raise AgentConflictError(
+                    f"agent name already exists in this conversation: {name}"
+                )
             connection.execute(
                 """
                 INSERT INTO agents (
-                    id, owner_conversation_id, child_conversation_id, context_mode,
-                    cwd, status, active_run_id, generation, lease_runtime_id,
-                    lease_token, lease_expires_at, created_at, updated_at
-                ) VALUES (?, ?, NULL, ?, ?, 'starting', ?, 1, ?, ?, ?, ?, ?)
+                    id, name, owner_conversation_id, child_conversation_id,
+                    context_mode, cwd, status, active_run_id, generation,
+                    lease_runtime_id, lease_token, lease_expires_at, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, 'starting', ?, 1, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
+                    name,
                     owner_id,
                     context_mode,
                     cwd,
@@ -1235,6 +1274,7 @@ class AgentStore:
         run_row = self._run_row_tx(connection, agent_id, selected_run_id)
         return AgentRecord(
             id=str(agent_row["id"]),
+            name=str(agent_row["name"]),
             owner_conversation_id=str(agent_row["owner_conversation_id"]),
             conversation_id=(
                 str(agent_row["child_conversation_id"])
@@ -1343,6 +1383,16 @@ ext = SubagentExtension(name="subagent", version="0.3.0")
 
 
 class SpawnAgentInput(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=AGENT_NAME_MAX_LENGTH,
+        pattern=AGENT_NAME_PATTERN.pattern,
+        description=(
+            "A unique canonical name for the agent within this conversation. Use "
+            "one to three lowercase words separated by hyphens, such as "
+            "'reviewer' or 'code-reviewer'."
+        ),
+    )
     task: str = Field(
         min_length=1,
         description=(
@@ -1507,18 +1557,9 @@ def resolve_agent_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
     return resolved
 
 
-def conversation_name_from_task(task: str) -> str:
-    name = " ".join(task.split())
-    if len(name) <= CONVERSATION_NAME_MAX_LENGTH:
-        return name
-    return f"{name[: CONVERSATION_NAME_MAX_LENGTH - 3]}..."
-
-
-async def fork_parent_context(parent_context: ToolContext, task: str) -> str:
+async def fork_parent_context(parent_context: ToolContext, name: str) -> str:
     try:
-        return await parent_context.fork_conversation(
-            name=conversation_name_from_task(task)
-        )
+        return await parent_context.fork_conversation(name=name)
     except ConversationForkUnavailableError as exc:
         raise RuntimeError(
             "context_mode='fork' requires live conversation forking; use "
@@ -1577,6 +1618,7 @@ def public_snapshot(
 ) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "agent_id": agent.id,
+        "name": agent.name,
         "run_id": agent.run.id,
         "generation": agent.run.generation,
         "conversation_id": agent.conversation_id,
@@ -1606,9 +1648,9 @@ def agent_widget_line(agent: AgentRecord) -> UIFrameLine:
         "interrupted": "!",
         "canceled": "×",
     }
-    task = " ".join(agent.run.task.split())
-    if len(task) > 88:
-        task = f"{task[:85]}..."
+    name = agent.name
+    if len(name) > 88:
+        name = f"{name[:85]}..."
     status = agent.run.status
     icon_style = {"bold": True} if status in ACTIVE_RUN_STATUSES else {"dim": True}
     status_style = (
@@ -1616,7 +1658,7 @@ def agent_widget_line(agent: AgentRecord) -> UIFrameLine:
     )
     spans: list[UIStyledSpan] = [
         {"text": f"{icon_by_status[status]} ", "style": icon_style},
-        {"text": task},
+        {"text": name},
         {"text": f"  {status}", "style": status_style},
         {"text": f"  {agent.id[-8:]}", "style": {"dim": True}},
     ]
@@ -2120,10 +2162,11 @@ async def prepare_claim(
     setup_heartbeat = start_agent_heartbeat(live)
     try:
         live.background_lease = await ctx.acquire_background_task(
-            f"subagent {live.agent_id}: {' '.join(task.split())[:160]}"
+            f"subagent {claim.agent.name} ({live.agent_id}): "
+            f"{' '.join(task.split())[:160]}"
         )
         if live.conversation_id is None and live.context_mode == "fork":
-            live.conversation_id = await fork_parent_context(ctx, task)
+            live.conversation_id = await fork_parent_context(ctx, claim.agent.name)
             if live.heartbeat_error is not None:
                 raise RuntimeError(live.heartbeat_error)
             attached = await store.attach_conversation(
@@ -2173,6 +2216,10 @@ async def spawn_agent(
 ) -> ToolExecutionResult:
     if is_agent_child(ctx):
         return child_tool_error()
+    try:
+        name = validate_agent_name(input.name)
+    except ValueError as exc:
+        return tool_error(str(exc))
     task = input.task.strip()
     if not task:
         return tool_error("task is required and must be a non-empty string")
@@ -2183,6 +2230,7 @@ async def spawn_agent(
         claim = await reserve_claim(
             store.create(
                 owner_id,
+                name,
                 task,
                 str(agent_cwd),
                 input.context_mode,
@@ -2209,8 +2257,9 @@ async def spawn_agent(
     )
     return {
         "content": (
-            f"Spawned agent {live.agent_id}{conversation_detail}. Continue with "
-            "independent work and call wait_agent before relying on its result."
+            f"Spawned agent {claim.agent.name!r} ({live.agent_id})"
+            f"{conversation_detail}. Continue with independent work and call "
+            "wait_agent before relying on its result."
         ),
         "data": public_snapshot(claim.agent),
     }
@@ -2342,12 +2391,19 @@ async def list_agents(
             "content": "No background agents have been spawned by this conversation.",
             "data": {"agents": []},
         }
-    lines = ["Background agents:", "Agent ID\tAgent state\tRun state\tTask"]
+    lines = [
+        "Background agents:",
+        "Name\tAgent ID\tConversation ID\tAgent state\tRun state\tTask",
+    ]
     for agent in agents:
         task = " ".join(agent.run.task.split())
         if len(task) > 100:
             task = f"{task[:97]}..."
-        lines.append(f"{agent.id}\t{agent.status}\t{agent.run.status}\t{task}")
+        conversation_id = agent.conversation_id or "pending"
+        lines.append(
+            f"{agent.name}\t{agent.id}\t{conversation_id}\t{agent.status}\t"
+            f"{agent.run.status}\t{task}"
+        )
     return {
         "content": "\n".join(lines),
         "data": {"agents": [public_snapshot(agent) for agent in agents]},
@@ -2387,7 +2443,8 @@ async def followup_agent(
         return tool_error(f"followup_agent failed: {exc}")
     return {
         "content": (
-            f"Started follow-up run {live.run_id} for agent {live.agent_id}"
+            f"Started follow-up run {live.run_id} for agent "
+            f"{claim.agent.name!r} ({live.agent_id})"
             + (
                 f" in conversation {live.conversation_id}."
                 if live.conversation_id is not None

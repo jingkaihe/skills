@@ -396,10 +396,19 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             {tool["name"] for tool in enabled["tools"]},
             set(extension.AGENT_TOOL_NAMES),
         )
-        wait_tool = next(tool for tool in enabled["tools"] if tool["name"] == "wait_agent")
+        wait_tool = next(
+            tool for tool in enabled["tools"] if tool["name"] == "wait_agent"
+        )
         self.assertEqual(
             set(wait_tool["inputSchema"]["properties"]),
             {"agent_id", "timeout_ms"},
+        )
+        spawn_tool = next(
+            tool for tool in enabled["tools"] if tool["name"] == "spawn_agent"
+        )
+        self.assertEqual(
+            set(spawn_tool["inputSchema"]["required"]),
+            {"name", "task"},
         )
 
         for capabilities in (
@@ -426,7 +435,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             {"tools": {"disable": list(extension.AGENT_TOOL_NAMES)}},
         )
         nested = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="nested work"),
+            extension.SpawnAgentInput(name="nested-worker", task="nested work"),
             child_context,
         )
         self.assertIn("only available to the main agent", nested["error"])
@@ -438,6 +447,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         store = await extension.store_for_context(context)
         claim = await store.create(
             context.conversation_id,
+            "persistence-worker",
             "persist this task",
             context.cwd,
             "fresh",
@@ -469,16 +479,22 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             claim.lease.run_id,
         )
         self.assertEqual(persisted.run.task, "persist this task")
+        self.assertEqual(persisted.name, "persistence-worker")
         self.assertEqual(persisted.status, "starting")
 
     async def test_spawn_fork_and_fresh_wait_and_list_ownership(self) -> None:
         context = self.context()
         FakeClient.block_runs = True
         forked = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="inspect authentication"),
+            extension.SpawnAgentInput(
+                name="authentication-inspector",
+                task="inspect authentication",
+            ),
             context,
         )
         forked_data = forked["data"]
+        self.assertEqual(forked_data["name"], "authentication-inspector")
+        self.assertIn("authentication-inspector", forked["content"])
         self.assertEqual(len(context.background_leases), 1)
         forked_lease = context.background_leases[0]
         self.assertIn(forked_data["agent_id"], forked_lease.description or "")
@@ -493,13 +509,14 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(running.conversation_id, "child-owner-1-1")
         self.assertEqual(running.context_mode, "fork")
-        self.assertEqual(context.fork_names, ["inspect authentication"])
+        self.assertEqual(context.fork_names, ["authentication-inspector"])
+        self.assertIn(running.conversation_id, forked["content"])
         self.assertEqual(
             FakeClient.instances[0].create_session_calls[0]["resume"],
             running.conversation_id,
         )
         self.assertIn("1 active", context.ui.text(extension.WIDGET_ID))
-        self.assertIn("inspect authentication", context.ui.text(extension.WIDGET_ID))
+        self.assertIn("authentication-inspector", context.ui.text(extension.WIDGET_ID))
 
         FakeClient.run_release.set()
         completed = await extension.wait_agent(
@@ -517,6 +534,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         FakeClient.block_runs = False
         fresh = await extension.spawn_agent(
             extension.SpawnAgentInput(
+                name="independent-reviewer",
                 task="independent review",
                 context_mode="fresh",
             ),
@@ -539,6 +557,10 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
 
         listed = await extension.list_agents(extension.ListAgentsInput(), context)
         self.assertEqual(len(listed["data"]["agents"]), 2)
+        self.assertIn("authentication-inspector", listed["content"])
+        self.assertIn("independent-reviewer", listed["content"])
+        self.assertIn(running.conversation_id, listed["content"])
+        self.assertIn(fresh_result["data"]["conversation_id"], listed["content"])
         other_context = self.context("owner-2")
         other_list = await extension.list_agents(
             extension.ListAgentsInput(),
@@ -558,12 +580,66 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         await extension.restore_agent_widget({}, restored_context)
         restored_text = restored_context.ui.text(extension.WIDGET_ID)
         self.assertIn("2 completed", restored_text)
-        self.assertIn("independent review", restored_text)
+        self.assertIn("independent-reviewer", restored_text)
+
+    async def test_agent_names_are_canonical_and_unique_per_owner(self) -> None:
+        store = await self.store("agent-names", "runtime-names")
+        first = await store.create(
+            "owner",
+            "research-agent",
+            "first task",
+            str(self.cwd),
+            "fresh",
+        )
+        self.assertEqual(first.agent.name, "research-agent")
+
+        with self.assertRaisesRegex(
+            extension.AgentConflictError,
+            "agent name already exists",
+        ):
+            await store.create(
+                "owner",
+                "research-agent",
+                "duplicate task",
+                str(self.cwd),
+                "fresh",
+            )
+
+        other_owner = await store.create(
+            "other-owner",
+            "research-agent",
+            "other task",
+            str(self.cwd),
+            "fresh",
+        )
+        self.assertEqual(other_owner.agent.name, "research-agent")
+
+        for invalid_name in (
+            "Research-agent",
+            "research agent",
+            "research_agent",
+            "one-two-three-four",
+            "-reviewer",
+            "reviewer-",
+            "reviewer--one",
+            "1-reviewer",
+        ):
+            with (
+                self.subTest(name=invalid_name),
+                self.assertRaisesRegex(ValueError, "name must contain"),
+            ):
+                await store.create(
+                    "owner",
+                    invalid_name,
+                    "invalid task",
+                    str(self.cwd),
+                    "fresh",
+                )
 
     async def test_wait_current_run_and_followup_resumes_child(self) -> None:
         context = self.context()
         spawned = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="first pass"),
+            extension.SpawnAgentInput(name="iterative-reviewer", task="first pass"),
             context,
         )
         agent_id = spawned["data"]["agent_id"]
@@ -613,7 +689,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         context = self.context()
         FakeClient.block_runs = True
         spawned = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="first pass", context_mode="fresh"),
+            extension.SpawnAgentInput(
+                name="run-capture",
+                task="first pass",
+                context_mode="fresh",
+            ),
             context,
         )
         agent_id = spawned["data"]["agent_id"]
@@ -668,7 +748,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         context = self.context()
         FakeClient.block_runs = True
         spawned = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="inspect progress", context_mode="fresh"),
+            extension.SpawnAgentInput(
+                name="progress-inspector",
+                task="inspect progress",
+                context_mode="fresh",
+            ),
             context,
         )
         agent_id = spawned["data"]["agent_id"]
@@ -744,7 +828,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         context = self.context()
         FakeClient.block_runs = True
         spawned = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="keep working", context_mode="fresh"),
+            extension.SpawnAgentInput(
+                name="long-runner",
+                task="keep working",
+                context_mode="fresh",
+            ),
             context,
         )
         agent_id = spawned["data"]["agent_id"]
@@ -773,6 +861,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         store = await extension.store_for_context(context)
         initial = await store.create(
             context.conversation_id,
+            "setup-agent",
             "initial setup",
             context.cwd,
             "fork",
@@ -791,7 +880,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             ),
             context,
         )
-        self.assertEqual(context.fork_names, ["retry setup"])
+        self.assertEqual(context.fork_names, ["setup-agent"])
         self.assertEqual(
             followup["data"]["conversation_id"],
             "child-owner-1-1",
@@ -814,7 +903,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*(store.initialize() for store in owner_stores))
         owner_results = await asyncio.gather(
             *(
-                store.create("one-owner", f"task-{index}", str(self.cwd), "fresh")
+                store.create(
+                    "one-owner",
+                    f"agent-{index}",
+                    f"task-{index}",
+                    str(self.cwd),
+                    "fresh",
+                )
                 for index, store in enumerate(owner_stores)
             ),
             return_exceptions=True,
@@ -839,6 +934,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             *(
                 store.create(
                     f"owner-{index // 3}",
+                    f"agent-{index}",
                     f"task-{index}",
                     str(self.cwd),
                     "fresh",
@@ -861,7 +957,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
     async def test_expiry_reconciliation_and_generation_runtime_fencing(self) -> None:
         clock = MutableClock()
         store = await self.store("leases", "runtime-a", clock=clock)
-        claim = await store.create("owner", "work", str(self.cwd), "fresh")
+        claim = await store.create(
+            "owner",
+            "lease-worker",
+            "work",
+            str(self.cwd),
+            "fresh",
+        )
         await store.mark_running(claim.lease, "child-lease")
         clock.advance(extension.LEASE_DURATION_SECONDS + 0.1)
         self.assertEqual(await store.reconcile_expired(), 1)
@@ -892,12 +994,14 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         await other.initialize()
         current_claim = await current.create(
             "current-owner",
+            "current-worker",
             "current task",
             str(self.cwd),
             "fresh",
         )
         other_claim = await other.create(
             "other-owner",
+            "other-worker",
             "other task",
             str(self.cwd),
             "fresh",
@@ -917,7 +1021,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = await self.store("steering", "runtime-steering")
-        claim = await store.create("owner", "long task", str(self.cwd), "fresh")
+        claim = await store.create(
+            "owner",
+            "parser-worker",
+            "long task",
+            str(self.cwd),
+            "fresh",
+        )
         await store.mark_running(claim.lease, "child-steering")
         first = await store.enqueue_steering(
             "owner",
@@ -1003,7 +1113,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         FakeClient.block_runs = True
         FakeClient.block_close = True
         spawned = await extension.spawn_agent(
-            extension.SpawnAgentInput(task="cancel me", context_mode="fresh"),
+            extension.SpawnAgentInput(
+                name="cancelable-worker",
+                task="cancel me",
+                context_mode="fresh",
+            ),
             context,
         )
         self.assertEqual(len(context.background_leases), 1)
@@ -1048,6 +1162,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(extension, "AGENT_START_TIMEOUT_SECONDS", 0.02):
             spawned = await extension.spawn_agent(
                 extension.SpawnAgentInput(
+                    name="slow-starter",
                     task="never starts",
                     context_mode="fresh",
                 ),
@@ -1082,7 +1197,11 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             0.001,
         ):
             spawned = await extension.spawn_agent(
-                extension.SpawnAgentInput(task="retry lease release", context_mode="fresh"),
+                extension.SpawnAgentInput(
+                    name="lease-releaser",
+                    task="retry lease release",
+                    context_mode="fresh",
+                ),
                 context,
             )
             await extension.wait_agent(
@@ -1104,7 +1223,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_retry_and_idempotency(self) -> None:
         clock = MutableClock()
         store = await self.store("terminal-retry", "runtime-retry", clock=clock)
-        claim = await store.create("owner", "retry update", str(self.cwd), "fresh")
+        claim = await store.create(
+            "owner",
+            "retry-worker",
+            "retry update",
+            str(self.cwd),
+            "fresh",
+        )
         await store.mark_running(claim.lease, "child-retry")
         live = extension.live_run_from_claim(claim, "retry update", store)
         live.conversation_id = "child-retry"
@@ -1159,7 +1284,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         async def delayed_create() -> Any:
             started.set()
             await release.wait()
-            return await store.create("owner", "delayed", str(self.cwd), "fresh")
+            return await store.create(
+                "owner",
+                "delayed-worker",
+                "delayed",
+                str(self.cwd),
+                "fresh",
+            )
 
         reservation = asyncio.create_task(
             extension.reserve_claim(
@@ -1187,6 +1318,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return await store.create(
                 context.conversation_id,
+                "shutdown-worker",
                 "during shutdown",
                 context.cwd,
                 "fresh",
