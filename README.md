@@ -34,11 +34,10 @@ A collection of CLI tool skill definitions for AI assistants.
 | [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
-| [subagent](./extensions/subagent/kodelet-extension-subagent) | `spawn_agent`, `wait_agent`, `list_agents`, `followup_agent`, `steer_agent`, `cancel_agent` | Run durable background Kodelet agents |
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 
-The subagent tools are available in both local and runner-backed extension runtimes.
+The durable subagent extension now lives in the standalone [`jingkaihe/kodelet-subagent`](https://github.com/jingkaihe/kodelet-subagent) repository. Install it separately with `uvx kodelet-subagent install`.
 
 ## Structure
 
