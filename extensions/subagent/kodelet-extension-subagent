@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "alembic>=1.16,<2",
-#   "kodelet-sdk>=0.1.21,<0.2",
+#   "kodelet-sdk>=0.1.22,<0.2",
 # ]
 # ///
 
@@ -47,61 +47,55 @@ from kodelet_sdk import (
     TaskRunSnapshot,
     ToolContext,
     ToolExecutionResult,
+    ToolPresentation,
     UIFrameLine,
     UIStyledSpan,
 )
 
 SPAWN_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Start a named independent Kodelet agent in the background and return
-    immediately. The name must contain one to three lowercase kebab-case words and
-    be unique among agents owned by this conversation.
-    By default, the child inherits the caller's live conversation context in an
-    isolated fork. Set context_mode to fresh to start with no parent conversation
-    memory. Agent identity, run history, and recovery state are persisted by this
-    extension. Use followup_agent to wake an idle, failed, or interrupted agent.
+    Start a named Kodelet agent in the background and return immediately. Names
+    must contain one to three lowercase kebab-case words and be unique. By default,
+    the agent inherits the current conversation; set context_mode to fresh to start
+    without it. Use followup_agent to wake an idle, failed, interrupted, or canceled
+    agent.
     """
 ).strip()
 
 WAIT_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Wait for the current run of a persisted background agent owned by this
-    conversation. Returns the final response when the run finishes, or its current
-    status when the timeout expires. Use a zero timeout to check the current status
-    without waiting.
+    Wait for a background agent's current run. Returns its final response when the
+    run finishes or its current status when the timeout expires. Set timeout_ms to
+    0 to check without waiting.
     """
 ).strip()
 
 LIST_AGENTS_DESCRIPTION = textwrap.dedent(
     """
-    List persisted background agents owned by this conversation, including their
-    current agent state, latest run state, and child conversation IDs.
+    List background agents with their current status and latest run.
     """
 ).strip()
 
 FOLLOWUP_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Wake an idle, failed, or interrupted background agent with a new task. The new
-    run resumes its persisted child conversation, or recreates the requested
-    fork/fresh context if interruption happened before attachment, and returns
-    immediately. Only the main agent that owns the original agent may call it.
+    Give an idle, failed, interrupted, or canceled background agent a new task and
+    return immediately. The agent continues its existing conversation when
+    available.
     """
 ).strip()
 
 STEER_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Queue guidance for an owned background agent that is currently running. The
-    extension persists the message until ACP reports that it was injected into
-    the live child session. If the turn closes first, the pending message is
-    carried into the next follow-up run. Injected but unconsumed guidance remains
-    on the child conversation and may also be applied during a later follow-up.
+    Send guidance to a background agent that is currently running. The guidance is
+    delivered before its next model response, or kept for a later follow-up if the
+    current run ends first.
     """
 ).strip()
 
 CANCEL_AGENT_DESCRIPTION = textwrap.dedent(
     """
-    Permanently cancel an owned background agent and fence its active worker. A
-    canceled agent cannot be resumed with followup_agent.
+    Cancel a background agent. An active agent remains in the canceling state until
+    it fully stops. Once canceled, it can be resumed with followup_agent.
     """
 ).strip()
 
@@ -127,6 +121,8 @@ WORKER_UPDATE_RETRY_INITIAL_SECONDS = 0.1
 WORKER_UPDATE_RETRY_MAX_SECONDS = 1.0
 BACKGROUND_LEASE_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 BACKGROUND_LEASE_RELEASE_RETRY_MAX_SECONDS = 2.0
+CLIENT_CLOSE_RETRY_INITIAL_SECONDS = 0.1
+CLIENT_CLOSE_RETRY_MAX_SECONDS = 2.0
 STEERING_POLL_SECONDS = 0.1
 STEERING_RETRY_SECONDS = 0.25
 SQLITE_BUSY_TIMEOUT_MS = 5_000
@@ -137,6 +133,7 @@ DATABASE_FILENAME = "subagents.sqlite"
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
 WIDGET_ID = "background-agents"
 WIDGET_AGENT_LIMIT = 8
+PRESENTATION_TASK_PREVIEW_LENGTH = 160
 AGENT_TOOL_NAMES = (
     "spawn_agent",
     "wait_agent",
@@ -150,6 +147,7 @@ SpawnContextMode = Literal["fork", "fresh"]
 AgentStatus = Literal[
     "starting",
     "running",
+    "canceling",
     "idle",
     "failed",
     "interrupted",
@@ -166,7 +164,7 @@ RunStatus = Literal[
 WorkerTerminalStatus = Literal["idle", "failed", "interrupted"]
 ACTIVE_AGENT_STATUSES = {"starting", "running"}
 ACTIVE_RUN_STATUSES = {"starting", "running"}
-CLAIMABLE_AGENT_STATUSES = {"idle", "failed", "interrupted"}
+CLAIMABLE_AGENT_STATUSES = {"idle", "failed", "interrupted", "canceled"}
 _database_initialization_locks_guard = threading.Lock()
 _database_initialization_locks: dict[Path, threading.Lock] = {}
 
@@ -339,6 +337,7 @@ class LiveRun:
     context_mode: SpawnContextMode
     lease: Lease = field(repr=False)
     conversation_id: str | None = None
+    setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
     cleanup_task: asyncio.Task[None] | None = field(default=None, repr=False)
     client: AgentClient | None = field(default=None, repr=False)
@@ -351,7 +350,7 @@ class LiveRun:
 
 
 # Keep these embedded resources byte-for-byte aligned with the packaged
-# persistence/migrations/env.py and versions/0001_initial.py files.
+# persistence/migrations/env.py and version files.
 ALEMBIC_ENV = """from __future__ import annotations
 
 from alembic import context
@@ -545,6 +544,109 @@ def downgrade() -> None:
     op.drop_table("agents")
 '''
 
+ALEMBIC_0002_CANCELING_STATE = '''"""Add the durable canceling agent state.
+
+Revision ID: 0002_canceling_state
+Revises: 0001_initial
+"""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "0002_canceling_state"
+down_revision = "0001_initial"
+branch_labels = None
+depends_on = None
+
+AGENT_STATUSES = "'starting', 'running', 'canceling', 'idle', 'failed', 'interrupted', 'canceled'"
+PREVIOUS_AGENT_STATUSES = "'starting', 'running', 'idle', 'failed', 'interrupted', 'canceled'"
+
+
+def _backup_dependents() -> None:
+    op.execute("CREATE TEMP TABLE subagent_runs_backup AS SELECT * FROM runs")
+    op.execute("CREATE TEMP TABLE subagent_steering_backup AS SELECT * FROM steering_messages")
+
+
+def _restore_dependents() -> None:
+    op.execute(
+        """
+        INSERT INTO runs (
+            id, agent_id, generation, lease_token, task, status,
+            result, error, created_at, started_at, completed_at, updated_at
+        )
+        SELECT
+            id, agent_id, generation, lease_token, task, status,
+            result, error, created_at, started_at, completed_at, updated_at
+        FROM subagent_runs_backup
+        """
+    )
+    op.execute(
+        """
+        INSERT INTO steering_messages (
+            id, agent_id, run_id, generation, message, created_at
+        )
+        SELECT id, agent_id, run_id, generation, message, created_at
+        FROM subagent_steering_backup
+        """
+    )
+    op.execute("DROP TABLE subagent_steering_backup")
+    op.execute("DROP TABLE subagent_runs_backup")
+
+
+def _replace_agent_constraints(*, statuses: str, leased_statuses: str) -> None:
+    _backup_dependents()
+    with op.batch_alter_table("agents", recreate="always") as batch_op:
+        batch_op.drop_constraint("ck_agents_status", type_="check")
+        batch_op.drop_constraint("ck_agents_active_lease", type_="check")
+        batch_op.create_check_constraint(
+            "ck_agents_status",
+            f"status IN ({statuses})",
+        )
+        batch_op.create_check_constraint(
+            "ck_agents_active_lease",
+            sa.text(
+                f"""
+                (
+                    status IN ({leased_statuses})
+                    AND lease_runtime_id IS NOT NULL
+                    AND lease_token IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                ) OR (
+                    status NOT IN ({leased_statuses})
+                    AND lease_runtime_id IS NULL
+                    AND lease_token IS NULL
+                    AND lease_expires_at IS NULL
+                )
+                """
+            ),
+        )
+    _restore_dependents()
+
+
+def upgrade() -> None:
+    _replace_agent_constraints(
+        statuses=AGENT_STATUSES,
+        leased_statuses="'starting', 'running', 'canceling'",
+    )
+
+
+def downgrade() -> None:
+    op.execute(
+        """
+        UPDATE agents
+        SET status = 'canceled', lease_runtime_id = NULL,
+            lease_token = NULL, lease_expires_at = NULL
+        WHERE status = 'canceling'
+        """
+    )
+    _replace_agent_constraints(
+        statuses=PREVIOUS_AGENT_STATUSES,
+        leased_statuses="'starting', 'running'",
+    )
+'''
+
 
 def open_database(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
@@ -680,6 +782,10 @@ def _alembic_config() -> Iterator[Any]:
         (script_location / "env.py").write_text(ALEMBIC_ENV, encoding="utf-8")
         (versions / "0001_initial.py").write_text(
             ALEMBIC_0001_INITIAL,
+            encoding="utf-8",
+        )
+        (versions / "0002_canceling_state.py").write_text(
+            ALEMBIC_0002_CANCELING_STATE,
             encoding="utf-8",
         )
         config = Config()
@@ -853,6 +959,17 @@ class AgentStore:
             conversation_id,
         )
 
+    async def attach_canceling_conversation(
+        self,
+        lease: Lease,
+        conversation_id: str,
+    ) -> AgentRecord:
+        return await asyncio.to_thread(
+            self._attach_canceling_conversation_sync,
+            lease,
+            conversation_id,
+        )
+
     async def mark_running(
         self,
         lease: Lease,
@@ -887,11 +1004,19 @@ class AgentStore:
         lease.expires_at = expires_at
         return expires_at
 
+    async def heartbeat_canceling(self, lease: Lease) -> float:
+        expires_at = await asyncio.to_thread(self._heartbeat_canceling_sync, lease)
+        lease.expires_at = expires_at
+        return expires_at
+
     async def abort(self, lease: Lease) -> bool:
         return await asyncio.to_thread(self._abort_sync, lease)
 
     async def cancel(self, owner_id: str, agent_id: str) -> AgentRecord:
         return await asyncio.to_thread(self._cancel_sync, owner_id, agent_id)
+
+    async def complete_cancel(self, lease: Lease) -> bool:
+        return await asyncio.to_thread(self._complete_cancel_sync, lease)
 
     async def enqueue_steering(
         self,
@@ -956,23 +1081,34 @@ class AgentStore:
     ) -> int:
         rows = connection.execute(
             """
-            SELECT id, active_run_id, generation
+            SELECT id, active_run_id, generation, status
             FROM agents
-            WHERE status IN ('starting', 'running')
+            WHERE status IN ('starting', 'running', 'canceling')
               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
             """,
             (now,),
         ).fetchall()
+        reconciled = 0
         for row in rows:
-            self._interrupt_row_tx(
-                connection,
-                str(row["id"]),
-                str(row["active_run_id"]),
-                int(row["generation"]),
-                "agent lease expired",
-                now,
-            )
-        return len(rows)
+            if str(row["status"]) == "canceling":
+                reconciled += self._complete_cancel_row_tx(
+                    connection,
+                    str(row["id"]),
+                    str(row["active_run_id"]),
+                    int(row["generation"]),
+                    now,
+                )
+            else:
+                self._interrupt_row_tx(
+                    connection,
+                    str(row["id"]),
+                    str(row["active_run_id"]),
+                    int(row["generation"]),
+                    "agent lease expired",
+                    now,
+                )
+                reconciled += 1
+        return reconciled
 
     def _interrupt_row_tx(
         self,
@@ -1002,6 +1138,31 @@ class AgentStore:
             (now, agent_id, run_id, generation),
         )
 
+    @staticmethod
+    def _complete_cancel_row_tx(
+        connection: sqlite3.Connection,
+        agent_id: str,
+        run_id: str,
+        generation: int,
+        now: float,
+    ) -> bool:
+        cursor = connection.execute(
+            """
+            UPDATE agents
+            SET status = 'canceled', lease_runtime_id = NULL,
+                lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND active_run_id = ? AND generation = ?
+              AND status = 'canceling'
+              AND EXISTS (
+                  SELECT 1 FROM runs
+                  WHERE runs.id = ? AND runs.agent_id = agents.id
+                    AND runs.generation = ? AND runs.status = 'canceled'
+              )
+            """,
+            (now, agent_id, run_id, generation, run_id, generation),
+        )
+        return cursor.rowcount == 1
+
     def _check_limits_tx(
         self,
         connection: sqlite3.Connection,
@@ -1011,7 +1172,8 @@ class AgentStore:
             connection.execute(
                 """
                 SELECT COUNT(*) FROM agents
-                WHERE owner_conversation_id = ? AND status IN ('starting', 'running')
+                WHERE owner_conversation_id = ?
+                  AND status IN ('starting', 'running', 'canceling')
                 """,
                 (owner_id,),
             ).fetchone()[0]
@@ -1023,7 +1185,10 @@ class AgentStore:
             )
         total_count = int(
             connection.execute(
-                "SELECT COUNT(*) FROM agents WHERE status IN ('starting', 'running')"
+                """
+                SELECT COUNT(*) FROM agents
+                WHERE status IN ('starting', 'running', 'canceling')
+                """
             ).fetchone()[0]
         )
         if total_count >= MAX_ACTIVE_AGENTS_TOTAL:
@@ -1144,7 +1309,7 @@ class AgentStore:
                 SELECT id FROM agents
                 WHERE owner_conversation_id = ?
                 ORDER BY
-                    CASE WHEN status IN ('starting', 'running') THEN 0 ELSE 1 END,
+                    CASE WHEN status IN ('starting', 'running', 'canceling') THEN 0 ELSE 1 END,
                     updated_at DESC
                 LIMIT ?
                 """,
@@ -1187,7 +1352,7 @@ class AgentStore:
                     lease_runtime_id = ?, lease_token = ?, lease_expires_at = ?,
                     updated_at = ?
                 WHERE id = ? AND owner_conversation_id = ? AND generation = ?
-                  AND status IN ('idle', 'failed', 'interrupted')
+                  AND status IN ('idle', 'failed', 'interrupted', 'canceled')
                 """,
                 (
                     run_id,
@@ -1236,6 +1401,36 @@ class AgentStore:
         with self._immediate_transaction() as connection:
             self._reconcile_expired_tx(connection, now)
             agent_row, _ = self._validate_active_lease_tx(connection, lease, now)
+            existing = agent_row["child_conversation_id"]
+            if existing is not None and str(existing) != conversation_id:
+                raise AgentConflictError("agent child conversation cannot change")
+            try:
+                connection.execute(
+                    """
+                    UPDATE agents
+                    SET child_conversation_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (conversation_id, now, lease.agent_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise AgentConflictError(
+                    "child conversation is already attached to another agent"
+                ) from exc
+            return self._fetch_agent_tx(connection, lease.agent_id)
+
+    def _attach_canceling_conversation_sync(
+        self,
+        lease: Lease,
+        conversation_id: str,
+    ) -> AgentRecord:
+        conversation_id = conversation_id.strip()
+        if not conversation_id:
+            raise ValueError("conversation id is required")
+        now = self.current_time()
+        with self._immediate_transaction() as connection:
+            self._reconcile_expired_tx(connection, now)
+            agent_row, _ = self._validate_canceling_lease_tx(connection, lease, now)
             existing = agent_row["child_conversation_id"]
             if existing is not None and str(existing) != conversation_id:
                 raise AgentConflictError("agent child conversation cannot change")
@@ -1403,6 +1598,22 @@ class AgentStore:
             )
         return expires_at
 
+    def _heartbeat_canceling_sync(self, lease: Lease) -> float:
+        now = self.current_time()
+        expires_at = now + LEASE_DURATION_SECONDS
+        with self._immediate_transaction() as connection:
+            self._reconcile_expired_tx(connection, now)
+            self._validate_canceling_lease_tx(connection, lease, now)
+            connection.execute(
+                """
+                UPDATE agents
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (expires_at, now, lease.agent_id),
+            )
+        return expires_at
+
     def _abort_sync(self, lease: Lease) -> bool:
         now = self.current_time()
         with self._immediate_transaction() as connection:
@@ -1439,7 +1650,7 @@ class AgentStore:
                 agent_id.strip(),
                 owner_id=owner_id.strip(),
             )
-            if current.status != "canceled":
+            if current.status not in {"canceling", "canceled"}:
                 self._delete_run_messages_tx(
                     connection,
                     current.id,
@@ -1456,16 +1667,64 @@ class AgentStore:
                         """,
                         (now, now, current.run.id),
                     )
-                connection.execute(
-                    """
-                    UPDATE agents
-                    SET status = 'canceled', lease_runtime_id = NULL,
-                        lease_token = NULL, lease_expires_at = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now, current.id),
-                )
+                    connection.execute(
+                        """
+                        UPDATE agents
+                        SET status = 'canceling', lease_expires_at = ?, updated_at = ?
+                        WHERE id = ? AND active_run_id = ? AND generation = ?
+                          AND status IN ('starting', 'running')
+                        """,
+                        (
+                            now + LEASE_DURATION_SECONDS,
+                            now,
+                            current.id,
+                            current.run.id,
+                            current.run.generation,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE agents
+                        SET status = 'canceled', lease_runtime_id = NULL,
+                            lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                        WHERE id = ? AND active_run_id = ? AND generation = ?
+                          AND status = ?
+                        """,
+                        (
+                            now,
+                            current.id,
+                            current.run.id,
+                            current.run.generation,
+                            current.status,
+                        ),
+                    )
             return self._fetch_agent_tx(connection, current.id)
+
+    def _complete_cancel_sync(self, lease: Lease) -> bool:
+        now = self.current_time()
+        with self._immediate_transaction() as connection:
+            self._reconcile_expired_tx(connection, now)
+            agent_row = self._agent_row_tx(connection, lease.agent_id)
+            run_row = self._run_row_tx(connection, lease.agent_id, lease.run_id)
+            self._validate_run_token(run_row, lease)
+            if (
+                str(agent_row["active_run_id"]) != lease.run_id
+                or int(agent_row["generation"]) != lease.generation
+            ):
+                return False
+            if str(agent_row["status"]) == "canceled":
+                return True
+            if str(agent_row["status"]) != "canceling":
+                return False
+            self._validate_canceling_lease_rows(agent_row, run_row, lease, now)
+            return self._complete_cancel_row_tx(
+                connection,
+                lease.agent_id,
+                lease.run_id,
+                lease.generation,
+                now,
+            )
 
     def _enqueue_steering_sync(
         self,
@@ -1732,12 +1991,51 @@ class AgentStore:
         self._validate_active_lease_rows(agent_row, run_row, lease, now)
         return agent_row, run_row
 
+    def _validate_canceling_lease_rows(
+        self,
+        agent_row: sqlite3.Row,
+        run_row: sqlite3.Row,
+        lease: Lease,
+        now: float,
+    ) -> None:
+        self._validate_run_token(run_row, lease)
+        if lease.runtime_id != self.runtime_id:
+            raise LeaseLostError("async-agent worker runtime changed")
+        if str(agent_row["active_run_id"]) != lease.run_id:
+            raise LeaseLostError("async-agent active run changed")
+        if int(agent_row["generation"]) != lease.generation:
+            raise LeaseLostError("async-agent generation changed")
+        runtime_id = agent_row["lease_runtime_id"]
+        if runtime_id is None or str(runtime_id) != self.runtime_id:
+            raise LeaseLostError("async-agent worker runtime changed")
+        token = agent_row["lease_token"]
+        if token is None or not hmac.compare_digest(str(token), lease.token):
+            raise LeaseLostError("async-agent lease token changed")
+        expires_at = agent_row["lease_expires_at"]
+        if expires_at is None or float(expires_at) <= now:
+            raise LeaseLostError("async-agent lease expired")
+        if str(agent_row["status"]) != "canceling":
+            raise LeaseLostError(f"async-agent is {agent_row['status']}")
+        if str(run_row["status"]) != "canceled":
+            raise LeaseLostError(f"async-agent run is {run_row['status']}")
+
+    def _validate_canceling_lease_tx(
+        self,
+        connection: sqlite3.Connection,
+        lease: Lease,
+        now: float,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        agent_row = self._agent_row_tx(connection, lease.agent_id)
+        run_row = self._run_row_tx(connection, lease.agent_id, lease.run_id)
+        self._validate_canceling_lease_rows(agent_row, run_row, lease, now)
+        return agent_row, run_row
+
 
 class SubagentExtension(Extension):
     """Extension host with capability gating tied to one runtime state."""
 
     def __init__(self, runtime: RuntimeState) -> None:
-        super().__init__(name="subagent", version="0.4.0")
+        super().__init__(name="subagent", version="0.4.1")
         self.runtime = runtime
 
     def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1787,9 +2085,9 @@ class SpawnAgentInput(BaseModel):
     context_mode: SpawnContextMode = Field(
         default="fork",
         description=(
-            "How to initialize the child conversation. 'fork' copies the main "
-            "agent's live conversation into an isolated child; 'fresh' starts "
-            "with no parent conversation memory. Defaults to 'fork'."
+            "How to initialize the agent's conversation. 'fork' copies the current "
+            "conversation into an isolated child; 'fresh' starts without parent "
+            "conversation context. Defaults to 'fork'."
         ),
     )
 
@@ -1817,18 +2115,18 @@ class ListAgentsInput(BaseModel):
 class FollowupAgentInput(BaseModel):
     agent_id: str = Field(
         min_length=1,
-        description="The persisted agent ID to wake or resume.",
+        description="The ID of an idle, failed, interrupted, or canceled agent to resume.",
     )
     task: str = Field(
         min_length=1,
-        description="The new task to run in the agent's persisted child conversation.",
+        description="The new task to run in the agent's existing conversation.",
     )
 
 
 class SteerAgentInput(BaseModel):
     agent_id: str = Field(
         min_length=1,
-        description="The running agent ID to steer.",
+        description="The ID of the currently running agent to guide.",
     )
     message: str = Field(
         min_length=1,
@@ -1980,9 +2278,21 @@ class RuntimeState:
         with self.activate():
             return await safe_worker_abort(live)
 
+    async def safe_complete_cancel(self, live: LiveRun) -> bool:
+        with self.activate():
+            return await safe_complete_cancel(live)
+
+    async def safe_attach_canceling_conversation(self, live: LiveRun) -> bool:
+        with self.activate():
+            return await safe_attach_canceling_conversation(live)
+
     async def heartbeat_agent(self, live: LiveRun) -> None:
         with self.activate():
             await heartbeat_agent(live)
+
+    async def heartbeat_canceling(self, live: LiveRun) -> None:
+        with self.activate():
+            await heartbeat_canceling(live)
 
     def start_agent_heartbeat(self, live: LiveRun) -> asyncio.Task[None]:
         with self.activate():
@@ -2116,6 +2426,10 @@ class RuntimeState:
                 heartbeat_task,
             )
 
+    @staticmethod
+    async def close_agent_client(client: AgentClient) -> None:
+        await close_agent_client(client)
+
     async def close_background_lease(self, live: LiveRun) -> None:
         with self.activate():
             await close_background_lease(live)
@@ -2127,6 +2441,10 @@ class RuntimeState:
     ) -> None:
         with self.activate():
             launch_live_run(live, heartbeat_task)
+
+    def own_live_setup(self, live: LiveRun, setup_task: asyncio.Task[Any]) -> None:
+        with self.activate():
+            own_live_setup(live, setup_task)
 
     @staticmethod
     async def fork_parent_context(parent_context: ToolContext, name: str) -> str:
@@ -2154,6 +2472,7 @@ class RuntimeState:
         self,
         store: AgentStore,
         agent_id: str,
+        run_id: str,
         *,
         cleanup_timeout: float | None = None,
     ) -> bool:
@@ -2161,6 +2480,7 @@ class RuntimeState:
             return await cancel_live_run(
                 store,
                 agent_id,
+                run_id,
                 cleanup_timeout=cleanup_timeout,
             )
 
@@ -2335,17 +2655,45 @@ def owned_run_key(store: AgentStore, run_id: str) -> tuple[Path, str]:
     return store.path, run_id
 
 
-def child_tool_error() -> ToolExecutionResult:
+def child_tool_error(summary: str) -> ToolExecutionResult:
     message = "async agent tools are only available to the main agent"
-    return {"content": message, "error": message}
+    return tool_error(message, summary=summary)
 
 
-def tool_error(message: str) -> ToolExecutionResult:
-    return {"content": message, "error": message}
+def tool_error(message: str, *, summary: str) -> ToolExecutionResult:
+    return {
+        "content": message,
+        "error": message,
+        "data": {"presentation": tool_presentation(summary)},
+    }
 
 
-def agent_not_found(agent_id: str) -> ToolExecutionResult:
-    return tool_error(f"agent not found: {agent_id.strip()}")
+def tool_presentation(summary: str, *, body: str | None = None) -> ToolPresentation:
+    presentation: ToolPresentation = {"summary": summary}
+    if body is not None:
+        presentation["body"] = body
+        presentation["format"] = "markdown"
+    return presentation
+
+
+def agent_not_found(*, summary: str) -> ToolExecutionResult:
+    return tool_error("agent not found", summary=summary)
+
+
+def agent_list_presentation(agents: list[AgentRecord]) -> ToolPresentation:
+    if not agents:
+        return tool_presentation("List agents", body="No background agents.")
+
+    lines: list[str] = []
+    for agent in agents:
+        task = " ".join(agent.run.task.split())
+        if len(task) > PRESENTATION_TASK_PREVIEW_LENGTH:
+            task = f"{task[: PRESENTATION_TASK_PREVIEW_LENGTH - 3]}..."
+        status = "canceling" if agent.status == "canceling" else agent.run.status
+        lines.append(f"- **{agent.name}** — {status}")
+        if task:
+            lines.append(f"  {task}")
+    return tool_presentation("List agents", body="\n".join(lines))
 
 
 def timestamp(value: float | None) -> str | None:
@@ -2386,6 +2734,7 @@ def agent_widget_line(agent: AgentRecord) -> UIFrameLine:
     icon_by_status = {
         "starting": "◌",
         "running": "●",
+        "canceling": "×",
         "completed": "✓",
         "failed": "!",
         "interrupted": "!",
@@ -2394,7 +2743,7 @@ def agent_widget_line(agent: AgentRecord) -> UIFrameLine:
     name = agent.name
     if len(name) > 88:
         name = f"{name[:85]}..."
-    status = agent.run.status
+    status = "canceling" if agent.status == "canceling" else agent.run.status
     icon_style = {"bold": True} if status in ACTIVE_RUN_STATUSES else {"dim": True}
     status_style = (
         {"bold": True} if status in {"failed", "interrupted"} else {"dim": True}
@@ -2410,10 +2759,15 @@ def agent_widget_line(agent: AgentRecord) -> UIFrameLine:
 
 def agent_widget_lines(agents: list[AgentRecord]) -> list[UIFrameLine]:
     active = sum(agent.run.status in ACTIVE_RUN_STATUSES for agent in agents)
+    canceling = sum(agent.status == "canceling" for agent in agents)
     completed = sum(agent.run.status == "completed" for agent in agents)
     attention = sum(agent.run.status in {"failed", "interrupted"} for agent in agents)
-    canceled = sum(agent.run.status == "canceled" for agent in agents)
+    canceled = sum(
+        agent.run.status == "canceled" and agent.status != "canceling" for agent in agents
+    )
     summary_parts = [f"{active} active", f"{completed} completed"]
+    if canceling:
+        summary_parts.append(f"{canceling} canceling")
     if attention:
         summary_parts.append(f"{attention} need attention")
     if canceled:
@@ -2563,9 +2917,9 @@ def is_retryable_store_error(exc: Exception) -> bool:
 
 def stop_live_run_for_error(live: LiveRun, error: str) -> None:
     live.heartbeat_error = error
-    runner_task = live.runner_task
-    if runner_task is not None and runner_task is not asyncio.current_task():
-        runner_task.cancel()
+    owned_task = live.runner_task or live.setup_task
+    if owned_task is not None and owned_task is not asyncio.current_task():
+        owned_task.cancel()
 
 
 async def safe_worker_terminal(
@@ -2632,6 +2986,60 @@ async def safe_worker_abort(live: LiveRun) -> bool:
             retry_delay = min(WORKER_UPDATE_RETRY_MAX_SECONDS, retry_delay * 2)
 
 
+async def safe_complete_cancel(live: LiveRun) -> bool:
+    retry_delay = min(
+        WORKER_UPDATE_RETRY_INITIAL_SECONDS,
+        WORKER_UPDATE_RETRY_MAX_SECONDS,
+    )
+    while True:
+        try:
+            completed = await live.store.complete_cancel(live.lease)
+            if completed:
+                await safe_sync_agent_widget(
+                    live.ui,
+                    live.store,
+                    live.owner_conversation_id,
+                )
+            return completed
+        except Exception as exc:  # noqa: BLE001
+            if is_definitive_worker_error(exc):
+                return False
+            if not is_retryable_store_error(exc):
+                return False
+            remaining = live.lease.expires_at - live.store.current_time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(retry_delay, remaining))
+            retry_delay = min(WORKER_UPDATE_RETRY_MAX_SECONDS, retry_delay * 2)
+
+
+async def safe_attach_canceling_conversation(live: LiveRun) -> bool:
+    conversation_id = live.conversation_id
+    if conversation_id is None or live.context_mode != "fork":
+        return True
+    retry_delay = min(
+        WORKER_UPDATE_RETRY_INITIAL_SECONDS,
+        WORKER_UPDATE_RETRY_MAX_SECONDS,
+    )
+    while True:
+        try:
+            await live.store.attach_canceling_conversation(
+                live.lease,
+                conversation_id,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if is_definitive_worker_error(exc):
+                return False
+            if not is_retryable_store_error(exc):
+                return False
+            remaining = live.lease.expires_at - live.store.current_time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(retry_delay, remaining))
+            retry_delay = min(WORKER_UPDATE_RETRY_MAX_SECONDS, retry_delay * 2)
+
+
 async def heartbeat_agent(live: LiveRun) -> None:
     interval = max(MIN_HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS)
     while True:
@@ -2668,6 +3076,31 @@ async def heartbeat_agent(live: LiveRun) -> None:
                         max(MIN_HEARTBEAT_INTERVAL_SECONDS, remaining / 2),
                     )
                 )
+
+
+async def heartbeat_canceling(live: LiveRun) -> None:
+    interval = max(MIN_HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS)
+    while True:
+        try:
+            await live.store.heartbeat_canceling(live.lease)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_definitive_worker_error(exc):
+                return
+            if not is_retryable_store_error(exc):
+                return
+            remaining = live.lease.expires_at - live.store.current_time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(
+                min(
+                    HEARTBEAT_RETRY_MAX_SECONDS,
+                    max(MIN_HEARTBEAT_INTERVAL_SECONDS, remaining / 2),
+                )
+            )
+            continue
+        await asyncio.sleep(interval)
 
 
 def start_agent_heartbeat(live: LiveRun) -> asyncio.Task[None]:
@@ -2943,11 +3376,21 @@ async def cleanup_live_run(
     try:
         await stop_task(steering_task)
         await stop_task(heartbeat_task)
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
-        live.client = None
-        live.session = None
+        child_closed = client is None
+        canceling_heartbeat = asyncio.create_task(
+            heartbeat_canceling(live),
+            name=f"kodelet-{live.agent_id}-{live.generation}-canceling-heartbeat",
+        )
+        try:
+            if client is not None:
+                await close_agent_client(client)
+                child_closed = True
+            live.client = None
+            live.session = None
+            if child_closed and await safe_attach_canceling_conversation(live):
+                await safe_complete_cancel(live)
+        finally:
+            await stop_task(canceling_heartbeat)
         await close_background_lease(live)
     finally:
         key = live_run_key(live.store, live.agent_id)
@@ -2956,7 +3399,22 @@ async def cleanup_live_run(
         owned_key = owned_run_key(live.store, live.run_id)
         if runtime.owned_runs.get(owned_key) is live:
             runtime.owned_runs.pop(owned_key, None)
+        live.setup_task = None
         live.cleanup_task = None
+
+
+async def close_agent_client(client: AgentClient) -> None:
+    retry_delay = CLIENT_CLOSE_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            await client.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(CLIENT_CLOSE_RETRY_MAX_SECONDS, retry_delay * 2)
+            continue
+        return
 
 
 async def close_background_lease(live: LiveRun) -> None:
@@ -2990,9 +3448,17 @@ def launch_live_run(
         name=f"kodelet-{live.agent_id}-{live.generation}",
     )
     live.runner_task = runner_task
+    live.setup_task = None
     runtime.owned_runs[owned_run_key(live.store, live.run_id)] = live
     key = live_run_key(live.store, live.agent_id)
     runtime.live_runs[key] = live
+
+
+def own_live_setup(live: LiveRun, setup_task: asyncio.Task[Any]) -> None:
+    runtime = current_runtime()
+    live.setup_task = setup_task
+    runtime.owned_runs[owned_run_key(live.store, live.run_id)] = live
+    runtime.live_runs[live_run_key(live.store, live.agent_id)] = live
 
 
 async def prepare_claim(
@@ -3012,6 +3478,7 @@ async def prepare_claim(
     try:
         live = live_run_from_claim(claim, task, store)
         live.ui = getattr(ctx, "ui", None)
+        own_live_setup(live, setup_task)
         setup_heartbeat = start_agent_heartbeat(live)
         try:
             live.background_lease = await ctx.acquire_background_task(
@@ -3028,38 +3495,51 @@ async def prepare_claim(
                 )
                 claim = Claim(agent=attached, lease=claim.lease)
             ensure_runtime_accepting_agents()
+            await store.heartbeat(live.lease)
             launch_live_run(live, setup_heartbeat)
             setup_heartbeat = None
             return claim, live
         except asyncio.CancelledError:
             live.terminalizing = True
             try:
-                if initial and live.conversation_id is None:
-                    await safe_worker_abort(live)
-                else:
-                    await safe_worker_terminal(
-                        live,
-                        "interrupted",
-                        error="agent setup was canceled before the worker started",
-                    )
+                if not live.parent_canceled:
+                    if initial and live.conversation_id is None:
+                        await safe_worker_abort(live)
+                    else:
+                        await safe_worker_terminal(
+                            live,
+                            "interrupted",
+                            error="agent setup was canceled before the worker started",
+                        )
             finally:
-                await stop_task(setup_heartbeat)
-                await close_background_lease(live)
+                cleanup_task = start_live_run_cleanup(
+                    live,
+                    None,
+                    None,
+                    setup_heartbeat,
+                )
+                await await_live_run_cleanup(cleanup_task)
             raise
         except Exception:
             live.terminalizing = True
             try:
-                if initial and live.conversation_id is None:
-                    await safe_worker_abort(live)
-                else:
-                    await safe_worker_terminal(
-                        live,
-                        "failed",
-                        error="agent setup failed before the worker started",
-                    )
+                if not live.parent_canceled:
+                    if initial and live.conversation_id is None:
+                        await safe_worker_abort(live)
+                    else:
+                        await safe_worker_terminal(
+                            live,
+                            "failed",
+                            error="agent setup failed before the worker started",
+                        )
             finally:
-                await stop_task(setup_heartbeat)
-                await close_background_lease(live)
+                cleanup_task = start_live_run_cleanup(
+                    live,
+                    None,
+                    None,
+                    setup_heartbeat,
+                )
+                await await_live_run_cleanup(cleanup_task)
             raise
     finally:
         runtime.setup_tasks.discard(setup_task)
@@ -3068,18 +3548,21 @@ async def prepare_claim(
 async def cancel_live_run(
     store: AgentStore,
     agent_id: str,
+    run_id: str,
     *,
     cleanup_timeout: float | None = None,
 ) -> bool:
-    live = current_runtime().live_runs.get(live_run_key(store, agent_id))
-    if live is None:
-        return True
+    runtime = current_runtime()
+    live = runtime.owned_runs.get(owned_run_key(store, run_id))
+    if live is None or live.agent_id != agent_id:
+        return False
     live.parent_canceled = True
-    runner_task = live.runner_task
-    if runner_task is None or runner_task.done():
-        return True
-    runner_task.cancel()
-    cleanup = asyncio.gather(runner_task, return_exceptions=True)
+    owned_task = live.runner_task or live.setup_task or live.cleanup_task
+    if owned_task is None:
+        return await safe_complete_cancel(live)
+    if not owned_task.done():
+        owned_task.cancel()
+    cleanup = asyncio.gather(owned_task, return_exceptions=True)
     try:
         await asyncio.wait_for(
             asyncio.shield(cleanup),
@@ -3091,22 +3574,27 @@ async def cancel_live_run(
         )
     except TimeoutError:
         return False
-    return True
+    return owned_run_key(store, run_id) not in runtime.owned_runs
 
 
 async def spawn_agent(
     input: SpawnAgentInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "Spawn agent"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     try:
         name = validate_agent_name(input.name)
     except ValueError as exc:
-        return tool_error(str(exc))
+        return tool_error(str(exc), summary=summary)
+    summary = f"Spawn {name}"
     task = input.task.strip()
     if not task:
-        return tool_error("task is required and must be a non-empty string")
+        return tool_error(
+            "task is required and must be a non-empty string",
+            summary=summary,
+        )
     try:
         owner_id = owner_conversation_id(ctx)
         agent_cwd = resolve_agent_cwd(input.cwd, ctx.cwd)
@@ -3123,6 +3611,7 @@ async def spawn_agent(
             store,
             initial=True,
         )
+        summary = f"Spawn {claim.agent.name}"
         claim, live = await prepare_claim(
             claim,
             task,
@@ -3132,20 +3621,22 @@ async def spawn_agent(
         )
         await safe_sync_agent_widget(ctx.ui, store, owner_id)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"spawn_agent failed: {exc}")
+        return tool_error(f"spawn_agent failed: {exc}", summary=summary)
 
     conversation_detail = (
         f" in conversation {live.conversation_id}"
         if live.conversation_id is not None
         else " with fresh context"
     )
+    snapshot = public_snapshot(claim.agent)
+    snapshot["presentation"] = tool_presentation(summary, body=task)
     return {
         "content": (
             f"Spawned agent {claim.agent.name!r} ({live.agent_id})"
             f"{conversation_detail}. Continue with independent work and call "
             "wait_agent before relying on its result."
         ),
-        "data": public_snapshot(claim.agent),
+        "data": snapshot,
     }
 
 
@@ -3153,13 +3644,15 @@ async def wait_agent(
     input: WaitAgentInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "Wait for agent"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     agent_id = input.agent_id.strip()
     try:
         owner_id = owner_conversation_id(ctx)
         store = await store_for_context(ctx)
         agent = await store.get(owner_id, agent_id)
+        summary = f"Wait for {agent.name}"
         progress: TaskProgress | None = None
         if agent.run.status in ACTIVE_RUN_STATUSES and input.timeout_ms > 0:
             agent, progress = await wait_for_active_run(
@@ -3170,20 +3663,21 @@ async def wait_agent(
                 input.timeout_ms,
             )
     except AgentNotFoundError:
-        return agent_not_found(agent_id)
+        return agent_not_found(summary=summary)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"wait_agent failed: {exc}")
+        return tool_error(f"wait_agent failed: {exc}", summary=summary)
 
     await safe_sync_agent_widget(ctx.ui, store, owner_id)
     snapshot = public_snapshot(
         agent,
         include_result=agent.run.status == "completed",
     )
+    snapshot["presentation"] = tool_presentation(summary)
     if progress is not None:
         snapshot["taskRun"] = await finish_wait_progress(progress, agent)
-    return wait_result(agent_id, agent, snapshot)
+    return wait_result(agent, snapshot)
 
 
 async def wait_for_active_run(
@@ -3198,9 +3692,9 @@ async def wait_for_active_run(
         kind="subagent",
         task=agent.run.task,
         cwd=agent.cwd,
-        running_title="Waiting for background agent",
-        completed_title="Finished waiting for background agent",
-        failed_title="Background agent failed",
+        running_title=f"Wait for {agent.name}",
+        completed_title=f"Wait for {agent.name}",
+        failed_title=f"Wait for {agent.name}",
         responding_detail="agent is responding",
     )
     await progress.start()
@@ -3267,28 +3761,35 @@ async def finish_wait_progress(
 
 
 def wait_result(
-    agent_id: str,
     agent: AgentRecord,
     snapshot: dict[str, object],
 ) -> ToolExecutionResult:
     if agent.run.status in ACTIVE_RUN_STATUSES:
         return {
-            "content": f"Agent {agent_id} is still {agent.run.status}.",
+            "content": f"Agent {agent.name!r} is still {agent.run.status}.",
             "data": snapshot,
         }
     if agent.run.status == "completed":
         return {"content": agent.run.result or "", "data": snapshot}
     if agent.run.status == "failed":
-        message = f"Agent {agent_id} failed: {agent.run.error or 'unknown error'}"
+        message = f"Agent {agent.name!r} failed: {agent.run.error or 'unknown error'}"
         return {"content": message, "error": message, "data": snapshot}
     if agent.run.status == "interrupted":
         message = (
-            f"Agent {agent_id} was interrupted: "
+            f"Agent {agent.name!r} was interrupted: "
             f"{agent.run.error or 'worker stopped'}. Use followup_agent to resume it."
         )
         return {"content": message, "error": message, "data": snapshot}
+    if agent.status == "canceling":
+        return {
+            "content": (
+                f"Agent {agent.name!r} is still canceling. "
+                "Retry followup_agent after cancellation finishes."
+            ),
+            "data": snapshot,
+        }
     return {
-        "content": f"Agent {agent_id} was canceled.",
+        "content": f"Agent {agent.name!r} was canceled. Use followup_agent to resume it.",
         "data": snapshot,
     }
 
@@ -3297,19 +3798,23 @@ async def list_agents(
     _input: ListAgentsInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "List agents"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     try:
         owner_id = owner_conversation_id(ctx)
         store = await store_for_context(ctx)
         agents = await store.list(owner_id)
         await safe_sync_agent_widget(ctx.ui, store, owner_id)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"list_agents failed: {exc}")
+        return tool_error(f"list_agents failed: {exc}", summary=summary)
     if not agents:
         return {
             "content": "No background agents have been spawned by this conversation.",
-            "data": {"agents": []},
+            "data": {
+                "agents": [],
+                "presentation": agent_list_presentation(agents),
+            },
         }
     lines = [
         "Background agents:",
@@ -3326,7 +3831,10 @@ async def list_agents(
         )
     return {
         "content": "\n".join(lines),
-        "data": {"agents": [public_snapshot(agent) for agent in agents]},
+        "data": {
+            "agents": [public_snapshot(agent) for agent in agents],
+            "presentation": agent_list_presentation(agents),
+        },
     }
 
 
@@ -3334,15 +3842,25 @@ async def followup_agent(
     input: FollowupAgentInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "Follow up agent"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     agent_id = input.agent_id.strip()
     task = input.task.strip()
     if not task:
-        return tool_error("task is required and must be a non-empty string")
+        return tool_error(
+            "task is required and must be a non-empty string",
+            summary=summary,
+        )
     try:
         owner_id = owner_conversation_id(ctx)
         store = await store_for_context(ctx)
+        agent = await store.get(owner_id, agent_id)
+        summary = f"Follow up {agent.name}"
+        if agent.status == "canceling":
+            raise AgentConflictError(
+                "agent cancellation is still in progress; retry followup_agent shortly"
+            )
         claim = await reserve_claim(
             store.claim(owner_id, agent_id, task),
             task,
@@ -3358,21 +3876,24 @@ async def followup_agent(
         )
         await safe_sync_agent_widget(ctx.ui, store, owner_id)
     except AgentNotFoundError:
-        return agent_not_found(agent_id)
+        return agent_not_found(summary=summary)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"followup_agent failed: {exc}")
+        return tool_error(f"followup_agent failed: {exc}", summary=summary)
+    conversation_detail = (
+        f" in conversation {live.conversation_id}."
+        if live.conversation_id is not None
+        else " with fresh context."
+    )
+    snapshot = public_snapshot(claim.agent)
+    snapshot["presentation"] = tool_presentation(summary, body=task)
     return {
         "content": (
             f"Started follow-up run {live.run_id} for agent "
-            f"{claim.agent.name!r} ({live.agent_id})"
-            + (
-                f" in conversation {live.conversation_id}."
-                if live.conversation_id is not None
-                else " with fresh context."
-            )
-            + " Call wait_agent before relying on its result."
+            f"{claim.agent.name!r} ({live.agent_id}){conversation_detail}\n\n"
+            f"Follow-up task sent:\n{task}\n\n"
+            "Call wait_agent before relying on its result."
         ),
-        "data": public_snapshot(claim.agent),
+        "data": snapshot,
     }
 
 
@@ -3380,25 +3901,38 @@ async def steer_agent(
     input: SteerAgentInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "Steer agent"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     agent_id = input.agent_id.strip()
+    message = input.message.strip()
     try:
         owner_id = owner_conversation_id(ctx)
         store = await store_for_context(ctx)
+        agent = await store.get(owner_id, agent_id)
+        summary = f"Steer {agent.name}"
         result = await store.enqueue_steering(
             owner_id,
             agent_id,
-            input.message,
+            message,
         )
     except AgentNotFoundError:
-        return agent_not_found(agent_id)
+        return agent_not_found(summary=summary)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"steer_agent failed: {exc}")
+        return tool_error(f"steer_agent failed: {exc}", summary=summary)
     queued = " behind pending steering" if result["alreadyPending"] else ""
     return {
-        "content": f"Queued steering for agent {agent_id}{queued}.",
-        "data": {"agent_id": agent_id, **result},
+        "content": (
+            f"Queued steering for agent {agent.name!r} ({agent.id}){queued}.\n\n"
+            f"Steering message queued for delivery:\n{message}"
+        ),
+        "data": {
+            "agent_id": agent.id,
+            "name": agent.name,
+            "message": message,
+            "presentation": tool_presentation(summary, body=message),
+            **result,
+        },
     }
 
 
@@ -3406,31 +3940,78 @@ async def cancel_agent(
     input: CancelAgentInput,
     ctx: ToolContext,
 ) -> ToolExecutionResult:
+    summary = "Cancel agent"
     if is_agent_child(ctx):
-        return child_tool_error()
+        return child_tool_error(summary)
     agent_id = input.agent_id.strip()
     try:
         owner_id = owner_conversation_id(ctx)
         store = await store_for_context(ctx)
         agent = await store.cancel(owner_id, agent_id)
+        summary = f"Cancel {agent.name}"
         await safe_sync_agent_widget(ctx.ui, store, owner_id)
     except AgentNotFoundError:
-        return agent_not_found(agent_id)
+        return agent_not_found(summary=summary)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"cancel_agent failed: {exc}")
+        return tool_error(f"cancel_agent failed: {exc}", summary=summary)
 
-    cleanup_complete = await cancel_live_run(store, agent_id)
-    if not cleanup_complete:
+    canceled_run_id = agent.run.id
+    cleanup_complete = True
+    if agent.status == "canceling":
+        cleanup_complete = await cancel_live_run(
+            store,
+            agent.id,
+            canceled_run_id,
+        )
+    agent = await store.get(owner_id, agent.id)
+    snapshot = public_snapshot(agent)
+    if agent.run.id != canceled_run_id:
+        snapshot["presentation"] = tool_presentation(
+            summary,
+            body="Cancellation was recorded; the agent has since changed generation.",
+        )
         return {
             "content": (
-                f"Cancellation persisted for agent {agent_id}; "
-                "local cleanup is still finishing."
+                f"Recorded cancellation for agent {agent.name!r}; "
+                "the agent has since changed generation."
             ),
-            "data": public_snapshot(agent),
+            "data": snapshot,
         }
+    if agent.status == "canceling":
+        snapshot["presentation"] = tool_presentation(
+            summary,
+            body=(
+                "Cancellation saved; worker cleanup is still finishing. "
+                "Retry followup_agent after cleanup completes."
+            ),
+        )
+        return {
+            "content": (
+                f"Cancellation persisted for agent {agent.name!r}; "
+                "worker cleanup is still finishing. Retry followup_agent after "
+                "cleanup completes."
+            ),
+            "data": snapshot,
+        }
+    if not cleanup_complete:
+        snapshot["presentation"] = tool_presentation(
+            summary,
+            body="Canceled and resumable. Remaining local resource cleanup is still finishing.",
+        )
+        return {
+            "content": (
+                f"Canceled agent {agent.name!r}; it can now be resumed with "
+                "followup_agent while remaining local resource cleanup finishes."
+            ),
+            "data": snapshot,
+        }
+    snapshot["presentation"] = tool_presentation(
+        summary,
+        body="Canceled. Use followup_agent to resume this agent later.",
+    )
     return {
-        "content": f"Canceled agent {agent_id}.",
-        "data": public_snapshot(agent),
+        "content": f"Canceled agent {agent.name!r}. Use followup_agent to resume it later.",
+        "data": snapshot,
     }
 
 
@@ -3580,11 +4161,10 @@ class SubagentApplication:
 
     @staticmethod
     def _wait_result(
-        agent_id: str,
         agent: AgentRecord,
         snapshot: dict[str, object],
     ) -> ToolExecutionResult:
-        return wait_result(agent_id, agent, snapshot)
+        return wait_result(agent, snapshot)
 
     async def list_agents(
         self,

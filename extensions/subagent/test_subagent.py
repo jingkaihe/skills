@@ -18,6 +18,11 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
 from unittest import mock
 
+from alembic import command
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import URL
+from sqlalchemy.pool import NullPool
+
 RECURSION_GUARD_ENV = "KODELET_SUBAGENT_EXTENSION_CHILD"
 
 
@@ -39,6 +44,26 @@ try:
 finally:
     if guard_value is not None:
         os.environ[RECURSION_GUARD_ENV] = guard_value
+
+
+def migrate_to_revision(path: Path, revision: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(
+        URL.create("sqlite+pysqlite", database=str(path)),
+        connect_args={"timeout": extension.SQLITE_BUSY_TIMEOUT_MS / 1000},
+        poolclass=NullPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+        extension._apply_connection_pragmas(dbapi_connection, ensure_wal=True)
+
+    try:
+        with extension._alembic_config() as config, engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, revision)
+    finally:
+        engine.dispose()
 
 
 class MutableClock:
@@ -116,6 +141,7 @@ class FakeContext:
         *,
         invoked_by: str | None = None,
         block_fork: bool = False,
+        block_background_acquire: bool = False,
         block_background_release: bool = False,
     ) -> None:
         self.conversation_id = conversation_id
@@ -125,11 +151,14 @@ class FakeContext:
         self.ui = FakeUI()
         self.log = SimpleNamespace(warn=lambda _message, _fields=None: None)
         self.block_fork = block_fork
+        self.block_background_acquire = block_background_acquire
         self.block_background_release = block_background_release
         self.fork_names: list[str | None] = []
         self.fork_started = asyncio.Event()
         self.fork_release = asyncio.Event()
         self.background_release_failures = 0
+        self.background_acquire_started = asyncio.Event()
+        self.background_acquire_release = asyncio.Event()
         self.background_leases: list[FakeBackgroundTaskLease] = []
         self.tool_updates: list[tuple[str, dict[str, Any] | None]] = []
 
@@ -144,6 +173,9 @@ class FakeContext:
         self,
         description: str | None = None,
     ) -> FakeBackgroundTaskLease:
+        self.background_acquire_started.set()
+        if self.block_background_acquire:
+            await self.background_acquire_release.wait()
         lease = FakeBackgroundTaskLease(
             description,
             self.background_release_failures,
@@ -218,6 +250,7 @@ class FakeClient:
     block_runs: ClassVar[bool] = False
     block_startup: ClassVar[bool] = False
     block_close: ClassVar[bool] = False
+    close_failures_remaining: ClassVar[int] = 0
     accept_steering: ClassVar[bool] = True
     steer_outcomes: ClassVar[list[str]] = []
     run_failure: ClassVar[Exception | None] = None
@@ -235,6 +268,7 @@ class FakeClient:
         cls.block_runs = False
         cls.block_startup = False
         cls.block_close = False
+        cls.close_failures_remaining = 0
         cls.accept_steering = True
         cls.steer_outcomes = []
         cls.run_failure = None
@@ -280,6 +314,9 @@ class FakeClient:
     async def close(self) -> None:
         self.close_calls += 1
         type(self).close_started.set()
+        if type(self).close_failures_remaining > 0:
+            type(self).close_failures_remaining -= 1
+            raise RuntimeError("temporary client close failure")
         if type(self).block_close:
             await type(self).close_release.wait()
         for session in self.sessions:
@@ -326,13 +363,14 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             background_lease = live.background_lease
             if isinstance(background_lease, FakeBackgroundTaskLease):
                 background_lease.close_release.set()
-            if live.runner_task is not None and not live.runner_task.done():
-                live.runner_task.cancel()
+            owned_task = live.runner_task or live.setup_task
+            if owned_task is not None and not owned_task.done():
+                owned_task.cancel()
         await asyncio.gather(
             *(
-                live.runner_task
+                owned_task
                 for live in list(self.runtime.owned_runs.values())
-                if live.runner_task is not None
+                if (owned_task := live.runner_task or live.setup_task) is not None
             ),
             return_exceptions=True,
         )
@@ -347,6 +385,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         data_dir: Path | None = None,
         invoked_by: str | None = None,
         block_fork: bool = False,
+        block_background_acquire: bool = False,
         block_background_release: bool = False,
     ) -> FakeContext:
         return FakeContext(
@@ -355,6 +394,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             data_dir or self.data_dir,
             invoked_by=invoked_by,
             block_fork=block_fork,
+            block_background_acquire=block_background_acquire,
             block_background_release=block_background_release,
         )
 
@@ -469,6 +509,10 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             child_context,
         )
         self.assertIn("only available to the main agent", nested["error"])
+        self.assertEqual(
+            nested["data"]["presentation"],
+            {"summary": "Spawn agent"},
+        )
         with mock.patch.dict(os.environ, {RECURSION_GUARD_ENV: "1"}):
             self.assertTrue(extension.is_agent_child(self.context()))
 
@@ -504,7 +548,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
                 )
             }
         self.assertEqual(journal_mode, "wal")
-        self.assertEqual(revision, "0001_initial")
+        self.assertEqual(revision, "0002_canceling_state")
         self.assertTrue(
             {"agents", "runs", "steering_messages", "alembic_version"} <= tables
         )
@@ -620,7 +664,119 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT version_num FROM alembic_version"
             ).fetchone()
         self.assertEqual(row, ("managed-worker", "managed task", "managed result"))
+        self.assertEqual(revision, ("0002_canceling_state",))
+
+    async def test_upgrade_from_initial_preserves_active_and_historical_rows(self) -> None:
+        path = self.root / "upgrade" / "subagents.sqlite"
+        await asyncio.to_thread(migrate_to_revision, path, "0001_initial")
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO agents (
+                    id, name, owner_conversation_id, child_conversation_id,
+                    context_mode, cwd, status, active_run_id, generation,
+                    lease_runtime_id, lease_token, lease_expires_at, created_at,
+                    updated_at
+                ) VALUES
+                    (
+                        'agt_active', 'active-worker', 'owner', 'child-active',
+                        'fresh', '/tmp', 'running', 'run_active', 1,
+                        'runtime-a', 'token-active', 2000.0, 1000.0, 1001.0
+                    ),
+                    (
+                        'agt_historical', 'historical-worker', 'owner', 'child-historical',
+                        'fresh', '/tmp', 'idle', 'run_historical', 1,
+                        NULL, NULL, NULL, 900.0, 901.0
+                    )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO runs (
+                    id, agent_id, generation, lease_token, task, status,
+                    result, error, created_at, started_at, completed_at, updated_at
+                ) VALUES
+                    (
+                        'run_active', 'agt_active', 1, 'token-active', 'active task',
+                        'running', NULL, NULL, 1000.0, 1000.5, NULL, 1001.0
+                    ),
+                    (
+                        'run_historical', 'agt_historical', 1, 'token-historical',
+                        'historical task', 'completed', 'historical result', NULL,
+                        900.0, 900.5, 901.0, 901.0
+                    )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO steering_messages (
+                    agent_id, run_id, generation, message, created_at
+                ) VALUES (
+                    'agt_active', 'run_active', 1, 'preserve this steering', 1001.0
+                )
+                """
+            )
+            connection.commit()
+
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            revision = connection.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
         self.assertEqual(revision, ("0001_initial",))
+
+        await asyncio.to_thread(extension.migrate_database, path)
+        await asyncio.to_thread(extension.migrate_database, path)
+
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT agents.id, agents.status, agents.lease_runtime_id,
+                       runs.status, runs.result
+                FROM agents JOIN runs ON runs.agent_id = agents.id
+                ORDER BY agents.id
+                """
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    ("agt_active", "running", "runtime-a", "running", None),
+                    (
+                        "agt_historical",
+                        "idle",
+                        None,
+                        "completed",
+                        "historical result",
+                    ),
+                ],
+            )
+            steering = connection.execute(
+                "SELECT agent_id, run_id, generation, message FROM steering_messages"
+            ).fetchall()
+            self.assertEqual(
+                steering,
+                [("agt_active", "run_active", 1, "preserve this steering")],
+            )
+            connection.execute("UPDATE runs SET status = 'canceled' WHERE id = 'run_active'")
+            connection.execute("UPDATE agents SET status = 'canceling' WHERE id = 'agt_active'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO agents (
+                        id, name, owner_conversation_id, child_conversation_id,
+                        context_mode, cwd, status, active_run_id, generation,
+                        lease_runtime_id, lease_token, lease_expires_at, created_at,
+                        updated_at
+                    ) VALUES (
+                        'agt_invalid', 'invalid-worker', 'owner', NULL,
+                        'fresh', '/tmp', 'canceling', 'run_invalid', 1,
+                        NULL, NULL, NULL, 1000.0, 1000.0
+                    )
+                    """
+                )
+            revision = connection.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone()
+        self.assertEqual(revision, ("0002_canceling_state",))
 
     async def test_existing_empty_database_is_initialized(self) -> None:
         path = self.root / "empty.sqlite"
@@ -632,7 +788,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             revision = connection.execute(
                 "SELECT version_num FROM alembic_version"
             ).fetchone()
-        self.assertEqual(revision, ("0001_initial",))
+        self.assertEqual(revision, ("0002_canceling_state",))
 
     async def test_concurrent_fresh_migrations_share_the_database_lock(self) -> None:
         path = self.root / "concurrent" / "subagents.sqlite"
@@ -651,7 +807,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT version_num FROM alembic_version"
             ).fetchone()
             quick_check = connection.execute("PRAGMA quick_check").fetchone()
-        self.assertEqual(revision, ("0001_initial",))
+        self.assertEqual(revision, ("0002_canceling_state",))
         self.assertEqual(quick_check, ("ok",))
 
     async def test_unmanaged_and_unknown_revision_databases_are_rejected(self) -> None:
@@ -747,6 +903,14 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         forked_data = forked["data"]
         self.assertEqual(forked_data["name"], "authentication-inspector")
         self.assertIn("authentication-inspector", forked["content"])
+        self.assertEqual(
+            forked_data["presentation"],
+            {
+                "summary": "Spawn authentication-inspector",
+                "body": "inspect authentication",
+                "format": "markdown",
+            },
+        )
         self.assertEqual(len(context.background_leases), 1)
         forked_lease = context.background_leases[0]
         self.assertIn(forked_data["agent_id"], forked_lease.description or "")
@@ -780,7 +944,16 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(completed["content"], "result for inspect authentication")
         self.assertEqual(completed["data"]["status"], "completed")
+        self.assertEqual(
+            completed["data"]["presentation"],
+            {"summary": "Wait for authentication-inspector"},
+        )
         self.assertIn("1 completed", context.ui.text(extension.WIDGET_ID))
+
+        async def forked_lease_closed() -> bool:
+            return forked_lease.close_calls == 1
+
+        await wait_until(forked_lease_closed)
         self.assertEqual(forked_lease.close_calls, 1)
 
         FakeClient.block_runs = False
@@ -805,7 +978,13 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("resume", fresh_client.create_session_calls[0])
         self.assertEqual(fresh_result["data"]["context_mode"], "fresh")
         self.assertEqual(len(context.background_leases), 2)
-        self.assertEqual(context.background_leases[1].close_calls, 1)
+        fresh_lease = context.background_leases[1]
+
+        async def fresh_lease_closed() -> bool:
+            return fresh_lease.close_calls == 1
+
+        await wait_until(fresh_lease_closed)
+        self.assertEqual(fresh_lease.close_calls, 1)
 
         listed = await self.app.list_agents(extension.ListAgentsInput(), context)
         self.assertEqual(len(listed["data"]["agents"]), 2)
@@ -813,12 +992,35 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("independent-reviewer", listed["content"])
         self.assertIn(running.conversation_id, listed["content"])
         self.assertIn(fresh_result["data"]["conversation_id"], listed["content"])
+        list_presentation = listed["data"]["presentation"]
+        self.assertEqual(list_presentation["summary"], "List agents")
+        self.assertEqual(list_presentation["format"], "markdown")
+        self.assertIn(
+            "**authentication-inspector** — completed",
+            list_presentation["body"],
+        )
+        self.assertIn("inspect authentication", list_presentation["body"])
+        self.assertIn(
+            "**independent-reviewer** — completed",
+            list_presentation["body"],
+        )
+        self.assertIn("independent review", list_presentation["body"])
+        self.assertNotIn(forked_data["agent_id"], list_presentation["body"])
+        self.assertNotIn(running.conversation_id, list_presentation["body"])
         other_context = self.context("owner-2")
         other_list = await self.app.list_agents(
             extension.ListAgentsInput(),
             other_context,
         )
         self.assertEqual(other_list["data"]["agents"], [])
+        self.assertEqual(
+            other_list["data"]["presentation"],
+            {
+                "summary": "List agents",
+                "body": "No background agents.",
+                "format": "markdown",
+            },
+        )
         hidden = await self.app.wait_agent(
             extension.WaitAgentInput(
                 agent_id=forked_data["agent_id"],
@@ -827,6 +1029,10 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             other_context,
         )
         self.assertIn("agent not found", hidden["error"])
+        self.assertEqual(
+            hidden["data"]["presentation"],
+            {"summary": "Wait for agent"},
+        )
 
         restored_context = self.context()
         await self.app.restore_agent_widget({}, restored_context)
@@ -914,6 +1120,16 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             ),
             context,
         )
+        self.assertIn("Follow-up task sent:\nsecond pass", followup["content"])
+        self.assertEqual(followup["data"]["task"], "second pass")
+        self.assertEqual(
+            followup["data"]["presentation"],
+            {
+                "summary": "Follow up iterative-reviewer",
+                "body": "second pass",
+                "format": "markdown",
+            },
+        )
         second_run_id = followup["data"]["run_id"]
         await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
         self.assertEqual(
@@ -927,6 +1143,10 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(current["data"]["run_id"], second_run_id)
         self.assertEqual(current["data"]["status"], "running")
+        self.assertEqual(
+            current["data"]["presentation"],
+            {"summary": "Wait for iterative-reviewer"},
+        )
         FakeClient.run_release.set()
         second = await self.app.wait_agent(
             extension.WaitAgentInput(
@@ -1066,6 +1286,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["content"], "result for inspect progress")
         task_run = completed["data"]["taskRun"]
         self.assertEqual(task_run["kind"], "subagent")
+        self.assertEqual(task_run["title"], "Wait for progress-inspector")
         self.assertEqual(task_run["status"], "completed")
         tool_activity = next(
             activity
@@ -1097,6 +1318,7 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["data"]["status"], "running")
+        self.assertEqual(result["data"]["taskRun"]["title"], "Wait for long-runner")
         self.assertEqual(result["data"]["taskRun"]["status"], "running")
         self.assertTrue(context.tool_updates)
         self.assertEqual(session.listeners.get("tool.call"), [])
@@ -1238,6 +1460,44 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(extension.LeaseLostError):
             await second_runtime.heartbeat(forged_runtime)
 
+    async def test_canceling_lease_expiry_recovers_to_resumable_canceled(self) -> None:
+        clock = MutableClock()
+        owner = await self.store("cancel-expiry", "runtime-owner", clock=clock)
+        claim = await owner.create(
+            "owner",
+            "cancel-expiry-worker",
+            "work",
+            str(self.cwd),
+            "fresh",
+        )
+        await owner.mark_running(claim.lease, "child-cancel-expiry")
+        other = extension.AgentStore(owner.path, "runtime-other", clock=clock)
+        await other.initialize()
+
+        canceling = await other.cancel("owner", claim.agent.id)
+        self.assertEqual(canceling.status, "canceling")
+        self.assertEqual(canceling.run.status, "canceled")
+        with self.assertRaisesRegex(extension.AgentConflictError, "agent is canceling"):
+            await other.claim("owner", claim.agent.id, "too early")
+
+        clock.advance(extension.LEASE_DURATION_SECONDS - 10)
+        renewed_expiry = await owner.heartbeat_canceling(claim.lease)
+        self.assertEqual(renewed_expiry, clock.value + extension.LEASE_DURATION_SECONDS)
+        clock.advance(11)
+        self.assertEqual(await other.reconcile_expired(), 0)
+        still_canceling = await other.get("owner", claim.agent.id)
+        self.assertEqual(still_canceling.status, "canceling")
+
+        clock.advance(extension.LEASE_DURATION_SECONDS - 10 + 0.1)
+        self.assertEqual(await other.reconcile_expired(), 1)
+        canceled = await other.get("owner", claim.agent.id)
+        self.assertEqual(canceled.status, "canceled")
+        resumed = await other.claim("owner", claim.agent.id, "resume after recovery")
+        self.assertEqual(resumed.agent.generation, 2)
+        self.assertFalse(await owner.complete_cancel(claim.lease))
+        with self.assertRaises(extension.LeaseLostError):
+            await owner.heartbeat(claim.lease)
+
     async def test_session_end_interrupts_only_current_runtime_rows(self) -> None:
         path = self.root / "session-end" / extension.DATABASE_FILENAME
         current = extension.AgentStore(path, self.runtime.runtime_id)
@@ -1360,6 +1620,47 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await store.acknowledge_steering(followup.lease, carried.id))
         self.assertEqual(self.steering_rows(store.path), [])
 
+    async def test_steer_result_exposes_the_normalized_queued_message(self) -> None:
+        context = self.context()
+        store = await self.runtime.store_for_context(context)
+        claim = await store.create(
+            context.conversation_id,
+            "steerable-worker",
+            "long task",
+            context.cwd,
+            "fresh",
+        )
+        await store.mark_running(claim.lease, "child-steerable")
+
+        result = await self.app.steer_agent(
+            extension.SteerAgentInput(
+                agent_id=claim.agent.id,
+                message="  focus on the parser  ",
+            ),
+            context,
+        )
+
+        self.assertIn(
+            "Steering message queued for delivery:\nfocus on the parser",
+            result["content"],
+        )
+        self.assertIn("steerable-worker", result["content"])
+        self.assertEqual(result["data"]["name"], "steerable-worker")
+        self.assertEqual(result["data"]["message"], "focus on the parser")
+        self.assertEqual(
+            result["data"]["presentation"],
+            {
+                "summary": "Steer steerable-worker",
+                "body": "focus on the parser",
+                "format": "markdown",
+            },
+        )
+        self.assertTrue(result["data"]["accepted"])
+        self.assertEqual(
+            self.steering_rows(store.path),
+            [(claim.lease.run_id, claim.lease.generation, "focus on the parser")],
+        )
+
     async def test_cancel_persists_cleanup(self) -> None:
         context = self.context()
         FakeClient.block_runs = True
@@ -1376,8 +1677,12 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
         background_lease = context.background_leases[0]
         self.assertEqual(background_lease.close_calls, 0)
         agent_id = spawned["data"]["agent_id"]
+        first_run_id = spawned["data"]["run_id"]
         await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
         store = await self.runtime.store_for_context(context)
+        running = await store.get(context.conversation_id, agent_id)
+        child_id = running.conversation_id
+        assert child_id is not None
         await store.enqueue_steering(context.conversation_id, agent_id, "pending")
 
         with mock.patch.object(extension, "CANCEL_CLEANUP_TIMEOUT_SECONDS", 0.01):
@@ -1385,11 +1690,40 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
                 extension.CancelAgentInput(agent_id=agent_id),
                 context,
             )
+            blocked_followup = await self.app.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=agent_id,
+                    task="conclude after cancellation",
+                ),
+                context,
+            )
         self.assertIn("cleanup is still finishing", canceled["content"])
+        self.assertEqual(
+            canceled["data"]["presentation"],
+            {
+                "summary": "Cancel cancelable-worker",
+                "body": (
+                    "Cancellation saved; worker cleanup is still finishing. "
+                    "Retry followup_agent after cleanup completes."
+                ),
+                "format": "markdown",
+            },
+        )
+        self.assertIn("cancellation is still in progress", blocked_followup["error"])
+        self.assertEqual(len(FakeClient.instances), 1)
+        self.assertNotIn(agent_id, canceled["data"]["presentation"]["body"])
         persisted = await store.get(context.conversation_id, agent_id)
-        self.assertEqual(persisted.status, "canceled")
+        self.assertEqual(persisted.status, "canceling")
         self.assertEqual(persisted.run.status, "canceled")
+        self.assertEqual(persisted.generation, 1)
         self.assertEqual(self.steering_rows(store.path), [])
+        self.assertIn("1 canceling", context.ui.text(extension.WIDGET_ID))
+
+        waited = await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=0),
+            context,
+        )
+        self.assertIn("still canceling", waited["content"])
 
         client = FakeClient.instances[0]
         session = client.sessions[0]
@@ -1403,10 +1737,427 @@ class SubagentExtensionTest(unittest.IsolatedAsyncioTestCase):
             return key not in self.runtime.live_runs
 
         await wait_until(cleaned_up)
+        persisted = await store.get(context.conversation_id, agent_id)
+        self.assertEqual(persisted.status, "canceled")
         self.assertTrue(client.closed)
         self.assertEqual(client.close_calls, 1)
         self.assertEqual(session.close_calls, 1)
         self.assertEqual(background_lease.close_calls, 1)
+        self.assertEqual(self.runtime.owned_runs, {})
+
+        canceled_again = await self.app.cancel_agent(
+            extension.CancelAgentInput(agent_id=agent_id),
+            context,
+        )
+        self.assertEqual(
+            canceled_again["data"]["presentation"],
+            {
+                "summary": "Cancel cancelable-worker",
+                "body": "Canceled. Use followup_agent to resume this agent later.",
+                "format": "markdown",
+            },
+        )
+        self.assertNotIn(agent_id, canceled_again["content"])
+
+        FakeClient.run_release = asyncio.Event()
+        FakeClient.run_started = asyncio.Event()
+        followup = await self.app.followup_agent(
+            extension.FollowupAgentInput(
+                agent_id=agent_id,
+                task="conclude after cancellation",
+            ),
+            context,
+        )
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        self.assertEqual(followup["data"]["generation"], 2)
+        self.assertNotEqual(followup["data"]["run_id"], first_run_id)
+        self.assertEqual(FakeClient.instances[1].create_session_calls[0]["resume"], child_id)
+        historical = await store.get(
+            context.conversation_id,
+            agent_id,
+            first_run_id,
+        )
+        self.assertEqual(historical.run.status, "canceled")
+
+        FakeClient.run_release.set()
+        completed = await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(completed["content"], "result for conclude after cancellation")
+
+    async def test_cancel_becomes_resumable_before_background_lease_release(self) -> None:
+        context = self.context(block_background_release=True)
+        FakeClient.block_runs = True
+        spawned = await self.app.spawn_agent(
+            extension.SpawnAgentInput(
+                name="cancel-lease-worker",
+                task="cancel before lease release",
+                context_mode="fresh",
+            ),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        store = await self.runtime.store_for_context(context)
+        background_lease = context.background_leases[0]
+
+        with mock.patch.object(extension, "CANCEL_CLEANUP_TIMEOUT_SECONDS", 0.01):
+            canceled = await self.app.cancel_agent(
+                extension.CancelAgentInput(agent_id=agent_id),
+                context,
+            )
+        await asyncio.wait_for(background_lease.close_started.wait(), timeout=1)
+        self.assertIn("it can now be resumed", canceled["content"])
+        persisted = await store.get(context.conversation_id, agent_id)
+        self.assertEqual(persisted.status, "canceled")
+        self.assertTrue(self.runtime.owned_runs)
+
+        context.block_background_release = False
+        FakeClient.run_started = asyncio.Event()
+        followup = await self.app.followup_agent(
+            extension.FollowupAgentInput(
+                agent_id=agent_id,
+                task="resume while old lease closes",
+            ),
+            context,
+        )
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        self.assertEqual(followup["data"]["generation"], 2)
+        background_lease.close_release.set()
+        FakeClient.run_release.set()
+        completed = await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(completed["content"], "result for resume while old lease closes")
+
+    async def test_cancel_retries_client_close_before_becoming_resumable(self) -> None:
+        context = self.context()
+        FakeClient.block_runs = True
+        FakeClient.close_failures_remaining = 100
+        spawned = await self.app.spawn_agent(
+            extension.SpawnAgentInput(
+                name="cancel-close-worker",
+                task="retry close",
+                context_mode="fresh",
+            ),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+        store = await self.runtime.store_for_context(context)
+
+        with (
+            mock.patch.object(extension, "CANCEL_CLEANUP_TIMEOUT_SECONDS", 0.01),
+            mock.patch.object(extension, "CLIENT_CLOSE_RETRY_INITIAL_SECONDS", 0.01),
+            mock.patch.object(extension, "CLIENT_CLOSE_RETRY_MAX_SECONDS", 0.01),
+        ):
+            canceled = await self.app.cancel_agent(
+                extension.CancelAgentInput(agent_id=agent_id),
+                context,
+            )
+            self.assertIn("worker cleanup is still finishing", canceled["content"])
+            persisted = await store.get(context.conversation_id, agent_id)
+            self.assertEqual(persisted.status, "canceling")
+            self.assertTrue(self.runtime.owned_runs)
+            blocked = await self.app.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=agent_id,
+                    task="too early",
+                ),
+                context,
+            )
+            self.assertIn("cancellation is still in progress", blocked["error"])
+
+            FakeClient.close_failures_remaining = 0
+
+            async def cancellation_finished() -> bool:
+                record = await store.get(context.conversation_id, agent_id)
+                return record.status == "canceled"
+
+            await wait_until(cancellation_finished)
+
+        client = FakeClient.instances[0]
+        self.assertTrue(client.closed)
+        self.assertGreater(client.close_calls, 1)
+
+    async def test_canceling_blocks_cross_runtime_followup_until_owner_cleanup(self) -> None:
+        context = self.context()
+        FakeClient.block_runs = True
+        FakeClient.block_close = True
+        with (
+            mock.patch.object(extension, "HEARTBEAT_INTERVAL_SECONDS", 0.01),
+            mock.patch.object(extension, "MIN_HEARTBEAT_INTERVAL_SECONDS", 0.001),
+        ):
+            spawned = await self.app.spawn_agent(
+                extension.SpawnAgentInput(
+                    name="shared-runtime-worker",
+                    task="first generation",
+                    context_mode="fresh",
+                ),
+                context,
+            )
+            agent_id = spawned["data"]["agent_id"]
+            first_run_id = spawned["data"]["run_id"]
+            await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+            owner_store = await self.runtime.store_for_context(context)
+
+            other_runtime = extension.RuntimeState(
+                runtime_id="other-runtime",
+                client_factory=FakeClient,
+            )
+            other_app = extension.SubagentApplication(other_runtime)
+            canceled = await other_app.cancel_agent(
+                extension.CancelAgentInput(agent_id=agent_id),
+                context,
+            )
+            self.assertIn("worker cleanup is still finishing", canceled["content"])
+            blocked = await other_app.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=agent_id,
+                    task="second generation",
+                ),
+                context,
+            )
+            self.assertIn("agent cancellation is still in progress", blocked["error"])
+            self.assertEqual(len(FakeClient.instances), 1)
+
+            await asyncio.wait_for(FakeClient.close_started.wait(), timeout=1)
+            canceling = await owner_store.get(context.conversation_id, agent_id)
+            self.assertEqual(canceling.status, "canceling")
+            self.assertEqual(canceling.run.status, "canceled")
+            FakeClient.close_release.set()
+
+            async def cancellation_finished() -> bool:
+                record = await owner_store.get(context.conversation_id, agent_id)
+                return record.status == "canceled"
+
+            await wait_until(cancellation_finished)
+            historical = await owner_store.get(
+                context.conversation_id,
+                agent_id,
+                first_run_id,
+            )
+            self.assertEqual(historical.run.status, "canceled")
+
+            FakeClient.run_started = asyncio.Event()
+            followup = await other_app.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=agent_id,
+                    task="second generation",
+                ),
+                context,
+            )
+            await asyncio.wait_for(FakeClient.run_started.wait(), timeout=1)
+            self.assertEqual(followup["data"]["generation"], 2)
+            self.assertNotEqual(followup["data"]["run_id"], first_run_id)
+
+            FakeClient.run_release.set()
+            completed = await other_app.wait_agent(
+                extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+                context,
+            )
+            self.assertEqual(completed["content"], "result for second generation")
+
+            await other_runtime.shutdown()
+
+    async def test_cancel_owns_prelaunch_fork_setup_before_resuming(self) -> None:
+        context = self.context(block_fork=True)
+        spawning = asyncio.create_task(
+            self.app.spawn_agent(
+                extension.SpawnAgentInput(
+                    name="cancel-setup-worker",
+                    task="first attempt",
+                ),
+                context,
+            )
+        )
+        await asyncio.wait_for(context.fork_started.wait(), timeout=1)
+        store = await self.runtime.store_for_context(context)
+        [reserved] = await store.list(context.conversation_id)
+        live = self.runtime.get_live_run(store, reserved.id)
+        assert live is not None
+        self.assertIs(live.setup_task, spawning)
+        self.assertIsNone(live.runner_task)
+
+        canceled = await self.app.cancel_agent(
+            extension.CancelAgentInput(agent_id=reserved.id),
+            context,
+        )
+        self.assertIn("Use followup_agent to resume it later", canceled["content"])
+        with self.assertRaises(asyncio.CancelledError):
+            await spawning
+        persisted = await store.get(context.conversation_id, reserved.id)
+        self.assertEqual(persisted.status, "canceled")
+        self.assertEqual(persisted.run.status, "canceled")
+        self.assertIsNone(persisted.conversation_id)
+        self.assertEqual(FakeClient.instances, [])
+        self.assertEqual(self.runtime.live_runs, {})
+        self.assertEqual(self.runtime.owned_runs, {})
+
+        context.block_fork = False
+        followup = await self.app.followup_agent(
+            extension.FollowupAgentInput(
+                agent_id=reserved.id,
+                task="retry after setup cancellation",
+            ),
+            context,
+        )
+        self.assertEqual(followup["data"]["conversation_id"], "child-owner-1-2")
+        completed = await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=reserved.id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(completed["content"], "result for retry after setup cancellation")
+
+    async def test_cancel_preserves_fork_created_before_attachment(self) -> None:
+        context = self.context()
+        store = await self.runtime.store_for_context(context)
+        attach_started = asyncio.Event()
+        attach_release = asyncio.Event()
+        cancel_attach_started = asyncio.Event()
+        cancel_attach_release = asyncio.Event()
+        original_attach = store.attach_conversation
+        original_cancel_attach = store.attach_canceling_conversation
+
+        async def delayed_attach(*args: Any, **kwargs: Any) -> Any:
+            attach_started.set()
+            await attach_release.wait()
+            return await original_attach(*args, **kwargs)
+
+        async def delayed_cancel_attach(*args: Any, **kwargs: Any) -> Any:
+            cancel_attach_started.set()
+            await cancel_attach_release.wait()
+            return await original_cancel_attach(*args, **kwargs)
+
+        with (
+            mock.patch.object(store, "attach_conversation", new=delayed_attach),
+            mock.patch.object(
+                store,
+                "attach_canceling_conversation",
+                new=delayed_cancel_attach,
+            ),
+            mock.patch.object(extension, "CANCEL_CLEANUP_TIMEOUT_SECONDS", 0.01),
+        ):
+            spawning = asyncio.create_task(
+                self.app.spawn_agent(
+                    extension.SpawnAgentInput(
+                        name="cancel-fork-worker",
+                        task="cancel after fork",
+                    ),
+                    context,
+                )
+            )
+            await asyncio.wait_for(attach_started.wait(), timeout=1)
+            [reserved] = await store.list(context.conversation_id)
+            canceled = await self.app.cancel_agent(
+                extension.CancelAgentInput(agent_id=reserved.id),
+                context,
+            )
+            await asyncio.wait_for(cancel_attach_started.wait(), timeout=1)
+            self.assertIn("worker cleanup is still finishing", canceled["content"])
+            blocked = await self.app.followup_agent(
+                extension.FollowupAgentInput(
+                    agent_id=reserved.id,
+                    task="too early",
+                ),
+                context,
+            )
+            self.assertIn("cancellation is still in progress", blocked["error"])
+            cancel_attach_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await spawning
+
+        persisted = await store.get(context.conversation_id, reserved.id)
+        self.assertEqual(persisted.status, "canceled")
+        self.assertEqual(persisted.conversation_id, "child-owner-1-1")
+        self.assertEqual(context.fork_names, ["cancel-fork-worker"])
+
+        followup = await self.app.followup_agent(
+            extension.FollowupAgentInput(
+                agent_id=reserved.id,
+                task="resume preserved fork",
+            ),
+            context,
+        )
+        self.assertEqual(followup["data"]["conversation_id"], "child-owner-1-1")
+        self.assertEqual(context.fork_names, ["cancel-fork-worker"])
+        completed = await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=reserved.id, timeout_ms=1_000),
+            context,
+        )
+        self.assertEqual(completed["content"], "result for resume preserved fork")
+
+    async def test_terminal_cancel_response_reloads_concurrent_generation(self) -> None:
+        context = self.context()
+        spawned = await self.app.spawn_agent(
+            extension.SpawnAgentInput(
+                name="cancel-response-worker",
+                task="initial task",
+                context_mode="fresh",
+            ),
+            context,
+        )
+        agent_id = spawned["data"]["agent_id"]
+        await self.app.wait_agent(
+            extension.WaitAgentInput(agent_id=agent_id, timeout_ms=1_000),
+            context,
+        )
+        store = await self.runtime.store_for_context(context)
+        original_cancel = store.cancel
+        raced_claim: Any = None
+
+        async def cancel_then_claim(owner_id: str, selected_agent_id: str) -> Any:
+            nonlocal raced_claim
+            canceled = await original_cancel(owner_id, selected_agent_id)
+            raced_claim = await store.claim(owner_id, selected_agent_id, "concurrent follow-up")
+            return canceled
+
+        with mock.patch.object(store, "cancel", new=cancel_then_claim):
+            canceled = await self.app.cancel_agent(
+                extension.CancelAgentInput(agent_id=agent_id),
+                context,
+            )
+
+        assert raced_claim is not None
+        self.assertIn("agent has since changed generation", canceled["content"])
+        self.assertEqual(canceled["data"]["run_id"], raced_claim.lease.run_id)
+        await store.terminal(
+            raced_claim.lease,
+            "interrupted",
+            error="test cleanup",
+        )
+
+    async def test_cancel_owns_blocked_background_acquisition(self) -> None:
+        context = self.context(block_background_acquire=True)
+        spawning = asyncio.create_task(
+            self.app.spawn_agent(
+                extension.SpawnAgentInput(
+                    name="cancel-acquire-worker",
+                    task="wait for background ownership",
+                    context_mode="fresh",
+                ),
+                context,
+            )
+        )
+        await asyncio.wait_for(context.background_acquire_started.wait(), timeout=1)
+        store = await self.runtime.store_for_context(context)
+        [reserved] = await store.list(context.conversation_id)
+
+        canceled = await self.app.cancel_agent(
+            extension.CancelAgentInput(agent_id=reserved.id),
+            context,
+        )
+        self.assertIn("Use followup_agent to resume it later", canceled["content"])
+        with self.assertRaises(asyncio.CancelledError):
+            await spawning
+        persisted = await store.get(context.conversation_id, reserved.id)
+        self.assertEqual(persisted.status, "canceled")
+        self.assertEqual(persisted.run.status, "canceled")
+        self.assertEqual(context.background_leases, [])
+        self.assertEqual(FakeClient.instances, [])
+        self.assertEqual(self.runtime.live_runs, {})
         self.assertEqual(self.runtime.owned_runs, {})
 
     async def test_completed_run_remains_owned_until_background_lease_release(
