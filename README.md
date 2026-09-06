@@ -49,7 +49,7 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 
 Extensions live under `extensions/` as executable `kodelet-extension-*` Python SDK scripts with inline `uv` dependency metadata.
 
-These extensions use Python SDK 0.2 and run on the selected runner. `code_search` uses a daemon-owned child with the existing `gpt-5.6-luna` model and requested turn limit. Configure its provider credentials, platform and service tier on the daemon. The parent runner must enable filesystem search and permit `file_read`, `grep_tool`, and `glob_tool`; denied tools or limits return an error, never a local or Bash fallback. Search directories must remain within the parent workspace. Progress shows the search/current tool, not individual tool success counts.
+These extensions require Python SDK 0.2.1 or newer within the 0.2 series and run on the selected runner. `code_search` uses a daemon-owned child with the existing `gpt-5.6-luna` model and requested turn limit. Configure its provider credentials, platform and service tier on the daemon. Search selects `file_read`, `grep_tool`, and `glob_tool` independently of the parent's default tool mode; explicit tool or filesystem-search restrictions still apply, with no local or Bash fallback. Search directories must remain within the parent workspace. Progress shows the search/current tool, not individual tool success counts.
 
 Run the extension regression and stdio initialization checks with `uv run --script tests/test_extensions.py` (no provider calls).
 

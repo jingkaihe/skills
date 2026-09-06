@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.2.0", "filetype", "google-genai", "pillow"]
+# dependencies = ["kodelet-sdk==0.2.1", "filetype", "google-genai", "pillow"]
 # ///
 
 """Run with `uv run --script tests/test_extensions.py`; no provider calls."""
@@ -68,7 +68,7 @@ class Host:
 class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     def test_published_minimum_sdk_is_not_an_editable_checkout(self) -> None:
         package = distribution("kodelet-sdk")
-        self.assertEqual(package.version, "0.2.0")
+        self.assertEqual(package.version, "0.2.1")
         self.assertIsNone(package.read_text("direct_url.json"))
 
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
@@ -88,7 +88,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.2.0,<0.3", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.2.1,<0.3", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
@@ -203,7 +203,11 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
             set(request), {"profile", "message", "cwd", "options", "requestId", "systemPrompt"}
         )
         self.assertIn(
-            ("kodelet.child.read", {"childId": "child-conversation", "after": 2}), self.host.calls
+            (
+                "kodelet.child.read",
+                {"childId": "child-conversation", "childRunId": "child-run", "after": 2},
+            ),
+            self.host.calls,
         )
         progress = result["data"]["taskRun"]
         self.assertEqual(progress["status"], "completed")
@@ -261,7 +265,8 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
             result = await self.search(query="find")
         self.assertIn("timed out", result["error"])
         self.assertEqual(
-            self.host.calls[-1], ("kodelet.child.cancel", {"childId": "child-conversation"})
+            self.host.calls[-1],
+            ("kodelet.child.cancel", {"childId": "child-conversation", "childRunId": "child-run"}),
         )
         self.assertEqual(result["data"]["taskRun"]["status"], "failed")
 
@@ -273,7 +278,8 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertEqual(
-            self.host.calls[-1], ("kodelet.child.cancel", {"childId": "child-conversation"})
+            self.host.calls[-1],
+            ("kodelet.child.cancel", {"childId": "child-conversation", "childRunId": "child-run"}),
         )
 
 
