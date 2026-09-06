@@ -34,16 +34,29 @@ class Host:
         self.allow_read = asyncio.Event()
         self.allow_read.set()
         self.start_error: Exception | None = None
-        self.initial = {
+        self.initial: dict[str, Any] = {
             "conversationId": "child-conversation",
             "runId": "child-run",
             "done": False,
             "events": [
-                {"sequence": 1, "kind": "tool-use", "toolName": "grep_tool", "toolCallId": "a"},
-                {"sequence": 2, "kind": "tool-result", "toolName": "grep_tool", "toolCallId": "a"},
+                {
+                    "sequence": 1,
+                    "kind": "tool-use",
+                    "toolName": "grep_tool",
+                    "toolCallId": "a",
+                    "input": '{"pattern":"parser","path":"."}',
+                },
+                {
+                    "sequence": 2,
+                    "kind": "tool-result",
+                    "toolName": "grep_tool",
+                    "toolCallId": "a",
+                    "success": True,
+                    "toolOutput": "src/handler.go:20: parser",
+                },
             ],
         }
-        self.result = {
+        self.result: dict[str, Any] = {
             **self.initial,
             "done": True,
             "output": "  Found src/handler.go:20-40.\n",
@@ -212,12 +225,101 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         progress = result["data"]["taskRun"]
         self.assertEqual(progress["status"], "completed")
         self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
-        self.assertEqual(progress["activities"][0]["id"], "child-run")
-        self.assertEqual(progress["activities"][0]["label"], "Search code: grep_tool")
+        self.assertEqual(progress["activities"][0]["id"], "a")
+        self.assertEqual(progress["activities"][0]["label"], 'Search "parser" in .')
         phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
         self.assertIn("working", phases)
         self.assertIn("responding", phases)
         self.assertEqual(list(self.root.iterdir()), [self.root / "src"])
+
+    async def test_parallel_calls_report_independent_outcomes_before_summary_finishes(self) -> None:
+        events = [
+            {
+                "kind": "tool-use",
+                "toolName": "grep_tool",
+                "toolCallId": "a",
+                "input": '{"pattern":"parser","path":"."}',
+            },
+            {
+                "kind": "tool-use",
+                "toolName": "glob_tool",
+                "toolCallId": "b",
+                "input": '{"pattern":"*.go","path":"."}',
+            },
+            {
+                "kind": "tool-use",
+                "toolName": "file_read",
+                "toolCallId": "c",
+                "input": '{"file_path":"src/handler.go"}',
+            },
+            {
+                "kind": "tool-update",
+                "toolName": "grep_tool",
+                "toolCallId": "a",
+                "toolOutput": "partial matches",
+                "success": False,
+            },
+            {"kind": "tool-result", "toolName": "file_read", "toolCallId": "c", "success": True},
+            {"kind": "tool-result", "toolName": "grep_tool", "toolCallId": "a", "success": True},
+            {
+                "kind": "tool-result",
+                "toolName": "glob_tool",
+                "toolCallId": "b",
+                "success": False,
+                "error": "permission denied",
+                "toolOutput": "partial output",
+            },
+            {"kind": "text-delta", "text": "Writing the answer"},
+        ]
+        self.host.initial["events"] = [
+            {"sequence": index + 1, **event} for index, event in enumerate(events)
+        ]
+        self.host.result["events"] = []
+        self.host.allow_read.clear()
+        task = asyncio.create_task(self.search(query="Find code"))
+        try:
+            await asyncio.wait_for(self.host.reading.wait(), timeout=2)
+            snapshots = [call.args[1]["taskRun"] for call in self.updates.call_args_list]
+            summary = snapshots[-1]
+            self.assertEqual(summary["status"], "running", "the answer is still in flight")
+            self.assertEqual(summary["phase"], "responding")
+            self.assertEqual(summary["detail"], "writing summary")
+            self.assertEqual(summary["counts"], {"succeeded": 2, "failed": 1, "running": 0})
+            self.assertEqual(
+                [(row["label"], row["status"]) for row in summary["activities"]],
+                [
+                    ('Search "parser" in .', "succeeded"),
+                    ('Find files "*.go" in .', "failed"),
+                    ("Read src/handler.go", "succeeded"),
+                ],
+            )
+            self.assertEqual(summary["activities"][1]["preview"], "permission denied")
+            self.assertNotIn("preview", summary["activities"][0])
+            self.assertFalse(task.done())
+        finally:
+            self.host.allow_read.set()
+            result = await task
+        self.assertEqual(result["data"]["taskRun"]["counts"], summary["counts"])
+
+    async def test_truncated_tool_input_and_result_without_start_are_safe(self) -> None:
+        self.host.initial["events"][0]["input"] = '{"pattern":"truncated'
+        self.host.initial["events"].append(
+            {
+                "sequence": 3,
+                "kind": "tool-result",
+                "toolName": "file_read",
+                "toolCallId": "lost",
+                "success": False,
+                "toolOutput": "file missing",
+            }
+        )
+        self.host.result["events"][0]["sequence"] = 4
+        result = await self.search(query="Find code")
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 1, "running": 0})
+        self.assertEqual(progress["activities"][0]["label"], "grep_tool")
+        self.assertEqual(progress["activities"][1]["label"], "file_read")
+        self.assertEqual(progress["activities"][1]["preview"], "file missing")
 
     async def test_default_turn_limit_and_workspace(self) -> None:
         await self.search(query="Find code")
@@ -248,7 +350,10 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.host.result["output"] = " \n "
         result = await self.search(query="find")
         self.assertEqual(result["error"], "code_search returned an empty response")
-        self.assertEqual(result["data"]["taskRun"]["counts"]["failed"], 1)
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertEqual(
+            result["data"]["taskRun"]["counts"], {"succeeded": 1, "failed": 0, "running": 0}
+        )
 
     async def test_rejected_policy_and_unavailable_host_never_fallback(self) -> None:
         self.host.start_error = RuntimeError("child tools exceed parent policy")
