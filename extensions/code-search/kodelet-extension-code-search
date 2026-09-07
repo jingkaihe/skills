@@ -60,7 +60,7 @@ class CodeSearchInput(BaseModel):
     max_turns: int = Field(
         default=3,
         ge=1,
-        description="Maximum search turns, subject to the parent run's limits. Defaults to 3.",
+        description="Maximum number of search turns to suggest to the search agent. Defaults to 3.",
     )
 
 
@@ -141,11 +141,12 @@ async def run_search_agent(
     progress: TaskProgress,
 ) -> str:
     async def run_once() -> dict[str, Any]:
+        # Keep max_turns in the prompt only; inherit the parent's execution ceiling.
+        # A hard limit can stop after tool calls, before the agent writes any answer.
         child = await ctx.children.start(
             profile="code_search",
             message=query,
             cwd=str(search_cwd),
-            options=ExecutionOptions(max_turns=max_turns),
             system_prompt=build_sysprompt_text(max_turns),
         )
         active_calls: set[str] = set()

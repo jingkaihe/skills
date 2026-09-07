@@ -209,11 +209,12 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["message"], "Find the handler.")
         self.assertEqual(request["profile"], "code_search")
         self.assertEqual(request["cwd"], str(self.root / "src"))
-        self.assertEqual(request["options"], {"maxTurns": 5})
+        self.assertNotIn("options", request)
         self.assertTrue(request["requestId"])
         self.assertEqual(request["systemPrompt"], SEARCH["build_sysprompt_text"](5))
+        self.assertIn("Try to finish within 5 turns", request["systemPrompt"])
         self.assertEqual(
-            set(request), {"profile", "message", "cwd", "options", "requestId", "systemPrompt"}
+            set(request), {"profile", "message", "cwd", "requestId", "systemPrompt"}
         )
         self.assertIn(
             (
@@ -321,10 +322,11 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress["activities"][1]["label"], "file_read")
         self.assertEqual(progress["activities"][1]["preview"], "file missing")
 
-    async def test_default_turn_limit_and_workspace(self) -> None:
+    async def test_default_turn_budget_is_advisory_and_workspace_is_inherited(self) -> None:
         await self.search(query="Find code")
         request = self.host.calls[0][1]
-        self.assertEqual(request["options"], {"maxTurns": 3})
+        self.assertNotIn("options", request)
+        self.assertIn("Try to finish within 3 turns", request["systemPrompt"])
         self.assertEqual(request["cwd"], str(self.root))
 
     async def test_invalid_queries_and_paths_do_not_submit(self) -> None:
