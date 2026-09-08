@@ -38,8 +38,6 @@ A collection of CLI tool skill definitions for AI assistants.
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 
-The subagent tools are available in both local and runner-backed extension runtimes.
-
 ## Structure
 
 Each skill is contained in its own directory with a `SKILL.md` file that provides:
@@ -48,10 +46,10 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 - Command reference and usage examples
 - Common workflows and troubleshooting tips
 
-Extensions live under `extensions/` with inline `uv` dependency metadata. Most use `kodelet-sdk>=0.2.1,<0.3`; subagent retains `kodelet-sdk>=0.1.22,<0.2`. Configure `code_search`'s `gpt-5.6-luna` model credentials on the daemon. Search runs on the selected runner, stays within the workspace, respects tool restrictions, and shows per-tool progress.
+Extensions live under `extensions/` with inline `uv` dependency metadata. Most use `kodelet-sdk>=0.2.1,<0.3`; subagent requires `kodelet-sdk>=0.2.2,<0.3` and Python 3.11 or newer. Configure `code_search`'s `gpt-5.6-luna` model credentials on the daemon. Search runs on the selected runner, stays within the workspace, respects tool restrictions, and shows per-tool progress.
 
 Test extensions without provider calls: `uv run --script tests/test_extensions.py`.
-Run the subagent tests separately: `uv run --with 'alembic>=1.16,<2' --with 'kodelet-sdk>=0.1.22,<0.2' -- python -B extensions/subagent/test_subagent.py`.
+Run the subagent tests separately: `uv run --with 'alembic>=1.16,<2' --with 'kodelet-sdk>=0.2.2,<0.3' -- python -B extensions/subagent/test_subagent.py`.
 
 ## Installation
 
