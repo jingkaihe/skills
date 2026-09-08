@@ -48,7 +48,10 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 - Command reference and usage examples
 - Common workflows and troubleshooting tips
 
-Extensions live under `extensions/` as executable `kodelet-extension-*` Python SDK scripts with inline `uv` dependency metadata.
+Extensions live under `extensions/` with inline `uv` dependency metadata. Most use `kodelet-sdk>=0.2.1,<0.3`; subagent retains `kodelet-sdk>=0.1.22,<0.2`. Configure `code_search`'s `gpt-5.6-luna` model credentials on the daemon. Search runs on the selected runner, stays within the workspace, respects tool restrictions, and shows per-tool progress.
+
+Test extensions without provider calls: `uv run --script tests/test_extensions.py`.
+Run the subagent tests separately: `uv run --with 'alembic>=1.16,<2' --with 'kodelet-sdk>=0.1.22,<0.2' -- python -B extensions/subagent/test_subagent.py`.
 
 ## Installation
 

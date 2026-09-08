@@ -1,27 +1,29 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.21"]
+# dependencies = ["kodelet-sdk>=0.2.1,<0.3"]
 # ///
 
 from __future__ import annotations
 
 import asyncio
-import tempfile
+import json
 import textwrap
 from pathlib import Path
+from typing import Any, cast
 
 from kodelet_sdk import (
     BaseModel,
-    Client,
+    ExecutionOptions,
+    ExecutionProfile,
     Extension,
     Field,
-    Profile,
     TaskProgress,
+    TaskProgressContext,
     ToolContext,
     ToolExecutionResult,
+    format_task_tool_activity,
 )
-
 
 DESCRIPTION = textwrap.dedent(
     """
@@ -51,9 +53,8 @@ class CodeSearchInput(BaseModel):
     cwd: str | None = Field(
         default=None,
         description=(
-            "Optional directory to search from. Defaults to the current "
-            "workspace directory. Relative paths are resolved against the "
-            "current workspace directory."
+            "Optional directory within the current runner workspace to search from. "
+            "Defaults to the workspace directory; relative paths resolve against it."
         ),
     )
     max_turns: int = Field(
@@ -64,16 +65,17 @@ class CodeSearchInput(BaseModel):
 
 
 def resolve_search_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
-    if raw_cwd is None:
-        return Path(workspace_cwd).resolve()
-    if not raw_cwd.strip():
+    root = Path(workspace_cwd).resolve()
+    if raw_cwd is not None and not raw_cwd.strip():
         raise ValueError("cwd must be a non-empty string when provided")
 
-    candidate = Path(raw_cwd).expanduser()
+    candidate = Path(raw_cwd).expanduser() if raw_cwd is not None else root
     if not candidate.is_absolute():
-        candidate = Path(workspace_cwd) / candidate
+        candidate = root / candidate
 
     resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("cwd must be within the current runner workspace")
     if not resolved.exists():
         raise ValueError(f"cwd does not exist: {resolved}")
     if not resolved.is_dir():
@@ -114,51 +116,81 @@ def build_sysprompt_text(max_turns: int) -> str:
     )
 
 
-def build_search_profile(sysprompt_path: Path) -> Profile:
-    return Profile(
-        {
-            "provider": "openai",
-            "model": "gpt-5.5",
-            "reasoning_effort": "none",
-            "openai": {
-                "api_mode": "responses",
-                "service_tier": "fast",
-                "platform": "codex",
-            },
-            "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
-            "enable_fs_search_tools": True,
-            "extensions": {"enabled": False},
-            "skills": {"enabled": False},
-            "sysprompt": str(sysprompt_path),
-            "tool_mode": "full",
-        }
+ext.register_profile(
+    ExecutionProfile(
+        name="code_search",
+        system_prompt=build_sysprompt_text(3),
+        options=ExecutionOptions(
+            provider="openai",
+            model="gpt-5.6-luna",
+            reasoning_effort="none",
+            allowed_tools=["file_read", "grep_tool", "glob_tool"],
+            enable_fs_search_tools=True,
+            no_extensions=True,
+            no_skills=True,
+        ),
     )
+)
 
 
 async def run_search_agent(
     query: str,
     search_cwd: Path,
-    sysprompt_path: Path,
+    max_turns: int,
+    ctx: ToolContext,
     progress: TaskProgress,
 ) -> str:
-    client = Client(command="kodelet", cwd=str(search_cwd))
-    try:
-        async def run_once() -> object:
-            session = await client.create_session(
-                profile=build_search_profile(sysprompt_path),
-                cwd=str(search_cwd),
-                streaming=True,
-            )
-            progress.attach(session)
-            return await session.run_and_wait(query)
+    async def run_once() -> dict[str, Any]:
+        # Keep max_turns in the prompt only; inherit the parent's execution ceiling.
+        # A hard limit can stop after tool calls, before the agent writes any answer.
+        child = await ctx.children.start(
+            profile="code_search",
+            message=query,
+            cwd=str(search_cwd),
+            system_prompt=build_sysprompt_text(max_turns),
+        )
+        active_calls: set[str] = set()
 
+        def on_event(event: dict[str, Any]) -> None:
+            kind = event["kind"]
+            call_id = event.get("toolCallId")
+            tool_name = event.get("toolName") or "tool"
+            if kind == "tool-use" and call_id:
+                try:
+                    tool_input = json.loads(event["input"])
+                except json.JSONDecodeError:
+                    tool_input = None  # Bounded host previews can truncate JSON.
+                if isinstance(tool_input, dict):
+                    label, detail = format_task_tool_activity(
+                        tool_name, tool_input, str(search_cwd)
+                    )
+                else:
+                    label, detail = tool_name, f"running {tool_name}"
+                progress.start_activity(call_id, label=label, detail=detail, kind=tool_name)
+                active_calls.add(call_id)
+            elif kind == "tool-update" and call_id:
+                progress.update_activity(call_id, event.get("toolOutput"))
+            elif kind == "tool-result" and call_id:
+                if call_id not in active_calls:
+                    # A bounded event window may retain the result but not its start.
+                    progress.start_activity(call_id, label=tool_name, kind=tool_name)
+                progress.finish_activity(
+                    call_id,
+                    success=event["success"],
+                    result=event.get("error") or event.get("toolOutput"),
+                )
+                active_calls.discard(call_id)
+            elif kind in {"text", "text-delta"}:
+                progress.mark_responding()
+
+        return await child.wait(on_event=on_event)
+
+    try:
         response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
     except TimeoutError:
         raise TimeoutError("code_search timed out while waiting for kodelet to finish") from None
-    finally:
-        await client.close()
 
-    content = response.get("content")
+    content = response.get("output")
     return content if isinstance(content, str) else ""
 
 
@@ -180,7 +212,8 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
         return {"content": str(exc), "error": str(exc)}
 
     progress = TaskProgress(
-        ctx,
+        # SDK 0.2's protocol makes log writable, though TaskProgress only reads it.
+        cast(TaskProgressContext, ctx),
         kind="code_search",
         task=query,
         cwd=str(search_cwd),
@@ -191,34 +224,19 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     )
     await progress.start()
 
-    sysprompt_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".tmpl", encoding="utf-8", delete=False
-        ) as handle:
-            handle.write(build_sysprompt_text(input.max_turns))
-            sysprompt_path = Path(handle.name)
-
-        stdout = await run_search_agent(query, search_cwd, sysprompt_path, progress)
+        stdout = await run_search_agent(query, search_cwd, input.max_turns, ctx, progress)
+    except asyncio.CancelledError:
+        await progress.finish(success=False, error="code_search cancelled")
+        raise
     except TimeoutError as exc:
         message = str(exc)
-        snapshot = await progress.finish(success=False, error=message)
-        return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    except OSError as exc:
-        message = f"Failed to execute kodelet: {exc}"
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
     except Exception as exc:
         message = f"code_search failed: {exc}"
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    finally:
-        if sysprompt_path is not None:
-            try:
-                sysprompt_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
     stdout = stdout.strip()
     if not stdout:
         message = "code_search returned an empty response"
