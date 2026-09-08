@@ -1,14 +1,19 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.2.1", "filetype", "google-genai", "pillow"]
+# dependencies = ["kodelet-sdk==0.3.0", "filetype", "google-genai", "pillow"]
 # ///
 
-"""Run with `uv run --script tests/test_extensions.py`; no provider calls."""
+"""Run with `uv run --script tests/test_extensions.py`; no provider calls.
+
+For the local SDK, set KODELET_TEST_LOCAL_SDK=1 and add
+`--refresh-package kodelet-sdk --with-editable ../kodelet-python-sdk` to the uv command.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import runpy
 import sys
 import tempfile
@@ -18,71 +23,155 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from kodelet_sdk import ChildClient, ToolContext
+import kodelet_sdk
+from kodelet_sdk import Client, ExecutionOptions, ToolContext, create_test_harness
+from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 
 
-class Host:
-    """Exercise the real SDK ChildClient against the bounded child RPC contract."""
+def tool_call(call_id: str, name: str, tool_input: Any) -> dict[str, Any]:
+    return {
+        "sessionUpdate": "tool_call", "toolCallId": call_id,
+        "toolName": name, "rawInput": tool_input,
+    }
+
+
+def tool_result(
+    call_id: str, name: str, status: str = "completed", text: str = "",
+) -> dict[str, Any]:
+    return {
+        "sessionUpdate": "tool_call_update", "toolCallId": call_id,
+        "toolName": name, "status": status,
+        "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+    }
+
+
+def message(text: str) -> dict[str, Any]:
+    return {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+
+
+class ACPProcess:
+    """Provider-free line transport; Client, Session, RPC, and progress are real SDK code."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, Any]] = []
-        self.reading = asyncio.Event()
-        self.allow_read = asyncio.Event()
-        self.allow_read.set()
-        self.start_error: Exception | None = None
-        self.initial: dict[str, Any] = {
-            "conversationId": "child-conversation",
-            "runId": "child-run",
-            "done": False,
-            "events": [
-                {
-                    "sequence": 1,
-                    "kind": "tool-use",
-                    "toolName": "grep_tool",
-                    "toolCallId": "a",
-                    "input": '{"pattern":"parser","path":"."}',
-                },
-                {
-                    "sequence": 2,
-                    "kind": "tool-result",
-                    "toolName": "grep_tool",
-                    "toolCallId": "a",
-                    "success": True,
-                    "toolOutput": "src/handler.go:20: parser",
-                },
-            ],
-        }
-        self.result: dict[str, Any] = {
-            **self.initial,
-            "done": True,
-            "output": "  Found src/handler.go:20-40.\n",
-            "events": [{"sequence": 3, "kind": "text-delta", "text": "Found the handler."}],
-        }
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.stdin = self
+        self.requests: list[dict[str, Any]] = []
+        self.tasks: set[asyncio.Task[None]] = set()
+        self.closed = asyncio.Event()
+        self.terminating = asyncio.Event()
+        self.killed = asyncio.Event()
+        self.reaped = asyncio.Event()
+        self.ignore_terminate = False
+        self.loading = asyncio.Event()
+        self.prompt_started = asyncio.Event()
+        self.allow_load = asyncio.Event()
+        self.allow_load.set()
+        self.allow_result = asyncio.Event()
+        self.allow_result.set()
+        self.init_error: str | None = None
+        self.prompt_error: str | None = None
+        self.stop_reason = "end_turn"
+        self.extension_version = 1
+        self.events = [
+            tool_call("a", "grep_tool", {"pattern": "parser", "path": "."}),
+            tool_result("a", "grep_tool", text="src/handler.go:20: parser"),
+            message("  Found src/handler.go:20-40.\n"),
+        ]
 
-    async def request(self, method: str, params: Any = None) -> Any:
-        self.calls.append((method, params))
-        if method == "kodelet.child.start":
-            if self.start_error is not None:
-                raise self.start_error
-            return self.initial
-        if method == "kodelet.child.read":
-            self.reading.set()
-            await self.allow_read.wait()
-            return self.result
-        if method == "kodelet.child.cancel":
-            return {"cancelled": True}
-        raise AssertionError(f"unexpected RPC: {method}")
+    def write(self, chunk: bytes) -> None:
+        for line in chunk.splitlines():
+            request = json.loads(line)
+            self.requests.append(request)
+            if "id" in request:
+                task = asyncio.create_task(self.handle(request))
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.terminate()
+
+    def terminate(self) -> None:
+        self.terminating.set()
+        if not self.ignore_terminate:
+            self._exit()
+
+    def _exit(self) -> None:
+        if not self.closed.is_set():
+            self.closed.set()
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            for task in self.tasks:
+                task.cancel()
+
+    def kill(self) -> None:
+        self.killed.set()
+        self._exit()
+
+    async def wait(self) -> int:
+        await self.closed.wait()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.reaped.set()
+        return 0
+
+    def send(self, value: dict[str, Any]) -> None:
+        self.stdout.feed_data((json.dumps({"jsonrpc": "2.0", **value}) + "\n").encode())
+
+    async def handle(self, request: dict[str, Any]) -> None:
+        method = request["method"]
+        error: str | None = None
+        if method == "initialize":
+            result = {"protocolVersion": 1, "_meta": {
+                "sessionExtensions": {"version": self.extension_version},
+            }}
+        elif method == "session/new":
+            self.loading.set()
+            await self.allow_load.wait()
+            error = self.init_error
+            result = {"sessionId": "search-conversation"}
+        elif method == "session/prompt":
+            self.prompt_started.set()
+            for event in self.events:
+                self.send({"method": "session/update", "params": {
+                    "sessionId": "search-conversation", "update": event,
+                }})
+                # Let the real reader and TaskProgress publish intermediate snapshots.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            await self.allow_result.wait()
+            error = self.prompt_error
+            result = {"stopReason": self.stop_reason}
+        else:
+            error = f"Unexpected ACP method: {method}"
+            result = {}
+        self.send({"id": request["id"], **(
+            {"error": {"code": -1, "message": error}} if error else {"result": result}
+        )})
 
 
 class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
-    def test_published_minimum_sdk_is_not_an_editable_checkout(self) -> None:
+    def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
-        self.assertEqual(package.version, "0.2.1")
-        self.assertIsNone(package.read_text("direct_url.json"))
+        direct_url = package.read_text("direct_url.json")
+        self.assertEqual(package.version, "0.3.0")
+        if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
+            self.assertIsNotNone(direct_url)
+            self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
+            self.assertEqual(
+                Path(kodelet_sdk.__file__).resolve(),
+                ROOT.parent / "kodelet-python-sdk" / "src" / "kodelet_sdk" / "__init__.py",
+            )
+            self.assertFalse(hasattr(ToolContext(None), "children"))
+        else:
+            self.assertIsNone(direct_url, "Default run must test the published minimum wheel")
+        self.assertEqual(ACP_MESSAGE_LIMIT, 64 * 1024 * 1024)
 
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
@@ -101,7 +190,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.2.1,<0.3", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.3.0,<0.4", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
@@ -153,30 +242,9 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(manifest["commands"][0]["name"], "last-word")
                         self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
                     if name == "code-search":
-                        self.assertEqual(manifest["profiles"][0]["name"], "code_search")
+                        self.assertNotIn("profiles", manifest)
             self.assertEqual(state.read_text(), "unusable client store")
             self.assertFalse((root / "data").exists())
-
-    def test_search_profile_is_strict_read_only_and_snapshotted(self) -> None:
-        extension = SEARCH["ext"]
-        manifest = extension.initialize({"extension": {"id": "code-search"}})
-        profile = manifest["profiles"][0]
-        self.assertEqual(
-            profile["options"],
-            {
-                "provider": "openai",
-                "model": "gpt-5.6-luna",
-                "reasoningEffort": "none",
-                "allowedTools": ["file_read", "grep_tool", "glob_tool"],
-                "enableFSSearchTools": True,
-                "noExtensions": True,
-                "noSkills": True,
-            },
-        )
-        self.assertEqual(profile["systemPrompt"], SEARCH["build_sysprompt_text"](3))
-        self.assertNotIn("systemPromptPath", profile)
-        profile["options"]["allowedTools"].append("bash")
-        self.assertNotIn("bash", extension.initialize({})["profiles"][0]["options"]["allowedTools"])
 
 
 class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
@@ -184,103 +252,167 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.host = Host()
+        self.peer = ACPProcess()
+        self.clients: list[Client] = []
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.closed_clients: list[Client] = []
+        self.close_started = asyncio.Event()
+        self.responding = asyncio.Event()
         self.ctx = ToolContext({"extension": {"cwd": str(self.root)}})
-        self.ctx.children = ChildClient(self.host)
-        self.updates = AsyncMock()
+        # The published SDK still has this namespace; the restored extension must not use it.
+        if hasattr(self.ctx, "children"):
+            delattr(self.ctx, "children")
+
+        async def update(_content: str, data: dict[str, Any]) -> None:
+            if data["taskRun"]["phase"] == "responding":
+                self.responding.set()
+
+        self.updates = AsyncMock(side_effect=update)
         self.update_patch = patch.object(self.ctx, "update", self.updates)
         self.update_patch.start()
         self.addCleanup(self.update_patch.stop)
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.clients.append(self)
+                owner.client_kwargs = kwargs
+                super().__init__(spawn=owner.spawn, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                owner.close_started.set()
+                try:
+                    await super().close()
+                finally:
+                    owner.closed_clients.append(self)
+
+        self.client_patch = patch.dict(
+            SEARCH["run_search_agent"].__globals__, Client=RecordingClient,
+        )
+        self.client_patch.start()
+        self.addCleanup(self.client_patch.stop)
+
+    def spawn(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({"command": command, "args": list(args), "options": options})
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        # Every submitted search must own cleanup, including failed initialization.
+        for client in self.clients:
+            self.assertIn(client, self.closed_clients)
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        if self.clients:
+            self.assertTrue(self.peer.closed.is_set())
+        self.peer.terminate()
+        await self.peer.wait()
 
     async def search(self, **kwargs: Any) -> dict[str, Any]:
-        with (
-            patch("subprocess.Popen", side_effect=AssertionError("must not spawn a CLI")),
-            patch("tempfile.NamedTemporaryFile", side_effect=AssertionError("no prompt files")),
-        ):
+        with patch("tempfile.NamedTemporaryFile", side_effect=AssertionError("no prompt files")):
             return await SEARCH["code_search"](SEARCH["CodeSearchInput"](**kwargs), self.ctx)
 
-    async def test_child_request_progress_and_authoritative_result(self) -> None:
+    async def prompt_patch(self, max_turns: int) -> dict[str, Any]:
+        extension = self.session_options[-1]["extensions"][0]
+        manifest = extension.initialize({})
+        self.assertEqual(manifest["tools"], [])
+        self.assertEqual(manifest["commands"], [])
+        self.assertEqual([row["event"] for row in manifest["subscriptions"]], ["agent.init"])
+        harness = await create_test_harness(extension)
+        result = await harness.handle_event({
+            "id": "init", "event": "agent.init",
+            "payload": {"systemPrompt": "Runner instructions and tool guidance"},
+        })
+        self.assertEqual(
+            result, {"systemPrompt": {"append": SEARCH["build_sysprompt_text"](max_turns)}},
+        )
+        return result
+
+    async def test_acp_read_only_options_prompt_hook_progress_and_result(self) -> None:
         (self.root / "src").mkdir()
         result = await self.search(query="  Find the handler.  ", cwd="src", max_turns=5)
         self.assertEqual(result["content"], "Found src/handler.go:20-40.")
         self.assertNotIn("error", result)
-        method, request = self.host.calls[0]
-        self.assertEqual(method, "kodelet.child.start")
-        self.assertEqual(request["message"], "Find the handler.")
-        self.assertEqual(request["profile"], "code_search")
-        self.assertEqual(request["cwd"], str(self.root / "src"))
-        self.assertNotIn("options", request)
-        self.assertTrue(request["requestId"])
-        self.assertEqual(request["systemPrompt"], SEARCH["build_sysprompt_text"](5))
-        self.assertIn("Try to finish within 5 turns", request["systemPrompt"])
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root / "src")})
+        self.assertFalse(hasattr(self.ctx, "children"))
+        self.assertIsNone(self.ctx._host_rpc_client)
+        options = self.session_options[0]["options"]
+        self.assertIsInstance(options, ExecutionOptions)
+        self.assertEqual(options.to_wire(), {
+            "provider": "openai", "model": "gpt-5.6-luna", "reasoningEffort": "none",
+            "allowedTools": ["file_read", "grep_tool", "glob_tool"],
+            "enableFSSearchTools": True, "noSkills": True,
+        })
+        self.assertEqual(self.launches[0]["command"], "kodelet")
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--provider=openai", "--model=gpt-5.6-luna", "--reasoning-effort=none",
+            "--no-skills=true", '--allowed-tools="file_read","grep_tool","glob_tool"',
+            "--enable-fs-search-tools=true",
+        ])
+        # No noExtensions flag: the inline prompt hook must remain attached.
+        self.assertEqual(set(self.session_options[0]), {"profile", "options", "extensions"})
+        self.assertEqual(self.session_options[0]["profile"], "")
+        await self.prompt_patch(5)
+        new = next(row for row in self.peer.requests if row.get("method") == "session/new")
+        self.assertEqual(new["params"], {
+            "cwd": str(self.root / "src"),
+            "_meta": {"sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]}},
+        })
+        prompt = next(row for row in self.peer.requests if row.get("method") == "session/prompt")
         self.assertEqual(
-            set(request), {"profile", "message", "cwd", "requestId", "systemPrompt"}
-        )
-        self.assertIn(
-            (
-                "kodelet.child.read",
-                {"childId": "child-conversation", "childRunId": "child-run", "after": 2},
-            ),
-            self.host.calls,
+            prompt["params"]["prompt"], [{"type": "text", "text": "Find the handler."}],
         )
         progress = result["data"]["taskRun"]
         self.assertEqual(progress["status"], "completed")
         self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
-        self.assertEqual(progress["activities"][0]["id"], "a")
         self.assertEqual(progress["activities"][0]["label"], 'Search "parser" in .')
         phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
         self.assertIn("working", phases)
         self.assertIn("responding", phases)
         self.assertEqual(list(self.root.iterdir()), [self.root / "src"])
 
-    async def test_parallel_calls_report_independent_outcomes_before_summary_finishes(self) -> None:
-        events = [
-            {
-                "kind": "tool-use",
-                "toolName": "grep_tool",
-                "toolCallId": "a",
-                "input": '{"pattern":"parser","path":"."}',
-            },
-            {
-                "kind": "tool-use",
-                "toolName": "glob_tool",
-                "toolCallId": "b",
-                "input": '{"pattern":"*.go","path":"."}',
-            },
-            {
-                "kind": "tool-use",
-                "toolName": "file_read",
-                "toolCallId": "c",
-                "input": '{"file_path":"src/handler.go"}',
-            },
-            {
-                "kind": "tool-update",
-                "toolName": "grep_tool",
-                "toolCallId": "a",
-                "toolOutput": "partial matches",
-                "success": False,
-            },
-            {"kind": "tool-result", "toolName": "file_read", "toolCallId": "c", "success": True},
-            {"kind": "tool-result", "toolName": "grep_tool", "toolCallId": "a", "success": True},
-            {
-                "kind": "tool-result",
-                "toolName": "glob_tool",
-                "toolCallId": "b",
-                "success": False,
-                "error": "permission denied",
-                "toolOutput": "partial output",
-            },
-            {"kind": "text-delta", "text": "Writing the answer"},
+    async def test_parent_daemon_profile_reaches_acp_without_environment_override(self) -> None:
+        with patch.object(self.ctx, "profile", "team-research"), patch.dict(
+            os.environ, {"KODELET_PROFILE": "host-other"},
+        ):
+            result = await self.search(query="Find code")
+        self.assertNotIn("error", result)
+        self.assertEqual(self.session_options[0]["profile"], "team-research")
+        self.assertEqual(
+            [arg for arg in self.launches[0]["args"] if arg.startswith("--profile=")],
+            ["--profile=team-research"],
+        )
+        self.assertEqual(self.session_options[0]["options"].provider, "openai")
+        self.assertEqual(self.launches[0]["options"]["env"]["KODELET_PROFILE"], "host-other")
+
+    async def test_absent_parent_profile_does_not_promote_host_environment_to_flag(self) -> None:
+        with patch.dict(os.environ, {"KODELET_PROFILE": "host-other"}):
+            result = await self.search(query="Find code")
+        self.assertNotIn("error", result)
+        self.assertEqual(self.session_options[0]["profile"], "")
+        self.assertFalse(any(arg.startswith("--profile") for arg in self.launches[0]["args"]))
+
+    async def test_parallel_tool_results_and_errors_before_summary_finishes(self) -> None:
+        self.peer.events = [
+            tool_call("a", "grep_tool", {"pattern": "parser", "path": "."}),
+            tool_call("b", "glob_tool", {"pattern": "*.go", "path": "."}),
+            tool_call("c", "file_read", {"file_path": "src/handler.go"}),
+            tool_result("a", "grep_tool", "in_progress", "partial matches"),
+            tool_result("c", "file_read"),
+            tool_result("a", "grep_tool"),
+            tool_result("b", "glob_tool", "failed", "permission denied"),
+            message("Writing the answer"),
         ]
-        self.host.initial["events"] = [
-            {"sequence": index + 1, **event} for index, event in enumerate(events)
-        ]
-        self.host.result["events"] = []
-        self.host.allow_read.clear()
+        self.peer.allow_result.clear()
         task = asyncio.create_task(self.search(query="Find code"))
         try:
-            await asyncio.wait_for(self.host.reading.wait(), timeout=2)
+            await asyncio.wait_for(self.responding.wait(), timeout=2)
             snapshots = [call.args[1]["taskRun"] for call in self.updates.call_args_list]
+            self.assertTrue(any(snapshot["counts"]["running"] == 3 for snapshot in snapshots))
             summary = snapshots[-1]
             self.assertEqual(summary["status"], "running", "the answer is still in flight")
             self.assertEqual(summary["phase"], "responding")
@@ -288,106 +420,205 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary["counts"], {"succeeded": 2, "failed": 1, "running": 0})
             self.assertEqual(
                 [(row["label"], row["status"]) for row in summary["activities"]],
-                [
-                    ('Search "parser" in .', "succeeded"),
-                    ('Find files "*.go" in .', "failed"),
-                    ("Read src/handler.go", "succeeded"),
-                ],
+                [('Search "parser" in .', "succeeded"),
+                 ('Find files "*.go" in .', "failed"), ("Read src/handler.go", "succeeded")],
             )
             self.assertEqual(summary["activities"][1]["preview"], "permission denied")
             self.assertNotIn("preview", summary["activities"][0])
             self.assertFalse(task.done())
         finally:
-            self.host.allow_read.set()
+            self.peer.allow_result.set()
             result = await task
         self.assertEqual(result["data"]["taskRun"]["counts"], summary["counts"])
 
     async def test_truncated_tool_input_and_result_without_start_are_safe(self) -> None:
-        self.host.initial["events"][0]["input"] = '{"pattern":"truncated'
-        self.host.initial["events"].append(
-            {
-                "sequence": 3,
-                "kind": "tool-result",
-                "toolName": "file_read",
-                "toolCallId": "lost",
-                "success": False,
-                "toolOutput": "file missing",
-            }
-        )
-        self.host.result["events"][0]["sequence"] = 4
+        self.peer.events[0]["rawInput"] = '{"pattern":"truncated'
+        self.peer.events.insert(2, tool_result("lost", "file_read", "failed", "file missing"))
         result = await self.search(query="Find code")
         progress = result["data"]["taskRun"]
-        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 1, "running": 0})
-        self.assertEqual(progress["activities"][0]["label"], "grep_tool")
-        self.assertEqual(progress["activities"][1]["label"], "file_read")
-        self.assertEqual(progress["activities"][1]["preview"], "file missing")
+        # TaskProgress's ACP adapter ignores results with no observed start.
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        self.assertEqual(progress["activities"][0]["label"], "Search in .")
 
     async def test_default_turn_budget_is_advisory_and_workspace_is_inherited(self) -> None:
         await self.search(query="Find code")
-        request = self.host.calls[0][1]
-        self.assertNotIn("options", request)
-        self.assertIn("Try to finish within 3 turns", request["systemPrompt"])
-        self.assertEqual(request["cwd"], str(self.root))
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root)})
+        self.assertNotIn("max_turns", self.session_options[0])
+        self.assertNotIn("maxTurns", self.session_options[0]["options"].to_wire())
+        self.assertFalse(any(arg.startswith("--max-turns") for arg in self.launches[0]["args"]))
+        await self.prompt_patch(3)
 
-    async def test_invalid_queries_and_paths_do_not_submit(self) -> None:
+    async def test_invalid_queries_and_paths_do_not_start_acp(self) -> None:
         (self.root / "file").write_text("text")
-        (self.root / "outside").symlink_to(self.root.parent, target_is_directory=True)
         inputs = [{"query": "   "}] + [
-            {"query": "find", "cwd": cwd} for cwd in ("", "missing", "file", "..", "outside")
+            {"query": "find", "cwd": cwd} for cwd in ("", "missing", "file")
         ]
         for value in inputs:
             with self.subTest(value=value):
                 self.assertIn("error", await self.search(**value))
-        self.assertEqual(self.host.calls, [])
+        self.assertEqual(self.clients, [])
+        self.assertEqual(self.launches, [])
         self.updates.assert_not_called()
 
-    async def test_child_failure_does_not_report_partial_output_as_success(self) -> None:
-        self.host.result.update(error="provider failed", output="partial answer")
+    async def test_relative_absolute_and_symlink_cwd_outside_workspace_reach_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory).resolve()
+            (self.root / "outside").symlink_to(outside, target_is_directory=True)
+            for cwd in (str(outside), os.path.relpath(outside, self.root), "outside", ".."):
+                with self.subTest(cwd=cwd):
+                    self.peer = ACPProcess()
+                    result = await self.search(query="find", cwd=cwd)
+                    self.assertNotIn("error", result)
+                    expected = self.root.parent if cwd == ".." else outside
+                    new = next(
+                        row for row in self.peer.requests if row.get("method") == "session/new"
+                    )
+                    self.assertEqual(new["params"]["cwd"], str(expected))
+                    self.assertTrue(self.peer.closed.is_set())
+            self.assertEqual(list(outside.iterdir()), [])
+
+    async def test_provider_failure_does_not_return_partial_output_as_success(self) -> None:
+        self.peer.events.append(message("partial answer"))
+        self.peer.prompt_error = "provider failed"
         result = await self.search(query="find")
         self.assertIn("provider failed", result["error"])
         self.assertNotIn("partial answer", result["content"])
         self.assertEqual(result["data"]["taskRun"]["status"], "failed")
 
-    async def test_empty_output_is_an_error(self) -> None:
-        self.host.result["output"] = " \n "
+    async def test_daemon_cancellation_does_not_return_partial_output_as_success(self) -> None:
+        self.peer.events = [message("partial answer")]
+        self.peer.stop_reason = "cancelled"
         result = await self.search(query="find")
-        self.assertEqual(result["error"], "code_search returned an empty response")
+        self.assertEqual(result["error"], "code_search failed: code_search was canceled")
+        self.assertNotIn("partial answer", result["content"])
         self.assertEqual(result["data"]["taskRun"]["status"], "failed")
-        self.assertEqual(
-            result["data"]["taskRun"]["counts"], {"succeeded": 1, "failed": 0, "running": 0}
-        )
 
-    async def test_rejected_policy_and_unavailable_host_never_fallback(self) -> None:
-        self.host.start_error = RuntimeError("child tools exceed parent policy")
-        result = await self.search(query="find")
-        self.assertIn("exceed parent policy", result["error"])
-        self.assertEqual(len(self.host.calls), 1)
-        self.ctx.children = ChildClient(None)
-        result = await self.search(query="find")
-        self.assertIn("no local fallback", result["error"])
+    async def test_empty_or_missing_output_is_an_error(self) -> None:
+        for content in ("", " \n ", None):
+            with self.subTest(content=content):
+                self.peer = ACPProcess()
+                self.peer.events = self.peer.events[:2]
+                if content is not None:
+                    self.peer.events.append(message(content))
+                result = await self.search(query="find")
+                self.assertEqual(result["error"], "code_search returned an empty response")
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+                self.assertEqual(result["data"]["taskRun"]["counts"], {
+                    "succeeded": 1, "failed": 0, "running": 0,
+                })
+                self.assertTrue(self.peer.closed.is_set())
 
-    async def test_timeout_cancels_only_the_submitted_child(self) -> None:
-        self.host.allow_read.clear()
+    async def test_failed_session_initialization_closes_client(self) -> None:
+        self.peer.init_error = "runner rejected workspace"
+        result = await self.search(query="find")
+        self.assertIn("runner rejected workspace", result["error"])
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.peer.prompt_started.is_set())
+        self.assertEqual(len(self.launches), 1, "No fallback or retry")
+
+    async def test_missing_inline_capability_fails_without_fallback(self) -> None:
+        self.peer.extension_version = 0
+        result = await self.search(query="find")
+        self.assertIn("sessionExtensions", result["error"])
+        self.assertFalse(self.peer.loading.is_set())
+        self.assertEqual(len(self.launches), 1)
+
+    async def test_timeout_closes_client_and_cancels_active_session(self) -> None:
+        self.peer.allow_result.clear()
         with patch.dict(SEARCH["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
             result = await self.search(query="find")
         self.assertIn("timed out", result["error"])
-        self.assertEqual(
-            self.host.calls[-1],
-            ("kodelet.child.cancel", {"childId": "child-conversation", "childRunId": "child-run"}),
-        )
         self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        cancel = next(row for row in self.peer.requests if row.get("method") == "session/cancel")
+        self.assertEqual(cancel["params"], {"sessionId": "search-conversation"})
 
-    async def test_handler_cancellation_is_not_returned_as_success(self) -> None:
-        self.host.allow_read.clear()
+    async def test_session_initialization_timeout_closes_client(self) -> None:
+        self.peer.allow_load.clear()
+        with patch.dict(SEARCH["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+            result = await self.search(query="find")
+        self.assertIn("timed out", result["error"])
+        self.assertTrue(self.peer.loading.is_set())
+        self.assertFalse(self.peer.prompt_started.is_set())
+
+    async def test_handler_cancellation_is_propagated_and_closes_client(self) -> None:
+        self.peer.allow_result.clear()
         task = asyncio.create_task(self.search(query="find"))
-        await asyncio.wait_for(self.host.reading.wait(), timeout=2)
+        await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=2)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(
-            self.host.calls[-1],
-            ("kodelet.child.cancel", {"childId": "child-conversation", "childRunId": "child-run"}),
-        )
+        self.assertTrue(self.peer.closed.is_set())
+
+    async def test_cancellation_during_session_initialization_closes_client(self) -> None:
+        self.peer.allow_load.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        await asyncio.wait_for(self.peer.loading.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(self.peer.prompt_started.is_set())
+        self.assertTrue(self.peer.closed.is_set())
+
+    async def assert_repeated_cancellation_waits_for_cleanup(
+        self, task: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        await asyncio.wait_for(self.close_started.wait(), timeout=2)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done(), "cancellation must wait for the owned client close")
+        self.assertFalse(self.peer.closed.is_set(), "SIGTERM was intentionally ignored")
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        self.assertTrue(self.peer.killed.is_set(), "the SDK must escalate to SIGKILL")
+        self.assertTrue(self.peer.reaped.is_set(), "the SDK must await process exit")
+        self.assertEqual(self.closed_clients, self.clients, "close runs once per client")
+        self.assertFalse(self.clients[0]._sessions)
+        self.assertFalse(self.clients[0]._rpcs)
+        self.assertTrue(task.cancelled(), "cleanup must not turn cancellation into success")
+
+    async def test_repeated_cancellation_during_prompt_waits_for_escalation_and_reaping(
+        self,
+    ) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=2)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_repeated_cancellation_during_startup_waits_for_escalation_and_reaping(
+        self,
+    ) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_load.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.loading.wait(), timeout=2)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            # Interrupt create_session's own cleanup before the outer client-close barrier.
+            task.cancel()
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+            self.assertFalse(self.peer.prompt_started.is_set())
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancellation_during_success_cleanup_does_not_return_success(self) -> None:
+        self.peer.ignore_terminate = True
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":

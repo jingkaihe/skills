@@ -47,7 +47,9 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 - Command reference and usage examples
 - Common workflows and troubleshooting tips
 
-Extensions live under `extensions/` and run on the selected runner using `kodelet-sdk>=0.2.1,<0.3`. Configure `code_search`'s `gpt-5.6-luna` model credentials on the daemon. Search stays within the workspace, respects tool restrictions, and shows per-tool progress.
+Extensions declare dependencies in their `uv` scripts and require Python 3.11+ and `kodelet-sdk>=0.3.0,<0.4`.
+
+Code search uses ACP with normal client credentials and the configured server/runner. It forwards the parent's model profile, which must use OpenAI for `gpt-5.6-luna`; `provider` checks compatibility rather than switching providers. Model credentials stay on the daemon. Search allows only `file_read`, `grep_tool`, and `glob_tool`, disables skills, and uses an inline prompt hook. Its turn budget is advisory; cancellation awaits SDK cleanup. Runner-targeted authorization is deferred.
 
 Test extensions without provider calls: `uv run --script tests/test_extensions.py`.
 

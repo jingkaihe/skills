@@ -1,28 +1,29 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.2.1,<0.3"]
+# dependencies = ["kodelet-sdk>=0.3.0,<0.4"]
 # ///
 
 from __future__ import annotations
 
 import asyncio
-import json
 import textwrap
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from kodelet_sdk import (
+    AgentInitEvent,
     BaseModel,
+    Client,
+    EventContext,
+    EventResult,
     ExecutionOptions,
-    ExecutionProfile,
     Extension,
     Field,
     TaskProgress,
     TaskProgressContext,
     ToolContext,
     ToolExecutionResult,
-    format_task_tool_activity,
 )
 
 DESCRIPTION = textwrap.dedent(
@@ -53,7 +54,7 @@ class CodeSearchInput(BaseModel):
     cwd: str | None = Field(
         default=None,
         description=(
-            "Optional directory within the current runner workspace to search from. "
+            "Optional directory to search from. "
             "Defaults to the workspace directory; relative paths resolve against it."
         ),
     )
@@ -74,8 +75,6 @@ def resolve_search_cwd(raw_cwd: str | None, workspace_cwd: str) -> Path:
         candidate = root / candidate
 
     resolved = candidate.resolve()
-    if not resolved.is_relative_to(root):
-        raise ValueError("cwd must be within the current runner workspace")
     if not resolved.exists():
         raise ValueError(f"cwd does not exist: {resolved}")
     if not resolved.is_dir():
@@ -88,7 +87,6 @@ def build_sysprompt_text(max_turns: int) -> str:
         textwrap.dedent(
             f"""
         You are a fast, parallel code search agent.
-        {{{{include "templates/sections/context_runtime.tmpl" .}}}}
 
         ## Goal
         - Use only `grep_tool`, `glob_tool`, and `file_read`.
@@ -116,81 +114,61 @@ def build_sysprompt_text(max_turns: int) -> str:
     )
 
 
-ext.register_profile(
-    ExecutionProfile(
-        name="code_search",
-        system_prompt=build_sysprompt_text(3),
-        options=ExecutionOptions(
-            provider="openai",
-            model="gpt-5.6-luna",
-            reasoning_effort="none",
-            allowed_tools=["file_read", "grep_tool", "glob_tool"],
-            enable_fs_search_tools=True,
-            no_extensions=True,
-            no_skills=True,
-        ),
-    )
-)
+def search_instructions(max_turns: int) -> Extension:
+    instructions = Extension(name="code-search-instructions", version="0.1.0")
+
+    @instructions.on("agent.init")
+    def configure_search(_event: AgentInitEvent, _ctx: EventContext) -> EventResult:
+        return {"systemPrompt": {"append": build_sysprompt_text(max_turns)}}
+
+    return instructions
 
 
 async def run_search_agent(
     query: str,
     search_cwd: Path,
     max_turns: int,
-    ctx: ToolContext,
     progress: TaskProgress,
+    *,
+    profile: str = "",
 ) -> str:
-    async def run_once() -> dict[str, Any]:
-        # Keep max_turns in the prompt only; inherit the parent's execution ceiling.
-        # A hard limit can stop after tool calls, before the agent writes any answer.
-        child = await ctx.children.start(
-            profile="code_search",
-            message=query,
-            cwd=str(search_cwd),
-            system_prompt=build_sysprompt_text(max_turns),
-        )
-        active_calls: set[str] = set()
-
-        def on_event(event: dict[str, Any]) -> None:
-            kind = event["kind"]
-            call_id = event.get("toolCallId")
-            tool_name = event.get("toolName") or "tool"
-            if kind == "tool-use" and call_id:
-                try:
-                    tool_input = json.loads(event["input"])
-                except json.JSONDecodeError:
-                    tool_input = None  # Bounded host previews can truncate JSON.
-                if isinstance(tool_input, dict):
-                    label, detail = format_task_tool_activity(
-                        tool_name, tool_input, str(search_cwd)
-                    )
-                else:
-                    label, detail = tool_name, f"running {tool_name}"
-                progress.start_activity(call_id, label=label, detail=detail, kind=tool_name)
-                active_calls.add(call_id)
-            elif kind == "tool-update" and call_id:
-                progress.update_activity(call_id, event.get("toolOutput"))
-            elif kind == "tool-result" and call_id:
-                if call_id not in active_calls:
-                    # A bounded event window may retain the result but not its start.
-                    progress.start_activity(call_id, label=tool_name, kind=tool_name)
-                progress.finish_activity(
-                    call_id,
-                    success=event["success"],
-                    result=event.get("error") or event.get("toolOutput"),
-                )
-                active_calls.discard(call_id)
-            elif kind in {"text", "text-delta"}:
-                progress.mark_responding()
-
-        return await child.wait(on_event=on_event)
-
+    client = Client(cwd=str(search_cwd))
     try:
-        response = await asyncio.wait_for(run_once(), timeout=AGENT_TIMEOUT_SECONDS)
+        async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
+            session = await client.create_session(
+                profile=profile,
+                options=ExecutionOptions(
+                    provider="openai",
+                    model="gpt-5.6-luna",
+                    reasoning_effort="none",
+                    allowed_tools=["file_read", "grep_tool", "glob_tool"],
+                    enableFSSearchTools=True,
+                    no_skills=True,
+                ),
+                extensions=[search_instructions(max_turns)],
+            )
+            progress.attach(session)
+            # Keep the turn budget advisory so tool use can finish with a summary.
+            response = await session.run_and_wait(query)
     except TimeoutError:
         raise TimeoutError("code_search timed out while waiting for kodelet to finish") from None
+    finally:
+        # Own one close through repeated caller cancellation. The SDK bounds
+        # SIGTERM/SIGKILL cleanup; do not abandon it or retry failed closes here.
+        closing = asyncio.create_task(client.close())
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        closing.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
-    content = response.get("output")
+    if response.get("stopReason") == "cancelled":
+        raise RuntimeError("code_search was canceled")
+    content = response.get("content")
     return content if isinstance(content, str) else ""
 
 
@@ -225,7 +203,9 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     await progress.start()
 
     try:
-        stdout = await run_search_agent(query, search_cwd, input.max_turns, ctx, progress)
+        stdout = await run_search_agent(
+            query, search_cwd, input.max_turns, progress, profile=ctx.profile or "",
+        )
     except asyncio.CancelledError:
         await progress.finish(success=False, error="code_search cancelled")
         raise
@@ -233,7 +213,7 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
         message = str(exc)
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - ACP failures must become tool errors, not partial success.
         message = f"code_search failed: {exc}"
         snapshot = await progress.finish(success=False, error=message)
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
