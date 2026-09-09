@@ -45,6 +45,11 @@ SEARCH_PROFILE = ext.register_profile(
     provider="openai",
     model="gpt-5.6-luna",
     reasoning_effort="none",
+    openai={
+        "api_mode": "responses",
+        "platform": "codex",
+        "service_tier": "fast",
+    },
     hidden=True,
 )
 

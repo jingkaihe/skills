@@ -246,8 +246,16 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     if name == "code-search":
                         self.assertEqual(manifest["profiles"], [{
                             "name": "code-search", "hidden": True,
-                            "options": {"provider": "openai", "model": "gpt-5.6-luna",
-                                        "reasoningEffort": "none"},
+                            "options": {
+                                "provider": "openai",
+                                "model": "gpt-5.6-luna",
+                                "reasoningEffort": "none",
+                                "openai": {
+                                    "api_mode": "responses",
+                                    "platform": "codex",
+                                    "service_tier": "fast",
+                                },
+                            },
                         }])
             self.assertEqual(state.read_text(), "unusable client store")
             self.assertFalse((root / "data").exists())
