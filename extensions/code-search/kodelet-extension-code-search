@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.4.0,<0.5"]
+# dependencies = ["kodelet-sdk>=0.5.0,<0.6"]
 # ///
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from kodelet_sdk import (
     Client,
     EventContext,
     EventResult,
-    ExecutionOptions,
     Extension,
     Field,
     TaskProgress,
@@ -50,6 +49,9 @@ SEARCH_PROFILE = ext.register_profile(
         "platform": "codex",
         "service_tier": "fast",
     },
+    allowed_tools=["file_read", "grep_tool", "glob_tool"],
+    enable_fs_search_tools=True,
+    skills={"enabled": False},
     hidden=True,
 )
 
@@ -149,11 +151,6 @@ async def run_search_agent(
         async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
             session = await client.create_session(
                 profile=SEARCH_PROFILE,
-                options=ExecutionOptions(
-                    allowed_tools=["file_read", "grep_tool", "glob_tool"],
-                    enableFSSearchTools=True,
-                    no_skills=True,
-                ),
                 extensions=[search_instructions(max_turns)],
             )
             progress.attach(session)
