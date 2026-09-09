@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.3.0,<0.4"]
+# dependencies = ["kodelet-sdk>=0.4.0,<0.5"]
 # ///
 
 from __future__ import annotations
@@ -40,6 +40,13 @@ TOOL_TIMEOUT_SECONDS = 5 * 60
 AGENT_TIMEOUT_SECONDS = TOOL_TIMEOUT_SECONDS - 10
 
 ext = Extension(name="code-search", version="0.1.0")
+SEARCH_PROFILE = ext.register_profile(
+    "code-search",
+    provider="openai",
+    model="gpt-5.6-luna",
+    reasoning_effort="none",
+    hidden=True,
+)
 
 
 class CodeSearchInput(BaseModel):
@@ -130,17 +137,14 @@ async def run_search_agent(
     max_turns: int,
     progress: TaskProgress,
     *,
-    profile: str = "",
+    runner: str,
 ) -> str:
-    client = Client(cwd=str(search_cwd))
+    client = Client(cwd=str(search_cwd), runner=runner)
     try:
         async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
             session = await client.create_session(
-                profile=profile,
+                profile=SEARCH_PROFILE,
                 options=ExecutionOptions(
-                    provider="openai",
-                    model="gpt-5.6-luna",
-                    reasoning_effort="none",
                     allowed_tools=["file_read", "grep_tool", "glob_tool"],
                     enableFSSearchTools=True,
                     no_skills=True,
@@ -203,8 +207,10 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     await progress.start()
 
     try:
+        if not ctx.runner_id:
+            raise RuntimeError("code_search requires a runner-backed extension context")
         stdout = await run_search_agent(
-            query, search_cwd, input.max_turns, progress, profile=ctx.profile or "",
+            query, search_cwd, input.max_turns, progress, runner=ctx.runner_id,
         )
     except asyncio.CancelledError:
         await progress.finish(success=False, error="code_search cancelled")

@@ -1,12 +1,13 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.3.0", "filetype", "google-genai", "pillow"]
+# dependencies = ["kodelet-sdk==0.4.0", "filetype", "google-genai", "pillow"]
 # ///
 
 """Run with `uv run --script tests/test_extensions.py`; no provider calls.
 
-For the local SDK, set KODELET_TEST_LOCAL_SDK=1 and add
-`--refresh-package kodelet-sdk --with-editable ../kodelet-python-sdk` to the uv command.
+For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
+../kodelet-python-sdk --with filetype --with google-genai --with pillow
+-- python tests/test_extensions.py
 """
 
 from __future__ import annotations
@@ -160,7 +161,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.3.0")
+        self.assertEqual(package.version, "0.4.0")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -190,13 +191,14 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.3.0,<0.4", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.4.0,<0.5", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "id": 1,
                             "method": "extension.initialize",
                             "params": {
+                                "capabilities": {"profiles": {"remote": True}},
                                 "extension": {
                                     "id": name,
                                     "cwd": directory,
@@ -242,7 +244,11 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(manifest["commands"][0]["name"], "last-word")
                         self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
                     if name == "code-search":
-                        self.assertNotIn("profiles", manifest)
+                        self.assertEqual(manifest["profiles"], [{
+                            "name": "code-search", "hidden": True,
+                            "options": {"provider": "openai", "model": "gpt-5.6-luna",
+                                        "reasoningEffort": "none"},
+                        }])
             self.assertEqual(state.read_text(), "unusable client store")
             self.assertFalse((root / "data").exists())
 
@@ -259,7 +265,7 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.closed_clients: list[Client] = []
         self.close_started = asyncio.Event()
         self.responding = asyncio.Event()
-        self.ctx = ToolContext({"extension": {"cwd": str(self.root)}})
+        self.ctx = ToolContext({"extension": {"cwd": str(self.root), "runnerId": "search-runner"}})
         # The published SDK still has this namespace; the restored extension must not use it.
         if hasattr(self.ctx, "children"):
             delattr(self.ctx, "children")
@@ -337,25 +343,26 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         result = await self.search(query="  Find the handler.  ", cwd="src", max_turns=5)
         self.assertEqual(result["content"], "Found src/handler.go:20-40.")
         self.assertNotIn("error", result)
-        self.assertEqual(self.client_kwargs, {"cwd": str(self.root / "src")})
+        self.assertEqual(
+            self.client_kwargs, {"cwd": str(self.root / "src"), "runner": "search-runner"},
+        )
         self.assertFalse(hasattr(self.ctx, "children"))
         self.assertIsNone(self.ctx._host_rpc_client)
         options = self.session_options[0]["options"]
         self.assertIsInstance(options, ExecutionOptions)
         self.assertEqual(options.to_wire(), {
-            "provider": "openai", "model": "gpt-5.6-luna", "reasoningEffort": "none",
             "allowedTools": ["file_read", "grep_tool", "glob_tool"],
             "enableFSSearchTools": True, "noSkills": True,
         })
         self.assertEqual(self.launches[0]["command"], "kodelet")
         self.assertEqual(self.launches[0]["args"], [
-            "acp", "--provider=openai", "--model=gpt-5.6-luna", "--reasoning-effort=none",
+            "acp", "--runner", "search-runner",
             "--no-skills=true", '--allowed-tools="file_read","grep_tool","glob_tool"',
-            "--enable-fs-search-tools=true",
+            "--enable-fs-search-tools=true", "--profile=code-search",
         ])
         # No noExtensions flag: the inline prompt hook must remain attached.
         self.assertEqual(set(self.session_options[0]), {"profile", "options", "extensions"})
-        self.assertEqual(self.session_options[0]["profile"], "")
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
         await self.prompt_patch(5)
         new = next(row for row in self.peer.requests if row.get("method") == "session/new")
         self.assertEqual(new["params"], {
@@ -375,26 +382,36 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("responding", phases)
         self.assertEqual(list(self.root.iterdir()), [self.root / "src"])
 
-    async def test_parent_daemon_profile_reaches_acp_without_environment_override(self) -> None:
+    async def test_dedicated_profile_overrides_parent_and_environment_selection(self) -> None:
         with patch.object(self.ctx, "profile", "team-research"), patch.dict(
             os.environ, {"KODELET_PROFILE": "host-other"},
         ):
             result = await self.search(query="Find code")
         self.assertNotIn("error", result)
-        self.assertEqual(self.session_options[0]["profile"], "team-research")
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
         self.assertEqual(
             [arg for arg in self.launches[0]["args"] if arg.startswith("--profile=")],
-            ["--profile=team-research"],
+            ["--profile=code-search"],
         )
-        self.assertEqual(self.session_options[0]["options"].provider, "openai")
+        self.assertIsNone(self.session_options[0]["options"].provider)
         self.assertEqual(self.launches[0]["options"]["env"]["KODELET_PROFILE"], "host-other")
+        self.assertNotIn("reasoningEffort", self.session_options[0]["options"].to_wire())
+        self.assertFalse(
+            any(arg.startswith("--reasoning-effort") for arg in self.launches[0]["args"]),
+        )
 
-    async def test_absent_parent_profile_does_not_promote_host_environment_to_flag(self) -> None:
+    async def test_absent_parent_profile_still_selects_registered_search_profile(self) -> None:
         with patch.dict(os.environ, {"KODELET_PROFILE": "host-other"}):
             result = await self.search(query="Find code")
         self.assertNotIn("error", result)
-        self.assertEqual(self.session_options[0]["profile"], "")
-        self.assertFalse(any(arg.startswith("--profile") for arg in self.launches[0]["args"]))
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
+        self.assertIn("--profile=code-search", self.launches[0]["args"])
+
+    async def test_missing_runner_context_does_not_use_default_runner(self) -> None:
+        with patch.object(self.ctx, "runner_id", None):
+            result = await self.search(query="Find code")
+        self.assertIn("requires a runner-backed extension context", result["error"])
+        self.assertFalse(self.launches)
 
     async def test_parallel_tool_results_and_errors_before_summary_finishes(self) -> None:
         self.peer.events = [
@@ -442,7 +459,7 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_default_turn_budget_is_advisory_and_workspace_is_inherited(self) -> None:
         await self.search(query="Find code")
-        self.assertEqual(self.client_kwargs, {"cwd": str(self.root)})
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root), "runner": "search-runner"})
         self.assertNotIn("max_turns", self.session_options[0])
         self.assertNotIn("maxTurns", self.session_options[0]["options"].to_wire())
         self.assertFalse(any(arg.startswith("--max-turns") for arg in self.launches[0]["args"]))

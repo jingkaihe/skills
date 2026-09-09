@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.3.0,<0.4"]
+# dependencies = ["kodelet-sdk>=0.4.0,<0.5"]
 # ///
 
 from __future__ import annotations
