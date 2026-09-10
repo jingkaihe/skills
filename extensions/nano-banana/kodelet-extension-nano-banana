@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "google-genai",
-#   "kodelet-sdk>=0.5.0,<0.6",
+#   "kodelet-sdk>=0.5.1,<0.6",
 #   "pillow",
 # ]
 # ///
@@ -27,7 +27,7 @@ DESCRIPTION = (
     "Generate an image from a prompt using Google Gemini Nano Banana and save it "
     "under $HOME/.cache/nano-banana."
 )
-DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image"
 DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 CACHE_DIR = Path.home() / ".cache" / "nano-banana"
 VALID_ASPECT_RATIOS = {
@@ -63,7 +63,7 @@ class NanoBananaInput(BaseModel):
     )
     model: str | None = Field(
         default=None,
-        description="Optional Gemini image generation model. Defaults to gemini-3.1-flash-image-preview.",
+        description="Optional Gemini image generation model. Defaults to gemini-3.1-flash-image.",
     )
 
 
@@ -151,6 +151,14 @@ async def nano_banana(input: NanoBananaInput, _ctx: ToolContext) -> ToolExecutio
         content = f"Generated image saved to {output_path} using {model}."
         return {
             "content": content,
+            "attachments": [
+                {
+                    "type": "image",
+                    "path": str(output_path),
+                    "mimeType": "image/png",
+                    "alt": input.prompt.strip()[:1000],
+                }
+            ],
             "data": {"success": True, "image_path": str(output_path), "model": model},
         }
     except Exception as exc:

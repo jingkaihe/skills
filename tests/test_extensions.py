@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.5.0", "filetype", "google-genai", "pillow"]
+# dependencies = ["kodelet-sdk==0.5.1", "filetype", "google-genai", "pillow"]
 # ///
 
 """Run with `uv run --script tests/test_extensions.py`; no provider calls.
@@ -22,7 +22,7 @@ import unittest
 from importlib.metadata import distribution
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import kodelet_sdk
 from kodelet_sdk import Client, ToolContext, create_test_harness
@@ -158,10 +158,53 @@ class ACPProcess:
 
 
 class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
+    def test_nano_banana_uses_image_model_default_and_override(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
+        generate = module["generate_image"]
+        for model, expected in [(None, "gemini-3.1-flash-image"), (" custom-model ", "custom-model")]:
+            with self.subTest(model=model):
+                client = Mock()
+                output_path = Path("/runner/cache/generated.png")
+                save_image = Mock(return_value=output_path)
+                with patch.dict(generate.__globals__, {
+                    "build_client": Mock(return_value=client), "save_generated_image": save_image,
+                }):
+                    result = generate(module["NanoBananaInput"](prompt=" A drawing ", model=model))
+                self.assertEqual(result, (output_path, expected))
+                client.models.generate_content.assert_called_once()
+                self.assertEqual(client.models.generate_content.call_args.kwargs["model"], expected)
+                self.assertEqual(client.models.generate_content.call_args.kwargs["contents"], "A drawing")
+                save_image.assert_called_once_with(client.models.generate_content.return_value, "A drawing")
+
+    async def test_nano_banana_declares_image_attachment(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
+        handler = module["nano_banana"]
+        output_path = Path("/runner/cache/generated.png")
+        with patch.dict(handler.__globals__, {"generate_image": lambda _input: (output_path, "test-model")}):
+            harness = await create_test_harness(module["ext"])
+            result = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": " A drawing "}})
+            long_prompt = "  " + "\U0001f3a8" * 1500 + "  "
+            long_result = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": long_prompt}})
+        self.assertEqual(result["attachments"], [{
+            "type": "image", "path": str(output_path), "mimeType": "image/png", "alt": "A drawing",
+        }])
+        self.assertEqual(result["data"]["image_path"], str(output_path))
+        self.assertIn("test-model", result["content"])
+        self.assertEqual(long_result["attachments"], [{
+            "type": "image", "path": str(output_path), "mimeType": "image/png",
+            "alt": long_prompt.strip()[:1000],
+        }])
+        self.assertEqual(len(long_result["attachments"][0]["alt"]), 1000)
+        self.assertLess(len(long_result["attachments"][0]["alt"].encode("utf-8")), 4096)
+        self.assertEqual(long_result["data"], {
+            "success": True, "image_path": str(output_path), "model": "test-model",
+        })
+        self.assertEqual(long_result["content"], result["content"])
+
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.5.0")
+        self.assertEqual(package.version, "0.5.1")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -191,7 +234,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.5.0,<0.6", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.5.1,<0.6", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
