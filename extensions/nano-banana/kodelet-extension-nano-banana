@@ -24,8 +24,8 @@ from kodelet_sdk import BaseModel, Extension, Field, ToolContext, ToolExecutionR
 
 
 DESCRIPTION = (
-    "Generate an image from a prompt using Google Gemini Nano Banana and save it "
-    "under $HOME/.cache/nano-banana."
+    "Generate an image from a prompt using Google Gemini Nano Banana and return it "
+    "as an image attachment."
 )
 DEFAULT_MODEL = "gemini-3.1-flash-image"
 DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
@@ -105,7 +105,7 @@ def save_generated_image(response: Any, prompt: str) -> Path:
     raise RuntimeError("The model response did not contain an image.")
 
 
-def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
+def generate_image(input: NanoBananaInput) -> Path:
     prompt = input.prompt.strip()
     if not prompt:
         raise ValueError("Missing required parameter: prompt")
@@ -135,8 +135,7 @@ def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
         contents=prompt,
         config=config,
     )
-    output_path = save_generated_image(response, prompt)
-    return output_path, model
+    return save_generated_image(response, prompt)
 
 
 @ext.tool(
@@ -147,10 +146,9 @@ def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
 )
 async def nano_banana(input: NanoBananaInput, _ctx: ToolContext) -> ToolExecutionResult:
     try:
-        output_path, model = await asyncio.to_thread(generate_image, input)
-        content = f"Generated image saved to {output_path} using {model}."
+        output_path = await asyncio.to_thread(generate_image, input)
         return {
-            "content": content,
+            "content": "Generated image.",
             "attachments": [
                 {
                     "type": "image",
@@ -159,7 +157,7 @@ async def nano_banana(input: NanoBananaInput, _ctx: ToolContext) -> ToolExecutio
                     "alt": input.prompt.strip()[:1000],
                 }
             ],
-            "data": {"success": True, "image_path": str(output_path), "model": model},
+            "data": {"success": True},
         }
     except Exception as exc:
         message = f"Image generation failed: {exc}"

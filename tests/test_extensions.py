@@ -170,7 +170,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "build_client": Mock(return_value=client), "save_generated_image": save_image,
                 }):
                     result = generate(module["NanoBananaInput"](prompt=" A drawing ", model=model))
-                self.assertEqual(result, (output_path, expected))
+                self.assertEqual(result, output_path)
                 client.models.generate_content.assert_called_once()
                 self.assertEqual(client.models.generate_content.call_args.kwargs["model"], expected)
                 self.assertEqual(client.models.generate_content.call_args.kwargs["contents"], "A drawing")
@@ -180,7 +180,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
         module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
         handler = module["nano_banana"]
         output_path = Path("/runner/cache/generated.png")
-        with patch.dict(handler.__globals__, {"generate_image": lambda _input: (output_path, "test-model")}):
+        with patch.dict(handler.__globals__, {"generate_image": lambda _input: output_path}):
             harness = await create_test_harness(module["ext"])
             result = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": " A drawing "}})
             long_prompt = "  " + "\U0001f3a8" * 1500 + "  "
@@ -188,17 +188,18 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["attachments"], [{
             "type": "image", "path": str(output_path), "mimeType": "image/png", "alt": "A drawing",
         }])
-        self.assertEqual(result["data"]["image_path"], str(output_path))
-        self.assertIn("test-model", result["content"])
+        self.assertEqual(result["data"], {"success": True})
+        self.assertEqual(result["content"], "Generated image.")
+        self.assertNotIn(str(output_path), json.dumps({
+            key: value for key, value in result.items() if key != "attachments"
+        }), "The runner path must only appear in the host-ingested attachment")
         self.assertEqual(long_result["attachments"], [{
             "type": "image", "path": str(output_path), "mimeType": "image/png",
             "alt": long_prompt.strip()[:1000],
         }])
         self.assertEqual(len(long_result["attachments"][0]["alt"]), 1000)
         self.assertLess(len(long_result["attachments"][0]["alt"].encode("utf-8")), 4096)
-        self.assertEqual(long_result["data"], {
-            "success": True, "image_path": str(output_path), "model": "test-model",
-        })
+        self.assertEqual(long_result["data"], {"success": True})
         self.assertEqual(long_result["content"], result["content"])
 
     def test_sdk_distribution_and_transport_support(self) -> None:
