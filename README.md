@@ -17,15 +17,6 @@ A collection of CLI tool skill definitions for AI assistants.
 | [uv](./skills/uv/SKILL.md) | Astral uv usage for `uv run`, PEP 723 inline script dependencies, dependency compilation/locking, and `uv_build` backend setup |
 | [waitrose-cli](./skills/waitrose-cli/SKILL.md) | Manage Waitrose grocery shopping - trolley, product search, delivery slots, and orders |
 
-## Available Recipes
-
-| Recipe | Description |
-|--------|-------------|
-| [code/architect](./recipes/code/architect.md) | Analyzes codebase patterns and designs architectural solutions with implementation blueprints |
-| [code/reviewer](./recipes/code/reviewer.md) | Performs a comprehensive code review of changes with focus on quality, security, and best practices |
-| [ralph/init](./recipes/ralph/init.md) | Generate a PRD (Product Requirements Document) based on discussion and design docs for autonomous development |
-| [ralph/iterate](./recipes/ralph/iterate.md) | Iteratively work through a feature list, implementing one feature at a time with progress tracking |
-
 ## Available Extensions
 
 | Extension | Tools / Commands | Description |
