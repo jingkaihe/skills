@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.5.1", "filetype", "google-genai", "pillow"]
+# dependencies = ["kodelet-sdk==0.5.2", "filetype", "google-genai", "pillow"]
 # ///
 
 """Run with `uv run --script tests/test_extensions.py`; no provider calls.
@@ -78,6 +78,7 @@ class ACPProcess:
         self.prompt_error: str | None = None
         self.stop_reason = "end_turn"
         self.extension_version = 1
+        self.hierarchy_version = 1
         self.events = [
             tool_call("a", "grep_tool", {"pattern": "parser", "path": "."}),
             tool_result("a", "grep_tool", text="src/handler.go:20: parser"),
@@ -131,6 +132,7 @@ class ACPProcess:
         if method == "initialize":
             result = {"protocolVersion": 1, "_meta": {
                 "sessionExtensions": {"version": self.extension_version},
+                "conversationHierarchy": {"version": self.hierarchy_version},
             }}
         elif method == "session/new":
             self.loading.set()
@@ -205,7 +207,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.5.1")
+        self.assertEqual(package.version, "0.5.2")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -235,7 +237,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.5.1,<0.6", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.5.2,<0.6", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
@@ -320,10 +322,10 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.closed_clients: list[Client] = []
         self.close_started = asyncio.Event()
         self.responding = asyncio.Event()
-        self.ctx = ToolContext({"extension": {"cwd": str(self.root), "runnerId": "search-runner"}})
-        # The published SDK still has this namespace; the restored extension must not use it.
-        if hasattr(self.ctx, "children"):
-            delattr(self.ctx, "children")
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "search-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
 
         async def update(_content: str, data: dict[str, Any]) -> None:
             if data["taskRun"]["phase"] == "responding":
@@ -408,13 +410,19 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
             "acp", "--runner", "search-runner", "--profile=code-search",
         ])
         # No noExtensions flag: the inline prompt hook must remain attached.
-        self.assertEqual(set(self.session_options[0]), {"profile", "extensions"})
+        self.assertEqual(
+            set(self.session_options[0]), {"profile", "extensions", "parent_conversation_id"},
+        )
+        self.assertEqual(self.session_options[0]["parent_conversation_id"], "parent-conversation")
         self.assertEqual(self.session_options[0]["profile"], "code-search")
         await self.prompt_patch(5)
         new = next(row for row in self.peer.requests if row.get("method") == "session/new")
         self.assertEqual(new["params"], {
             "cwd": str(self.root / "src"),
-            "_meta": {"sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]}},
+            "_meta": {
+                "sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]},
+                "conversationHierarchy": {"version": 1, "parentConversationId": "parent-conversation"},
+            },
         })
         prompt = next(row for row in self.peer.requests if row.get("method") == "session/prompt")
         self.assertEqual(
@@ -583,6 +591,19 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessionExtensions", result["error"])
         self.assertFalse(self.peer.loading.is_set())
         self.assertEqual(len(self.launches), 1)
+
+    async def test_missing_hierarchy_capability_fails_without_fallback(self) -> None:
+        self.peer.hierarchy_version = 0
+        result = await self.search(query="find")
+        self.assertIn("conversationHierarchy", result["error"])
+        self.assertFalse(self.peer.loading.is_set())
+        self.assertEqual(len(self.launches), 1)
+
+    async def test_missing_parent_conversation_does_not_launch(self) -> None:
+        with patch.object(self.ctx, "conversation_id", None):
+            result = await self.search(query="find")
+        self.assertIn("requires a parent conversation", result["error"])
+        self.assertFalse(self.launches)
 
     async def test_timeout_closes_client_and_cancels_active_session(self) -> None:
         self.peer.allow_result.clear()

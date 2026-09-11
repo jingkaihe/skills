@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.5.1,<0.6"]
+# dependencies = ["kodelet-sdk>=0.5.2,<0.6"]
 # ///
 
 from __future__ import annotations
@@ -145,6 +145,7 @@ async def run_search_agent(
     progress: TaskProgress,
     *,
     runner: str,
+    parent_conversation_id: str,
 ) -> str:
     client = Client(cwd=str(search_cwd), runner=runner)
     try:
@@ -152,6 +153,7 @@ async def run_search_agent(
             session = await client.create_session(
                 profile=SEARCH_PROFILE,
                 extensions=[search_instructions(max_turns)],
+                parent_conversation_id=parent_conversation_id,
             )
             progress.attach(session)
             # Keep the turn budget advisory so tool use can finish with a summary.
@@ -211,8 +213,11 @@ async def code_search(input: CodeSearchInput, ctx: ToolContext) -> ToolExecution
     try:
         if not ctx.runner_id:
             raise RuntimeError("code_search requires a runner-backed extension context")
+        if not ctx.conversation_id:
+            raise RuntimeError("code_search requires a parent conversation")
         stdout = await run_search_agent(
             query, search_cwd, input.max_turns, progress, runner=ctx.runner_id,
+            parent_conversation_id=ctx.conversation_id,
         )
     except asyncio.CancelledError:
         await progress.finish(success=False, error="code_search cancelled")

@@ -47,8 +47,6 @@ Each skill is contained in its own directory with a `SKILL.md` file that provide
 - Command reference and usage examples
 - Common workflows and troubleshooting tips
 
-Extensions require Python 3.11+ and SDK 0.5.1. Code search also requires an updated daemon/runner with native profile configuration.
-
 Test extensions without provider calls: `uv run --script tests/test_extensions.py`.
 
 ## Installation
