@@ -12,6 +12,7 @@ A collection of CLI tool skill definitions for AI assistants.
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | Manage iCloud calendars, events, and email via the CLI |
 | [matchlock](./skills/matchlock/SKILL.md) | Run AI agents in ephemeral micro-VMs with VM-level isolation, network allowlisting, and secret injection - CLI, Go SDK, and Python SDK |
 | [schedule](./skills/schedule/SKILL.md) | Manage scheduled, background agentic tasks |
+| [screen-recording](./skills/screen-recording/SKILL.md) | Record terminal/browser demos with tmux, asciinema, Playwright or maco, lossless capture, FFmpeg, and visual playback checks |
 | [strix-halo-llm](./skills/strix-halo-llm/SKILL.md) | Run, benchmark, and serve local GGUF models on AMD Strix Halo using kyuz0 toolboxes, memory estimation, and reproducible podman commands |
 | [tmux](./skills/tmux/SKILL.md) | Run interactive CLIs and long-running tasks in isolated tmux sessions - manage session lifecycle, scrape pane output, and poll for patterns |
 | [uv](./skills/uv/SKILL.md) | Astral uv usage for `uv run`, PEP 723 inline script dependencies, dependency compilation/locking, and `uv_build` backend setup |
