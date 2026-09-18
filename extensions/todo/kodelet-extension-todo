@@ -217,15 +217,10 @@ def format_todos(todos: list[TodoItem]) -> str:
     return "\n".join(lines)
 
 
-def todo_presentation(todos: list[TodoItem]) -> ToolPresentation:
-    statistics = calculate_statistics(todos)
-    finished = statistics["completed"] + statistics["canceled"]
-    summary = f"Todos · {finished}/{statistics['total']} finished"
-    if statistics["in_progress"]:
-        summary += f" · {statistics['in_progress']} in progress"
-    if statistics["canceled"]:
-        summary += f" · {statistics['canceled']} canceled"
-
+def todo_presentation(
+    action: Literal["read", "write"], todos: list[TodoItem]
+) -> ToolPresentation:
+    summary = "Todo updated" if action == "write" else "Todo read"
     lines = []
     for todo in todos:
         # Keep each item on one line and display task text literally in Markdown.
@@ -325,7 +320,7 @@ async def publish_progress(
     try:
         await ctx.update(
             f"Todo progress: {finished}/{statistics['total']} finished",
-            {"todo": progress, "presentation": todo_presentation(todos)},
+            {"todo": progress, "presentation": todo_presentation(action, todos)},
         )
     except RuntimeError as exc:
         ctx.log.warn(f"failed to stream todo progress: {exc}")  # noqa: G010
@@ -382,7 +377,7 @@ async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionRes
         "content": format_todos(sorted_todos),
         "data": {
             **snapshot("read", path, sorted_todos),
-            "presentation": todo_presentation(todos),
+            "presentation": todo_presentation("read", todos),
         },
     }
 
@@ -415,7 +410,7 @@ async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionRe
         "content": "Todo list updated.",
         "data": {
             **snapshot("write", path, todos),
-            "presentation": todo_presentation(todos),
+            "presentation": todo_presentation("write", todos),
         },
     }
 

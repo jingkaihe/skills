@@ -343,7 +343,7 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
             {"content": "Replace widget", "status": "canceled", "priority": "low"},
         ]
         expected = {
-            "summary": "Todos · 2/4 finished · 1 in progress · 1 canceled",
+            "summary": "Todo updated",
             "body": (
                 "✓ ~~Inspect tools~~ · high priority  \n"
                 "**→ Improve presentation** · in progress · high priority  \n"
@@ -361,7 +361,8 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
         })
 
         read = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
-        self.assertEqual(read["data"]["presentation"], expected)
+        expected_read = {**expected, "summary": "Todo read"}
+        self.assertEqual(read["data"]["presentation"], expected_read)
         self.assertEqual(read["content"], (
             "Current todos:\nID\tStatus\tPriority\tContent\n"
             "1\tcanceled\tlow\tReplace widget\n"
@@ -370,19 +371,19 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
             "4\tpending\tmedium\tRun tests"
         ))
         self.assertEqual(self.updates.await_count, 2)
-        for call in self.updates.call_args_list:
-            self.assertEqual(call.args[1]["presentation"], expected)
+        for call, presentation in zip(self.updates.call_args_list, [expected, expected_read]):
+            self.assertEqual(call.args[1]["presentation"], presentation)
             self.assertEqual(call.args[1]["todo"]["statistics"], written["data"]["statistics"])
         self.assertEqual(self.widget.await_count, 2)
 
     async def test_terminal_lists_keep_presentation_after_widget_is_removed(self) -> None:
-        for status, suffix, icon in [("completed", "", "✓"), ("canceled", " · 1 canceled", "×")]:
+        for status, icon in [("completed", "✓"), ("canceled", "×")]:
             with self.subTest(status=status):
                 result = await self.write([
                     {"content": "Finish task", "status": status, "priority": "medium"},
                 ])
                 presentation = result["data"]["presentation"]
-                self.assertEqual(presentation["summary"], f"Todos · 1/1 finished{suffix}")
+                self.assertEqual(presentation["summary"], "Todo updated")
                 self.assertIn(f"{icon} ~~Finish task~~", presentation["body"])
                 self.widget.assert_awaited_with("todo-progress", None)
 
@@ -392,7 +393,7 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
             {"content": content, "status": "pending", "priority": "low"},
         ])
         self.assertEqual(result["data"]["presentation"], {
-            "summary": "Todos · 0/1 finished",
+            "summary": "Todo updated",
             "body": (
                 r"○ Keep \*\*literal\*\* \[link\]\(https://example\.com\) "
                 r"\- \<tag\> \&copy; \`code\` \~text\~ · low priority"
@@ -409,7 +410,7 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertNotIn("error", result)
         self.assertEqual(
-            result["data"]["presentation"]["summary"], "Todos · 0/1 finished · 1 in progress",
+            result["data"]["presentation"]["summary"], "Todo updated",
         )
 
     async def test_missing_list_does_not_claim_successful_progress(self) -> None:
