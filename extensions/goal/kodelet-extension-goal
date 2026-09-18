@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.5.2,<0.6"]
+# dependencies = ["kodelet-sdk>=0.5.3,<0.6"]
 # ///
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ async def restore_goal(event: AgentInitEvent, ctx: EventContext) -> EventResult 
     _can_continue.discard(key)
     # Run after ordinary tool-policy handlers. Older hosts omit allowedTools;
     # never auto-continue without proof that the model can stop the goal.
-    allowed_tools = event.get("allowedTools", [])
+    allowed_tools = event.allowedTools if "allowedTools" in event else None
     if not isinstance(allowed_tools, list) or "update_goal" not in allowed_tools:
         return None
     try:
