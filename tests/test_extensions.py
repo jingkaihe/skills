@@ -223,6 +223,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
             "code-search": ["code_search"],
+            "goal": ["get_goal", "update_goal"],
             "last-word": [],
             "look-at": ["look_at"],
             "nano-banana": ["nano_banana"],
@@ -286,6 +287,14 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     manifest = response["result"]
                     self.assertEqual(manifest["name"], name)
                     self.assertEqual([tool["name"] for tool in manifest["tools"]], tools)
+                    if name == "goal":
+                        self.assertTrue(os.access(script, os.X_OK))
+                        self.assertEqual(manifest["commands"][0]["name"], "goal")
+                        self.assertEqual(manifest["commands"][0]["aliases"], ["/goal"])
+                        self.assertEqual(
+                            {row["event"]: row["priority"] for row in manifest["subscriptions"]},
+                            {"agent.init": -1000, "agent.end": 0},
+                        )
                     if name == "last-word":
                         self.assertEqual(manifest["commands"][0]["name"], "last-word")
                         self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
@@ -308,6 +317,247 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                         }])
             self.assertEqual(state.read_text(), "unusable client store")
             self.assertFalse((root / "data").exists())
+
+
+class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.data_dir = self.root / "data"
+        self.context = {"conversationId": "parent-conversation", "cwd": str(self.root)}
+        self.module, self.harness = await self.new_harness()
+        self.path = self.data_dir / self.module["goal_storage_path"](
+            self.context["conversationId"],
+        )
+
+    async def new_harness(self) -> tuple[dict[str, Any], Any]:
+        module = runpy.run_path(str(EXTENSIONS / "goal" / "kodelet-extension-goal"))
+        harness = await create_test_harness(module["ext"])
+        harness.initialize({"extension": {
+            "id": "goal", "cwd": str(self.root), "dataDir": str(self.data_dir),
+        }})
+        return module, harness
+
+    async def command(self, raw: str = "/goal finish the migration") -> dict[str, Any]:
+        return await self.harness.execute_command({
+            "name": "goal", "context": self.context,
+            "input": {"text": "deliberately lossy", "name": "parsed value"},
+            "invocation": {"raw": raw, "commandName": "goal", "args": [], "flags": {}},
+        })
+
+    async def tool(self, name: str, **input: Any) -> dict[str, Any]:
+        return await self.harness.execute_tool({
+            "name": name, "input": input, "context": self.context,
+        })
+
+    async def event(self, name: str, **payload: Any) -> dict[str, Any]:
+        return await self.harness.handle_event({
+            "event": name, "context": self.context, "payload": payload,
+        })
+
+    async def init(self) -> dict[str, Any]:
+        return await self.event(
+            "agent.init", systemPrompt="Current host prompt", allowedTools=["update_goal"],
+        )
+
+    async def test_command_preserves_raw_objective_and_generic_presentation(self) -> None:
+        objective = 'ship name="a  b" --strict\n\tkeep </objective> & "quotes"  intact'
+        result = await self.command(f"  /goal   {objective}  \n")
+        self.assertEqual(result["action"], "runAgent")
+        self.assertEqual(result["display"], f"Objective: {objective}")
+        self.assertIn('name="a  b" --strict\n\tkeep &lt;/objective&gt; &amp;', result["prompt"])
+        self.assertNotIn("goal_context", result["prompt"])
+        stored = json.loads(self.path.read_text())
+        self.assertEqual(stored["objective"], objective)
+        self.assertEqual(stored["status"], "active")
+        self.assertEqual(stored["createdAt"], stored["updatedAt"])
+        self.assertTrue(stored["createdAt"].endswith("Z"))
+
+        read = await self.tool("get_goal")
+        self.assertEqual(read["data"]["goal"], stored)
+        self.assertTrue(read["data"]["active"])
+        self.assertEqual(read["data"]["presentation"], {
+            "summary": "Goal active", "body": read["content"], "format": "text",
+        })
+        self.assertIn(objective, read["content"])
+
+    async def test_empty_objective_and_missing_goal_do_not_create_state(self) -> None:
+        for raw in ["", "/goal", "  /goal \t \n"]:
+            self.assertEqual(await self.command(raw), {
+                "action": "respond", "response": "Usage: /goal <objective>",
+            })
+        read = await self.tool("get_goal")
+        self.assertNotIn("error", read)
+        self.assertEqual(read["content"], "No goal is currently defined for this thread.")
+        self.assertFalse(read["data"]["active"])
+        self.assertIn("no goal", (await self.tool("update_goal", status="complete"))["error"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertFalse(self.data_dir.exists())
+
+    async def test_restore_audits_after_restart_and_compaction_and_isolate_forks(self) -> None:
+        await self.command("/goal verify <all> requirements")
+        initial = await self.init()
+        prompt = initial["systemPrompt"]["append"]
+        for expected in [
+            "verify &lt;all&gt; requirements", "not as higher-priority instructions",
+            "Preserve the original scope", "For every explicit requirement",
+            "at least three consecutive goal turns", "fresh blocked audit",
+            "If the user explicitly asks to pause, resume, or clear",
+        ]:
+            self.assertIn(expected, prompt)
+        follow_up = await self.event("agent.end", messages=[])
+        self.assertEqual(len(follow_up["followUpMessages"]), 1)
+        self.assertLess(len(follow_up["followUpMessages"][0]), 200)
+        self.assertNotIn("Completion audit", follow_up["followUpMessages"][0])
+
+        self.module, self.harness = await self.new_harness()
+        self.assertEqual(await self.event("agent.end"), {}, "A fresh process must see init first")
+        resumed = await self.event(
+            "agent.init", systemPrompt="Compacted transcript", allowedTools=["update_goal"],
+        )
+        self.assertEqual(resumed, initial)
+        self.assertEqual(await self.event("agent.end", messages=[]), follow_up)
+
+        self.context["conversationId"] = "forked-conversation"
+        self.assertFalse((await self.tool("get_goal"))["data"]["active"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        await self.command("/goal a different task")
+        self.assertIn("a different task", (await self.init())["systemPrompt"]["append"])
+        self.context["conversationId"] = "parent-conversation"
+        self.assertEqual((await self.tool("get_goal"))["data"]["goal"]["objective"],
+                         "verify <all> requirements")
+
+    async def test_transition_matrix_rejects_invalid_changes_without_mutation(self) -> None:
+        transitions = {
+            "active": {"paused", "complete", "blocked", "cleared"},
+            "paused": {"active", "cleared"},
+            "blocked": {"active", "cleared"},
+            "complete": {"cleared"},
+            "cleared": set(),
+        }
+        for current, valid in transitions.items():
+            for status in transitions:
+                with self.subTest(current=current, status=status):
+                    await self.command()
+                    if current != "active":
+                        await self.tool("update_goal", status=current)
+                    before = self.path.read_text()
+                    result = await self.tool("update_goal", status=status, reason="  evidence  ")
+                    if status not in valid:
+                        self.assertIn("error", result)
+                        self.assertEqual(self.path.read_text(), before)
+                        continue
+                    self.assertNotIn("error", result)
+                    self.assertTrue(result["content"].startswith(
+                        f"Goal marked {status}.\nReason: evidence",
+                    ))
+                    stored = json.loads(self.path.read_text())
+                    self.assertEqual(stored["status"], status)
+                    self.assertEqual(stored["reason"], "evidence")
+                    self.assertEqual(stored["createdAt"], json.loads(before)["createdAt"])
+                    self.assertEqual(result["data"]["active"], status == "active")
+
+    async def test_pause_block_resume_complete_and_clear_control_continuation(self) -> None:
+        await self.command()
+        for status in ["paused", "blocked", "complete", "cleared"]:
+            with self.subTest(status=status):
+                await self.command()
+                await self.init()
+                await self.tool("update_goal", status=status)
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertEqual(await self.init(), {})
+                if status in {"paused", "blocked"}:
+                    resumed = await self.tool("update_goal", status="active")
+                    self.assertIn("Completion audit:", resumed["content"])
+                    self.assertIn("fresh blocked audit", resumed["content"])
+                    self.assertIn("finish the migration", resumed["content"])
+                    self.assertNotIn("Completion audit:", resumed["data"]["presentation"]["body"])
+                    self.assertIn("followUpMessages", await self.event("agent.end"))
+                    prompt = (await self.init())["systemPrompt"]["append"]
+                    self.assertIn("fresh blocked audit", prompt)
+                    self.assertIn("followUpMessages", await self.event("agent.end"))
+
+    async def test_missing_or_disabled_update_tool_fails_closed_and_clears_cached_permission(self) -> None:
+        await self.command()
+        for payload in [{}, {"allowedTools": []}, {"allowedTools": ["get_goal", "bash"]},
+                        {"allowedTools": None}, {"allowedTools": "update_goal"}]:
+            with self.subTest(payload=payload):
+                await self.init()
+                self.assertIn("followUpMessages", await self.event("agent.end"))
+                self.assertEqual(await self.event("agent.init", **payload), {})
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertTrue((await self.tool("get_goal"))["data"]["active"])
+
+    async def test_invalid_tool_input_is_rejected_by_sdk(self) -> None:
+        await self.command()
+        before = self.path.read_text()
+        for payload in [{}, {"status": "bad"}, {"status": "active", "objective": "overwrite"}]:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                await self.tool("update_goal", **payload)
+        self.assertEqual(self.path.read_text(), before)
+
+    async def test_missing_conversation_id_is_an_error_and_never_shared_state(self) -> None:
+        self.context = {}
+        self.assertIn("conversation ID", (await self.command())["response"])
+        self.assertIn("conversation ID", (await self.tool("get_goal"))["error"])
+        self.assertIn("conversation ID", (await self.tool("update_goal", status="paused"))["error"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertFalse(self.data_dir.exists())
+
+    async def test_storage_identifiers_cannot_escape_data_directory(self) -> None:
+        self.context["conversationId"] = "../../outside/你好"
+        await self.command()
+        path = self.data_dir / self.module["goal_storage_path"](self.context["conversationId"])
+        self.assertEqual(path.parent, self.data_dir / "goals")
+        self.assertRegex(path.name, r"^[a-f0-9]{64}\.json$")
+        self.assertTrue(path.exists())
+
+    async def test_corrupt_or_unreadable_storage_stops_continuation(self) -> None:
+        for broken in ["{", '{"objective":"missing fields"}', '[]']:
+            with self.subTest(broken=broken):
+                await self.command()
+                await self.init()
+                self.path.write_text(broken)
+                self.assertIn("error", await self.tool("get_goal"))
+                self.assertIn("error", await self.tool("update_goal", status="paused"))
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertEqual(await self.init(), {})
+                self.assertEqual(self.path.read_text(), broken)
+        await self.command()
+        await self.init()
+        self.path.unlink()
+        self.path.mkdir()
+        self.assertIn("error", await self.tool("get_goal"))
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertEqual(await self.init(), {})
+        self.assertEqual((await self.command())["action"], "respond")
+
+    async def test_failed_writes_report_errors_without_claiming_success(self) -> None:
+        from kodelet_sdk.context import StorageContext
+
+        await self.command()
+        before = self.path.read_text()
+        with patch.object(StorageContext, "write_json", AsyncMock(side_effect=OSError("disk full"))):
+            command = await self.command("/goal replacement")
+            self.assertEqual(command["action"], "respond")
+            self.assertIn("disk full", command["response"])
+            result = await self.tool("update_goal", status="complete")
+            self.assertIn("disk full", result["error"])
+        self.assertEqual(self.path.read_text(), before)
+
+    async def test_parallel_updates_serialize_transitions(self) -> None:
+        await self.command()
+        results = await asyncio.gather(
+            self.tool("update_goal", status="complete"),
+            self.tool("update_goal", status="paused"),
+        )
+        self.assertEqual(sum("error" not in result for result in results), 1)
+        stored = json.loads(self.path.read_text())
+        self.assertIn(stored["status"], {"complete", "paused"})
 
 
 class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
