@@ -310,6 +310,115 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "data").exists())
 
 
+class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.module = runpy.run_path(str(EXTENSIONS / "todo" / "kodelet-extension-todo"))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "test-todos.json"
+        env = patch.dict(os.environ, CUSTOM_TOOL_TODO_DIR=directory.name)
+        env.start()
+        self.addCleanup(env.stop)
+        self.ctx = ToolContext(None, {"conversationId": "test-todos"})
+        self.updates = AsyncMock()
+        self.widget = AsyncMock()
+        for target, attribute, replacement in [
+            (self.ctx, "update", self.updates),
+            (self.ctx.ui, "set_widget", self.widget),
+        ]:
+            patched = patch.object(target, attribute, replacement)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    async def write(self, todos: list[dict[str, str]]) -> dict[str, Any]:
+        return await self.module["todo_write"](
+            self.module["TodoWriteInput"](todos=todos), self.ctx,
+        )
+
+    async def test_read_write_and_live_updates_share_checklist_in_plan_order(self) -> None:
+        todos = [
+            {"content": "Inspect tools", "status": "completed", "priority": "high"},
+            {"content": "Improve presentation", "status": "in_progress", "priority": "high"},
+            {"content": "Run tests", "status": "pending", "priority": "medium"},
+            {"content": "Replace widget", "status": "canceled", "priority": "low"},
+        ]
+        expected = {
+            "summary": "Todos · 2/4 finished · 1 in progress · 1 canceled",
+            "body": (
+                "✓ ~~Inspect tools~~ · high priority  \n"
+                "**→ Improve presentation** · in progress · high priority  \n"
+                "○ Run tests · medium priority  \n"
+                "× ~~Replace widget~~ · canceled · low priority"
+            ),
+            "format": "markdown",
+        }
+        written = await self.write(todos)
+        self.assertEqual(written["content"], "Todo list updated.")
+        self.assertEqual(written["data"]["presentation"], expected)
+        self.assertEqual(json.loads(self.path.read_text()), {"todos": todos})
+        self.assertEqual(written["data"]["statistics"], {
+            "total": 4, "completed": 1, "in_progress": 1, "pending": 1, "canceled": 1,
+        })
+
+        read = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
+        self.assertEqual(read["data"]["presentation"], expected)
+        self.assertEqual(read["content"], (
+            "Current todos:\nID\tStatus\tPriority\tContent\n"
+            "1\tcanceled\tlow\tReplace widget\n"
+            "2\tcompleted\thigh\tInspect tools\n"
+            "3\tin_progress\thigh\tImprove presentation\n"
+            "4\tpending\tmedium\tRun tests"
+        ))
+        self.assertEqual(self.updates.await_count, 2)
+        for call in self.updates.call_args_list:
+            self.assertEqual(call.args[1]["presentation"], expected)
+            self.assertEqual(call.args[1]["todo"]["statistics"], written["data"]["statistics"])
+        self.assertEqual(self.widget.await_count, 2)
+
+    async def test_terminal_lists_keep_presentation_after_widget_is_removed(self) -> None:
+        for status, suffix, icon in [("completed", "", "✓"), ("canceled", " · 1 canceled", "×")]:
+            with self.subTest(status=status):
+                result = await self.write([
+                    {"content": "Finish task", "status": status, "priority": "medium"},
+                ])
+                presentation = result["data"]["presentation"]
+                self.assertEqual(presentation["summary"], f"Todos · 1/1 finished{suffix}")
+                self.assertIn(f"{icon} ~~Finish task~~", presentation["body"])
+                self.widget.assert_awaited_with("todo-progress", None)
+
+    async def test_task_text_cannot_change_checklist_markdown(self) -> None:
+        content = "Keep **literal** [link](https://example.com)\n- <tag> &copy; `code` ~text~"
+        result = await self.write([
+            {"content": content, "status": "pending", "priority": "low"},
+        ])
+        self.assertEqual(result["data"]["presentation"], {
+            "summary": "Todos · 0/1 finished",
+            "body": (
+                r"○ Keep \*\*literal\*\* \[link\]\(https://example\.com\) "
+                r"\- \<tag\> \&copy; \`code\` \~text\~ · low priority"
+            ),
+            "format": "markdown",
+        })
+        self.assertEqual(result["data"]["todos"][0]["content"], content)
+
+    async def test_presentation_survives_unavailable_live_ui(self) -> None:
+        self.updates.side_effect = RuntimeError("disconnected")
+        self.widget.side_effect = RuntimeError("disconnected")
+        result = await self.write([
+            {"content": "Work offline", "status": "in_progress", "priority": "high"},
+        ])
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            result["data"]["presentation"]["summary"], "Todos · 0/1 finished · 1 in progress",
+        )
+
+    async def test_missing_list_does_not_claim_successful_progress(self) -> None:
+        result = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
+        self.assertIn("todo file not found", result["error"])
+        self.assertNotIn("presentation", result["data"])
+        self.updates.assert_not_awaited()
+
+
 class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()

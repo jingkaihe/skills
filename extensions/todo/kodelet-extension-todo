@@ -23,6 +23,7 @@ from kodelet_sdk import (
     SessionStartEvent,
     ToolContext,
     ToolExecutionResult,
+    ToolPresentation,
     UIFrameLine,
     UIStyledSpan,
 )
@@ -216,6 +217,35 @@ def format_todos(todos: list[TodoItem]) -> str:
     return "\n".join(lines)
 
 
+def todo_presentation(todos: list[TodoItem]) -> ToolPresentation:
+    statistics = calculate_statistics(todos)
+    finished = statistics["completed"] + statistics["canceled"]
+    summary = f"Todos · {finished}/{statistics['total']} finished"
+    if statistics["in_progress"]:
+        summary += f" · {statistics['in_progress']} in progress"
+    if statistics["canceled"]:
+        summary += f" · {statistics['canceled']} canceled"
+
+    lines = []
+    for todo in todos:
+        # Keep each item on one line and display task text literally in Markdown.
+        content = re.sub(
+            r"([\\`*_{}\[\]()<>#+.!|~&-])", r"\\\1", " ".join(todo.content.split())
+        )
+        if todo.status == "in_progress":
+            content = f"**→ {content}** · in progress"
+        elif todo.status == "completed":
+            content = f"✓ ~~{content}~~"
+        elif todo.status == "canceled":
+            content = f"× ~~{content}~~ · canceled"
+        else:
+            content = f"○ {content}"
+        lines.append(f"{content} · {todo.priority} priority")
+
+    # Markdown hard breaks keep the status-marked rows separate without bullets.
+    return {"summary": summary, "body": "  \n".join(lines), "format": "markdown"}
+
+
 def all_todos_finished(todos: list[TodoItem]) -> bool:
     return bool(todos) and all(todo.status in TERMINAL_STATUSES for todo in todos)
 
@@ -295,7 +325,7 @@ async def publish_progress(
     try:
         await ctx.update(
             f"Todo progress: {finished}/{statistics['total']} finished",
-            {"todo": progress},
+            {"todo": progress, "presentation": todo_presentation(todos)},
         )
     except RuntimeError as exc:
         ctx.log.warn(f"failed to stream todo progress: {exc}")  # noqa: G010
@@ -350,7 +380,10 @@ async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionRes
         await publish_progress(ctx, "read", path, todos)
     return {
         "content": format_todos(sorted_todos),
-        "data": snapshot("read", path, sorted_todos),
+        "data": {
+            **snapshot("read", path, sorted_todos),
+            "presentation": todo_presentation(todos),
+        },
     }
 
 
@@ -380,7 +413,10 @@ async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionRe
         await publish_progress(ctx, "write", path, todos)
     return {
         "content": "Todo list updated.",
-        "data": snapshot("write", path, todos),
+        "data": {
+            **snapshot("write", path, todos),
+            "presentation": todo_presentation(todos),
+        },
     }
 
 
