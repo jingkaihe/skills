@@ -1181,10 +1181,7 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
                 text = prompt["params"]["prompt"][0]["text"]
                 self.assertLess(len(text), 1000, "transcript must never be embedded in the prompt")
                 self.assertNotIn("untrusted archived tool output", text)
-                self.assertEqual(json.loads(text), {
-                    "conversation_id": "parent-conversation", "goal": "What changed?",
-                    "transcript_path": str(transcript), "transcript_bytes": size + len(tail),
-                })
+                self.assertEqual(text, f"goal: What changed?\n\ntranscript can be found at {transcript}")
             finally:
                 self.peer.allow_result.set()
                 result = await task

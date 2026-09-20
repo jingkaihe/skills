@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
 import textwrap
 from contextlib import suppress
@@ -112,6 +111,7 @@ def build_sysprompt_text(max_turns: int) -> str:
         - Always finish with a concise final assistant message answering the goal.
         - Preserve exact technical details and relevant snippets when supported.
         - Cite concrete evidence as `conversation <id>, transcript lines <start>-<end>`.
+          Get the conversation ID from the transcript header.
           These refer to the exported snapshot's line numbers, not source-code lines.
           Never cite temporary file paths or file:// links; the transcript is deleted.
         - Clearly report truncation, unverified facts, missing evidence, and uncertainty.
@@ -140,7 +140,7 @@ def read_instructions(max_turns: int) -> Extension:
     return instructions
 
 
-async def export_transcript(conversation_id: str, transcript: Path, cwd: str) -> int:
+async def export_transcript(conversation_id: str, transcript: Path, cwd: str) -> None:
     # Both streams go straight to disk, never through an unbounded PIPE/communicate.
     # Inherit the runner's KODELET_SERVER/auth configuration; do not access a local DB.
     with transcript.open("wb") as stdout, transcript.with_suffix(".stderr").open("w+b") as stderr:
@@ -184,10 +184,8 @@ async def export_transcript(conversation_id: str, transcript: Path, cwd: str) ->
                 f"stderr tail: {detail or '(empty)'}"
             )
 
-    size = transcript.stat().st_size
-    if not size:
+    if not transcript.stat().st_size:
         raise RuntimeError("conversation export returned an empty transcript")
-    return size
 
 
 async def run_read_agent(
@@ -263,11 +261,8 @@ async def read_conversation(input: ReadConversationInput, ctx: ToolContext) -> T
         # mkdtemp creates a private directory. It outlives exporter and child cleanup.
         with tempfile.TemporaryDirectory(prefix="kodelet-read-conversation-") as directory:
             transcript = Path(directory) / "transcript.md"
-            size = await export_transcript(conversation_id, transcript, ctx.cwd)
-            query = json.dumps({
-                "conversation_id": conversation_id, "goal": goal,
-                "transcript_path": str(transcript), "transcript_bytes": size,
-            })
+            await export_transcript(conversation_id, transcript, ctx.cwd)
+            query = f"goal: {goal}\n\ntranscript can be found at {transcript}"
             content = await run_read_agent(
                 query, ctx.cwd, input.max_turns, progress, runner=ctx.runner_id,
                 parent_conversation_id=ctx.conversation_id,
