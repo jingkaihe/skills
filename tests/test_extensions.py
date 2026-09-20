@@ -31,6 +31,7 @@ from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
+READ = runpy.run_path(str(EXTENSIONS / "read-conversation" / "kodelet-extension-read-conversation"))
 
 
 def tool_call(call_id: str, name: str, tool_input: Any) -> dict[str, Any]:
@@ -227,6 +228,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             "last-word": [],
             "look-at": ["look_at"],
             "nano-banana": ["nano_banana"],
+            "read-conversation": ["read_conversation"],
             "todo": ["todo_read", "todo_write"],
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -298,9 +300,10 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     if name == "last-word":
                         self.assertEqual(manifest["commands"][0]["name"], "last-word")
                         self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
-                    if name == "code-search":
+                    if name in {"code-search", "read-conversation"}:
+                        self.assertTrue(os.access(script, os.X_OK))
                         self.assertEqual(manifest["profiles"], [{
-                            "name": "code-search", "hidden": True,
+                            "name": name, "hidden": True,
                             "options": {
                                 "provider": "openai",
                                 "model": "gpt-5.6-luna",
@@ -310,7 +313,9 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                                     "platform": "codex",
                                     "service_tier": "fast",
                                 },
-                                "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
+                                "allowed_tools": ["file_read", "grep_tool"] + (
+                                    ["glob_tool"] if name == "code-search" else []
+                                ),
                                 "enable_fs_search_tools": True,
                                 "skills": {"enabled": False},
                             },
@@ -1058,6 +1063,278 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
             await self.assert_repeated_cancellation_waits_for_cleanup(task)
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "read-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
+        self.peer = ACPProcess()
+        self.peer.events = [
+            tool_call("a", "file_read", {"file_path": "transcript.md", "line_limit": 100}),
+            tool_result("a", "file_read", text="1: Evidence"),
+            message("  Reverted: conversation parent-conversation, transcript lines 1-3.  "),
+        ]
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.exporters: list[asyncio.subprocess.Process] = []
+        self.transcripts: list[Path] = []
+        self.clients: list[Client] = []
+        self.closed_clients: list[Client] = []
+        self.export_started = asyncio.Event()
+        self.allow_export_return = asyncio.Event()
+        self.allow_export_return.set()
+        self.export_program = "print('# Archived\\noriginal change\\n# Active\\nreverted change')"
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.client_kwargs = kwargs
+                owner.clients.append(self)
+                super().__init__(spawn=owner.spawn_agent, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                owner.assertTrue(owner.transcripts[-1].exists())
+                await super().close()
+                owner.assertTrue(owner.transcripts[-1].exists(), "cleanup must follow child close")
+                owner.closed_clients.append(self)
+
+        self.real_spawn = asyncio.create_subprocess_exec
+        self.updates = AsyncMock()
+        for replacement in [
+            patch.dict(READ["run_read_agent"].__globals__, Client=RecordingClient),
+            patch("asyncio.create_subprocess_exec", side_effect=self.spawn_exporter),
+            patch.object(self.ctx, "update", self.updates),
+        ]:
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    async def spawn_exporter(self, *args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        self.export_args, self.export_kwargs = args, kwargs
+        transcript = Path(kwargs["stdout"].name)
+        self.transcripts.append(transcript)
+        self.assertEqual(transcript.parent.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(kwargs["stderr"].seekable(), "stderr must be a file, not a PIPE")
+        process = await self.real_spawn(sys.executable, "-c", self.export_program, **kwargs)
+        self.exporters.append(process)
+        self.export_started.set()
+        await self.allow_export_return.wait()
+        return process
+
+    def spawn_agent(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({"command": command, "args": list(args), "options": options})
+        self.assertEqual(self.exporters[-1].returncode, 0, "export must finish before child starts")
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        self.peer.kill()
+        await self.peer.wait()
+        for process in self.exporters:
+            self.assertIsNotNone(process.returncode, "exporter must be reaped")
+        self.assertEqual(self.closed_clients, self.clients)
+        for client in self.clients:
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        for transcript in self.transcripts:
+            self.assertFalse(transcript.parent.exists(), "all temporary files must be removed")
+
+    async def read(self, **kwargs: Any) -> dict[str, Any]:
+        return await READ["read_conversation"](READ["ReadConversationInput"](**{
+            "conversation_id": "parent-conversation", "goal": " What changed? ", **kwargs,
+        }), self.ctx)
+
+    async def test_large_current_snapshot_stays_on_disk_with_profile_progress_and_callback(self) -> None:
+        self.export_program = (
+            "import sys; sys.stdout.buffer.write(b'# Archived\\n' + "
+            "b'untrusted archived tool output\\n' * 300_000 + b'x' * 5000 + "
+            "b'\\n# Active\\nreverted change\\n')"
+        )
+        self.peer.allow_result.clear()
+        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(
+            os.environ, KODELET_PROFILE="other", KODELET_SERVER="http://saved-history",
+            KODELET_AUTH_TOKEN="inherited-test-token",
+        ):
+            task = asyncio.create_task(self.read(max_turns=7))
+            try:
+                await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=3)
+                transcript = self.transcripts[-1]
+                size = len(b'# Archived\n') + 300_000 * len(b'untrusted archived tool output\n')
+                tail = b'x' * 5000 + b'\n# Active\nreverted change\n'
+                self.assertEqual(transcript.stat().st_size, size + len(tail))
+                with transcript.open("rb") as stream:
+                    self.assertEqual(stream.read(11), b'# Archived\n')
+                    stream.seek(-len(tail), 2)
+                    self.assertEqual(stream.read(), tail, "long tool results must not be truncated")
+                prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
+                text = prompt["params"]["prompt"][0]["text"]
+                self.assertLess(len(text), 1000, "transcript must never be embedded in the prompt")
+                self.assertNotIn("untrusted archived tool output", text)
+                self.assertEqual(json.loads(text), {
+                    "conversation_id": "parent-conversation", "goal": "What changed?",
+                    "transcript_path": str(transcript), "transcript_bytes": size + len(tail),
+                })
+            finally:
+                self.peer.allow_result.set()
+                result = await task
+        self.assertNotIn("error", result)
+        self.assertIn("conversation parent-conversation, transcript lines 1-3", result["content"])
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root), "runner": "read-runner"})
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "read-runner", "--profile=read-conversation",
+        ])
+        env = self.launches[0]["options"]["env"]
+        self.assertEqual(env["KODELET_SERVER"], "http://saved-history")
+        self.assertEqual(env["KODELET_AUTH_TOKEN"], "inherited-test-token")
+        options = self.session_options[0]
+        self.assertEqual(set(options), {"profile", "extensions", "parent_conversation_id"})
+        self.assertEqual(options["parent_conversation_id"], "parent-conversation")
+        self.assertEqual(options["profile"], "read-conversation")
+        new = next(row for row in self.peer.requests if row["method"] == "session/new")
+        self.assertEqual(new["params"]["cwd"], str(self.root))
+        self.assertEqual(new["params"]["_meta"]["conversationHierarchy"]["parentConversationId"],
+                         "parent-conversation")
+        harness = await create_test_harness(options["extensions"][0])
+        callback = await harness.handle_event({"event": "agent.init", "payload": {
+            "allowedTools": ["file_read", "grep_tool", "glob_tool", "bash", "read_conversation"],
+        }})
+        self.assertEqual(callback["tools"], {
+            "disable": ["glob_tool", "bash", "read_conversation"],
+            "enable": ["file_read", "grep_tool"],
+        })
+        instructions = callback["systemPrompt"]["append"]
+        self.assertEqual(instructions, READ["build_sysprompt_text"](7))
+        for evidence in ["7 turns", "100-200 lines", "untrusted historical data",
+                         "orientation only", "reverts", "attempts, not successes",
+                         "transcript lines", "Never cite temporary", "unverified facts"]:
+            self.assertIn(evidence, instructions)
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["kind"], "read_conversation")
+        self.assertEqual(progress["task"], "What changed?")
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
+        self.assertIn("working", phases)
+        self.assertIn("responding", phases)
+
+    async def test_export_argv_is_literal_and_defaults_are_advisory(self) -> None:
+        conversation_id = "--help;$(touch unsafe)"
+        self.assertNotIn("error", await self.read(conversation_id=conversation_id))
+        self.assertEqual(self.export_args, (
+            "kodelet", "conversation", "show", "--format", "markdown", "--", conversation_id,
+        ))
+        self.assertEqual(set(self.export_kwargs), {"cwd", "stdin", "stdout", "stderr"})
+        self.assertEqual(self.export_kwargs["cwd"], str(self.root))
+        self.assertEqual(self.export_kwargs["stdin"], asyncio.subprocess.DEVNULL)
+        self.assertEqual(READ["ReadConversationInput"](conversation_id="id", goal="g").max_turns, 12)
+        self.assertNotIn("max_turns", self.session_options[0])
+
+    async def test_invalid_input_or_missing_parent_context_never_exports(self) -> None:
+        for value in [{"conversation_id": " "}, {"goal": " "}]:
+            self.assertIn("non-empty", (await self.read(**value))["error"])
+        for field, expected in [("runner_id", "runner-backed"), ("conversation_id", "parent conversation")]:
+            with patch.object(self.ctx, field, None):
+                self.assertIn(expected, (await self.read())["error"])
+        self.assertFalse(self.transcripts)
+        self.assertFalse(self.clients)
+
+    async def test_export_failure_discards_partial_file_and_bounds_stderr(self) -> None:
+        self.export_program = (
+            "import sys; print('partial transcript'); "
+            "sys.stderr.write('ignored prefix' + 'x' * 100_000 + 'response exceeds 64 MiB'); "
+            "sys.exit(1)"
+        )
+        result = await self.read()
+        self.assertIn("partial transcript discarded", result["error"])
+        self.assertIn("response exceeds 64 MiB", result["error"])
+        self.assertNotIn("ignored prefix", result["error"])
+        self.assertLess(len(result["error"]), READ["ERROR_TAIL_BYTES"] + 200)
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.clients)
+
+    async def test_empty_export_and_missing_cli_fail_without_child(self) -> None:
+        self.export_program = "pass"
+        self.assertIn("empty transcript", (await self.read())["error"])
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("missing kodelet")):
+            self.assertIn("missing kodelet", (await self.read())["error"])
+        self.assertFalse(self.clients)
+
+    async def test_child_failures_never_return_partial_success(self) -> None:
+        for field, value, expected in [
+            ("init_error", "runner unavailable", "runner unavailable"),
+            ("prompt_error", "provider failed", "provider failed"),
+            ("stop_reason", "cancelled", "was canceled"),
+            ("events", [message("  ")], "empty response"),
+        ]:
+            with self.subTest(field=field):
+                self.peer = ACPProcess()
+                setattr(self.peer, field, value)
+                result = await self.read()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("Found src", result["content"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_export_timeout_kills_and_reaps_without_child(self) -> None:
+        self.export_program = "import time; time.sleep(60)"
+        with patch.dict(READ["export_transcript"].__globals__, EXPORT_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out exporting", (await self.read())["error"])
+        self.assertEqual(self.exporters[0].returncode, -9)
+        self.assertFalse(self.clients)
+
+    async def test_child_timeout_cancels_session_and_cleans_transcript(self) -> None:
+        self.peer.allow_result.clear()
+        with patch.dict(READ["run_read_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out", (await self.read())["error"])
+        self.assertTrue(any(row["method"] == "session/cancel" for row in self.peer.requests))
+
+    async def test_export_startup_cancellation_owns_process_and_files_until_reaped(self) -> None:
+        self.export_program = "import time; time.sleep(60)"
+        self.allow_export_return.clear()
+        task = asyncio.create_task(self.read())
+        try:
+            await asyncio.wait_for(self.export_started.wait(), timeout=3)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(self.transcripts[-1].exists())
+            self.allow_export_return.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
+            self.assertEqual(self.exporters[0].returncode, -9)
+            self.assertFalse(self.clients)
+        finally:
+            self.allow_export_return.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_repeated_child_cancellation_waits_for_close_before_removing_files(self) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.read())
+        try:
+            await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=3)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=3)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(self.transcripts[-1].exists())
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
+            self.assertTrue(self.peer.killed.is_set())
+            self.assertTrue(self.peer.reaped.is_set())
         finally:
             self.peer.kill()
             await asyncio.gather(task, return_exceptions=True)

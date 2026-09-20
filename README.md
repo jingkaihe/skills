@@ -27,9 +27,14 @@ A collection of CLI tool skill definitions for AI assistants.
 | [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
+| [read-conversation](./extensions/read-conversation/kodelet-extension-read-conversation) | `read_conversation` | Read-only agentic research over saved conversation snapshots, with transcript-line evidence |
 | [todo](./extensions/todo/kodelet-extension-todo) | `todo_read`, `todo_write` | Track conversation tasks with progress summaries, status checklists, and a live composer widget |
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
+
+`read_conversation` takes `conversation_id`, `goal`, and optional advisory `max_turns` (default 12). It exports the full archived + active Markdown snapshot through the authenticated CLI, without tool-result truncation, and gives a child on the same runner and parent cwd only the goal and transcript location/metadata. The hidden profile matches code-search's model; an `agent.init` tool patch restricts it to `file_read`/`grep_tool`, with skills disabled. Temporary files are private and removed after child cleanup; answers cite conversation IDs and transcript line ranges. The current conversation is supported from its saved snapshot. CLI export failures (including the existing 64 MiB response cap) fail explicitly, never analyze a partial export.
+
+The runner needs `kodelet` on `PATH`, CLI daemon configuration (`KODELET_SERVER` or saved config), and client/API authentication (`KODELET_AUTH_TOKEN` or CLI auth config) for both history export and SDK session creation. A runner-only token is insufficient.
 
 The durable subagent extension now lives in the standalone [`jingkaihe/kodelet-subagent`](https://github.com/jingkaihe/kodelet-subagent) repository. Install it separately with `uvx kodelet-subagent install`.
 
