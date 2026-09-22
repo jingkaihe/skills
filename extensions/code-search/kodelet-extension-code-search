@@ -42,7 +42,7 @@ ext = Extension(name="code-search", version="0.1.0")
 SEARCH_PROFILE = ext.register_profile(
     "code-search",
     provider="openai",
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     reasoning_effort="none",
     openai={
         "api_mode": "responses",

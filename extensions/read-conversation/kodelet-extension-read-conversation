@@ -47,7 +47,7 @@ ext = Extension(name="read-conversation", version="0.1.0")
 READ_PROFILE = ext.register_profile(
     "read-conversation",
     provider="openai",
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     reasoning_effort="none",
     openai={
         "api_mode": "responses",

@@ -315,7 +315,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                             "name": name, "hidden": True,
                             "options": {
                                 "provider": "openai",
-                                "model": "gpt-5.6-luna",
+                                "model": "gpt-6-luna",
                                 "reasoning_effort": "none",
                                 "openai": {
                                     "api_mode": "responses",
