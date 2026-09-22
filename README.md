@@ -22,6 +22,7 @@ A collection of CLI tool skill definitions for AI assistants.
 
 | Extension | Tools / Commands | Description |
 |-----------|------------------|-------------|
+| [browser-use](./extensions/browser-use/README.md) | `browser_use` | Goal-driven automation in the browser shared with the user |
 | [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
 | [goal](./extensions/goal/kodelet-extension-goal) | `/goal`, `get_goal`, `update_goal` | Persistent conversation objectives with completion audits and automatic follow-up turns |
 | [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
@@ -29,6 +30,8 @@ A collection of CLI tool skill definitions for AI assistants.
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
 | [read-conversation](./extensions/read-conversation/kodelet-extension-read-conversation) | `read_conversation` | Read-only agentic research over saved conversation snapshots, with transcript-line evidence |
 | [todo](./extensions/todo/kodelet-extension-todo) | `todo_read`, `todo_write` | Track conversation tasks with progress summaries, status checklists, and a live composer widget |
+
+`browser_use` requires a host with the shared-browser capability. Set `TYPESAFE_API_KEY` in the runner environment for semantic click/fill and goal execution; observe and navigate do not need it.
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 

@@ -1,12 +1,20 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk==0.5.3", "filetype", "google-genai", "pillow"]
+# dependencies = [
+#   "kodelet-sdk==0.5.5",
+#   "filetype",
+#   "google-genai",
+#   "pillow",
+#   "typesafe-sdk==0.7.1",
+#   "playwright==1.63.0",
+# ]
 # ///
 
 """Run with `uv run --script tests/test_extensions.py`; no provider calls.
 
 For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
 ../kodelet-python-sdk --with filetype --with google-genai --with pillow
+--with typesafe-sdk==0.7.1 --with playwright==1.63.0
 -- python tests/test_extensions.py
 """
 
@@ -208,7 +216,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.5.3")
+        self.assertEqual(package.version, "0.5.5")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -223,6 +231,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
+            "browser-use": ["browser_use"],
             "code-search": ["code_search"],
             "goal": ["get_goal", "update_goal"],
             "last-word": [],
@@ -240,7 +249,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.5.3,<0.6", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.5.5,<0.6", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",

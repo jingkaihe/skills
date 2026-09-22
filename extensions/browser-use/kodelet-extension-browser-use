@@ -1,0 +1,14 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "kodelet-sdk>=0.5.5,<0.6",
+#   "typesafe-sdk==0.7.1",
+#   "playwright==1.63.0",
+# ]
+# ///
+
+from browser_use import ext
+
+if __name__ == "__main__":
+    ext.run_sync()
