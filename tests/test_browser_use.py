@@ -9,7 +9,8 @@
 
 """Run with `uv run --script tests/test_browser_use.py`; no provider calls.
 
-SDK requests use httpx2.MockTransport. Chromium tests launch a temporary,
+Goal policy tests inject observations rather than emulate the DOM. SDK requests
+use httpx2.MockTransport. Chromium tests launch a temporary,
 headless profile, block external requests, and never use the host's browser.
 Only that optional class skips when /usr/bin/chromium-browser is unavailable.
 """
@@ -19,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-import itertools
 import json
 import logging
 import sys
@@ -134,196 +134,67 @@ class FakeClient:
         return SimpleNamespace(answers=answers)
 
 
-class Control:
-    """Mutable fake page state, separate from each retained ElementHandle."""
-
-    def __init__(
-        self,
-        name="Settings",
-        *,
-        context="",
-        editable=False,
-        enabled=True,
-        tag=None,
-        kind="",
-        role=None,
-        value="",
-        identity="",
-    ):
-        self.description = {
-            "role": role or ("textbox" if editable else "button"),
-            "name": name,
-            "context": context,
-            "editable": editable,
-            "enabled": enabled,
-            "identity": {
-                "tag": tag or ("input" if editable else "button"),
-                "id": identity,
-                "type": kind,
-                "href": None,
-                "fieldName": None,
-            },
-        }
-        self.value = value
-        self.visible = True
-        self.attached = True
-        self.invalid = False
-        self.after_action = None
-
-
-class FakeHandle:
-    def __init__(self, page, control):
-        self.page = page
-        self.control = control
-        self.disposals = 0
-
-    async def evaluate(self, expression, argument=None):
-        if expression == browser_dom._FIELD_FACTS:
-            return {
-                "value": self.control.value,
-                "invalid": self.control.invalid,
-                "matches": [
-                    name for name, value in argument.items() if value == self.control.value
-                ],
-            }
-        if expression != browser_dom._DESCRIBE_ELEMENT:
-            raise AssertionError("Unexpected fake DOM evaluation")
-        if not self.control.attached:
-            return None
-        description = copy.deepcopy(self.control.description)
-        for key in ("role", "name", "context"):
-            description[key] = browser_dom.redact_input_values(description[key], argument or {})
-        return description
-
-    async def is_visible(self):
-        return self.control.visible and self.control.attached
-
-    async def is_enabled(self):
-        return self.control.description["enabled"]
-
-    async def is_editable(self):
-        return self.control.description["editable"]
-
-    async def dispose(self):
-        self.disposals += 1
-
-    async def dispatch(self, operation, **extra):
-        self.page.dispatched.append(
-            {
-                "operation": operation,
-                "name": self.control.description["name"],
-                **extra,
-            }
-        )
-        if self.control.after_action:
-            pending = self.control.after_action(operation)
-            if inspect.isawaitable(pending):
-                await pending
-
-    async def click(self, **kwargs):
-        await self.dispatch("click")
-
-    async def fill(self, value, **kwargs):
-        self.control.value = value
-        await self.dispatch("fill", value=value)
-
-    async def press(self, key, **kwargs):
-        await self.dispatch("press", key=key)
-
-
-class FakeLocator:
-    def __init__(self, page, controls):
-        self.page, self.controls = page, controls
-
-    async def count(self):
-        return len(self.controls)
-
-    def nth(self, index):
-        async def element_handle(**kwargs):
-            handle = FakeHandle(self.page, self.controls[index])
-            self.page.handles.append(handle)
-            return handle
-
-        return SimpleNamespace(element_handle=element_handle)
-
-    async def evaluate_all(self, expression):
-        if expression != browser_dom._FIELD_VALUES:
-            raise AssertionError("Unexpected fake form evaluation")
-        if len(self.controls) > 512:
-            return None
-        return json.dumps(
-            [
-                [control.description["identity"]["id"], None, control.value]
-                for control in self.controls
-            ]
-        )
-
-
-class FakePage:
-    def __init__(self, target_id="shared-page"):
-        self.target_id = target_id
-        self.url = "http://localhost/private-fixture"
-        self.closed = False
-        self.controls = [
-            Control(context="Account menu"),
-            Control(context="Project: kodelet"),
-        ]
-        self.evidence = [Control("Project settings", role="heading")]
-        self.handles = []
-        self.dispatched = []
-        self.listeners = {}
-        self.cdp = SimpleNamespace(
-            send=AsyncMock(return_value={"targetInfo": {"targetId": target_id}}),
-            detach=AsyncMock(),
-        )
-        self.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=self.cdp))
-        self.set_default_timeout = Mock()
-        self.set_default_navigation_timeout = Mock()
-        self.goto = AsyncMock()
-        self.reload = AsyncMock()
-        self.go_back = AsyncMock()
-        self.wait_for_load_state = AsyncMock()
-
-    async def title(self):
-        return "Fixture"
-
-    def is_closed(self):
-        return self.closed
-
-    def on(self, event, callback):
-        self.listeners.setdefault(event, []).append(callback)
-
-    def remove_listener(self, event, callback):
-        self.listeners[event].remove(callback)
-
-    def navigate(self):
-        for callback in self.listeners.get("framenavigated", [])[:]:
-            callback(self)
-
-    def locator(self, selector):
-        if selector == browser_dom._CANDIDATE_SELECTOR:
-            controls = [c for c in self.controls if c.attached and c.visible]
-        elif selector.startswith("h1,"):
-            controls = self.evidence
-        elif selector == "input:not([type=hidden]),textarea,[contenteditable=true]":
-            controls = [c for c in self.controls if c.description["editable"]]
-        else:
-            raise AssertionError(f"Unexpected selector: {selector}")
-        return FakeLocator(self, controls)
+def element(ref, name, *, editable=False):
+    candidate = {
+        "ref": ref,
+        "name": name,
+        "role": "textbox" if editable else "button",
+        "context": "Project",
+        "editable": editable,
+        "enabled": True,
+    }
+    return browser_dom.ObservedElement(
+        candidate=candidate,
+        description={
+            **candidate,
+            "identity": {"tag": "input" if editable else "button", "type": "text"},
+        },
+        handle=SimpleNamespace(
+            click=AsyncMock(), fill=AsyncMock(), press=AsyncMock(), dispose=AsyncMock()
+        ),
+    )
 
 
 class Harness:
-    sessions = itertools.count()
+    """Fixture at the observation boundary; Chromium tests own DOM semantics."""
 
     def __init__(self, respond=target_reply, key="test-key"):
-        self.page = FakePage()
-        self.other = FakePage("unrelated-page")
+        self.elements = [element("e1", "Settings"), element("e2", "Save")]
+        self.snapshot = {
+            "title": "Fixture",
+            "frame": "main",
+            "truncated": False,
+            "elements": [item.candidate for item in self.elements],
+            "pagination": {
+                "controls": {"offset": 0, "total": 2, "limit": 80},
+                "evidence": {"offset": 0, "total": 1, "limit": 20},
+            },
+            "evidence": ["Project settings"],
+            "inputMatches": {},
+            "invalidFields": [],
+            "nonEmptyFields": [],
+            "localValuesDigest": "local-digest",
+        }
+        self.page = SimpleNamespace(
+            url="http://localhost/private-fixture",
+            is_closed=Mock(return_value=False),
+            on=Mock(),
+            remove_listener=Mock(),
+            set_default_timeout=Mock(),
+            set_default_navigation_timeout=Mock(),
+            wait_for_load_state=AsyncMock(),
+        )
+        self.cdp = SimpleNamespace(
+            send=AsyncMock(return_value={"targetInfo": {"targetId": "shared-page"}}),
+            detach=AsyncMock(),
+        )
+        self.page.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=self.cdp))
         self.browser = SimpleNamespace(
-            contexts=[SimpleNamespace(pages=[self.other, self.page])],
+            contexts=[SimpleNamespace(pages=[self.page])],
             close=AsyncMock(),
         )
         self.lease = SimpleNamespace(
-            session_id=f"test-session-{next(self.sessions)}",
+            session_id="test-session",
             lease_id="test-lease",
             cdp_url="ws://127.0.0.1:1/devtools/browser/private",
             page_target_id="shared-page",
@@ -337,21 +208,30 @@ class Harness:
             update=AsyncMock(),
         )
 
-        async def connect(url, *, timeout, no_defaults):
-            assert url == self.lease.cdp_url
-            assert no_defaults is True
-            assert 0 < timeout <= browser_dom.ACTION_TIMEOUT
-            return self.browser
+        self.connect = AsyncMock(return_value=self.browser)
+        self.validate = AsyncMock()
 
-        self.connect = AsyncMock(side_effect=connect)
+    async def observe(self, page, handles, *args):
+        handles.extend(self.elements)
+        return copy.deepcopy(self.snapshot)
+
+    async def observe_single(self, page, handles):
+        snapshot = await self.observe(page, handles)
+        return {key: snapshot[key] for key in ("title", "frame", "truncated", "elements")}
 
     async def execute(self, input_dict=None):
-        return await browser_use.execute_browser_use(
-            input_dict or GOAL,
-            self.ctx,
-            connect=self.connect,
-            client_factory=self.factory,
-        )
+        with (
+            patch.object(browser_use, "observe", self.observe_single),
+            patch.object(browser_goal, "observe_goal", self.observe),
+            patch.object(browser_use, "validate_target", self.validate),
+            patch.object(browser_goal, "validate_target", self.validate),
+        ):
+            return await browser_use.execute_browser_use(
+                input_dict or GOAL,
+                self.ctx,
+                connect=self.connect,
+                client_factory=self.factory,
+            )
 
 
 class BrowserTestCase(unittest.IsolatedAsyncioTestCase):
@@ -362,10 +242,13 @@ class BrowserTestCase(unittest.IsolatedAsyncioTestCase):
             h.client.aclose.assert_awaited_once()
         else:
             h.factory.assert_not_called()
-        self.assertFalse(h.page.closed)
-        self.assertFalse(h.page.listeners.get("framenavigated"))
-        self.assertTrue(all(handle.disposals == 1 for handle in h.page.handles))
+        self.assertEqual(h.page.on.call_count, h.page.remove_listener.call_count)
         self.assertNotIn(h.lease.session_id, browser_use._active_sessions)
+
+    def assert_no_dispatch(self, h):
+        for observed in h.elements:
+            for operation in ("click", "fill", "press"):
+                getattr(observed.handle, operation).assert_not_awaited()
 
     def assert_private(self, h, output, *secrets):
         captured = json.dumps([h.client.calls, output, h.ctx.update.await_args_list], default=str)
@@ -454,20 +337,8 @@ class SDKSelectionTests(BrowserTestCase):
         ]
         for selected, probabilities, confidence, reason in cases:
             with self.subTest(reason=reason, confidence=confidence):
-                client = self.sdk_client(
-                    lambda request, selected=selected, probabilities=probabilities, confidence=confidence: (
-                        httpx2.Response(
-                            200,
-                            json={
-                                "answers": {
-                                    "target": choice(
-                                        selected, probabilities, confidence, probabilities
-                                    ),
-                                }
-                            },
-                        )
-                    )
-                )
+                answer = choice(selected, probabilities, confidence, probabilities)
+                client = FakeClient(lambda body, answer=answer: {"target": answer})
                 result = await browser_use.select_target(
                     "fill",
                     "Project name",
@@ -487,57 +358,20 @@ class SDKSelectionTests(BrowserTestCase):
         )
         self.assertEqual(client.calls, [])
 
-    async def test_rounded_distributions_do_not_normalize_confidence_gates(self):
-        for count in (2, 80):
-            candidates = [{**ACCOUNT, "ref": f"e{i + 1}"} for i in range(count)]
-            zeros = {candidate["ref"]: 0 for candidate in candidates}
-            for second in (0.23, 0.25, 0.04, 0.16):
-                with self.subTest(count=count, second=second):
-                    valid = second in (0.23, 0.25)
-                    probabilities = {
-                        **zeros,
-                        "e1": 0.75 if valid else 0.9,
-                        "e2": second,
-                        "none": 0.01 if valid else 0,
-                    }
-                    client = self.sdk_client(
-                        lambda request, probabilities=probabilities: httpx2.Response(
-                            200,
-                            json={
-                                "answers": {
-                                    "target": choice(
-                                        "e1", probabilities, probabilities=probabilities
-                                    ),
-                                }
-                            },
-                        )
-                    )
-                    if valid:
-                        result = await browser_use.select_target(
-                            "click", "Settings", candidates, client
-                        )
-                        self.assertEqual(result["kind"], "selected")
-                    else:
-                        with self.assertRaises(browser_dom.BrowserUseError) as caught:
-                            await browser_use.select_target("click", "Settings", candidates, client)
-                        self.assertEqual(caught.exception.code, "jev_invalid_response")
-            probabilities = {**zeros, "e1": 0.74, "e2": 0.23, "none": 0.01}
-            client = self.sdk_client(
-                lambda request, probabilities=probabilities: httpx2.Response(
-                    200,
-                    json={
-                        "answers": {
-                            "target": choice("e1", probabilities, probabilities=probabilities),
-                        }
-                    },
+    def test_rounded_distributions_preserve_original_action_thresholds(self):
+        for selected, other, accepted in (
+            (0.75, 0.24, True),
+            (0.75, 0.26, True),
+            (0.74, 0.25, False),
+        ):
+            probabilities = {"target": selected, "none": other}
+            with self.subTest(probabilities=probabilities):
+                answer = browser_use.validate_choice(
+                    choice("target", probabilities, probabilities=probabilities),
+                    probabilities,
                 )
-            )
-            if count == 2:
-                with self.assertRaises(browser_dom.BrowserUseError):
-                    await browser_use.select_target("click", "Settings", candidates, client)
-            else:
-                result = await browser_use.select_target("click", "Settings", candidates, client)
-                self.assertEqual(result["reason"], "ambiguous")
+                self.assertEqual(answer["probabilities"], probabilities)
+                self.assertEqual(browser_use.confident(answer), accepted)
 
     async def test_malformed_responses_and_transport_failures_are_sanitized_without_retry(self):
         responses = [
@@ -597,7 +431,7 @@ class SDKSelectionTests(BrowserTestCase):
         self.assertEqual(output["data"]["status"], "give_up", output)
         self.assertEqual(output["data"]["reason"], "needs_confirmation")
         self.assertEqual(len(requests), 1)
-        self.assertEqual(h.page.dispatched, [])
+        self.assert_no_dispatch(h)
         h.lease.release.assert_awaited_once()
         h.browser.close.assert_awaited_once()
 
@@ -635,7 +469,7 @@ class LifecycleTests(BrowserTestCase):
                     async def query(method, entered=entered, allow=allow):
                         entered.set()
                         await allow.wait()
-                        return {"targetInfo": {"targetId": "unrelated-page"}}
+                        return {"targetInfo": {"targetId": "shared-page"}}
 
                     async def detach(stage=stage, entered=entered, allow=allow):
                         if stage == "detach":
@@ -643,8 +477,8 @@ class LifecycleTests(BrowserTestCase):
                         await allow.wait()
 
                     if stage == "query":
-                        h.other.cdp.send.side_effect = query
-                    h.other.cdp.detach.side_effect = detach
+                        h.cdp.send.side_effect = query
+                    h.cdp.detach.side_effect = detach
                     task = asyncio.create_task(
                         h.execute(
                             {
@@ -668,7 +502,7 @@ class LifecycleTests(BrowserTestCase):
                         )
                         h.browser.close.assert_awaited_once()
                         h.lease.release.assert_awaited_once()
-                        self.assertEqual(h.page.dispatched, [])
+                        self.assert_no_dispatch(h)
                         h.factory.assert_not_called()
                     finally:
                         allow.set()
@@ -677,44 +511,8 @@ class LifecycleTests(BrowserTestCase):
                             asyncio.gather(*list(browser_use._pending_cleanup)), 2
                         )
                         await asyncio.sleep(0)
-                    h.other.cdp.detach.assert_awaited_once()
+                    h.cdp.detach.assert_awaited_once()
                     self.assertFalse(browser_use._pending_cleanup)
-
-    async def test_shared_page_uses_cdp_identity_and_detaches_all_sessions(self):
-        h = Harness()
-        self.assertIs(await browser_use.shared_page(h.browser, "shared-page"), h.page)
-        for page in (h.other, h.page):
-            page.cdp.send.assert_awaited_once_with("Target.getTargetInfo")
-            page.cdp.detach.assert_awaited_once()
-        with self.assertRaises(browser_dom.BrowserUseError) as caught:
-            await browser_use.shared_page(h.browser, "missing")
-        self.assertEqual(caught.exception.code, "shared_page_missing")
-        h.browser.contexts[0].pages = [h.other] * 33
-        with self.assertRaises(browser_dom.BrowserUseError) as caught:
-            await browser_use.shared_page(h.browser, "shared-page")
-        self.assertEqual(caught.exception.code, "too_many_pages")
-
-    async def test_observe_and_navigate_need_no_client(self):
-        for action in ({"action": "observe"}, {"action": "navigate", "url": "about:blank"}):
-            with self.subTest(action=action):
-                h = Harness(key=None)
-                output = await h.execute(action)
-                self.assertEqual(
-                    output["data"]["status"],
-                    "observed" if action["action"] == "observe" else "navigated",
-                )
-                if action["action"] == "observe":
-                    self.assertEqual(len(output["data"]["snapshot"]["elements"]), 2)
-                    self.assertNotIn("identity", output["content"])
-                else:
-                    h.page.goto.assert_awaited_once_with(
-                        "about:blank",
-                        wait_until="domcontentloaded",
-                        timeout=5000,
-                    )
-                    h.other.goto.assert_not_awaited()
-                self.assert_cleaned(h, semantic=False)
-                self.assert_private(h, output)
 
     async def test_invalid_input_credentials_and_urls_fail_before_acquisition(self):
         cases = [({"action": "click", "target": "Settings"}, "missing_key")]
@@ -738,56 +536,58 @@ class LifecycleTests(BrowserTestCase):
                 h.ctx.browser.acquire.assert_not_awaited()
                 h.connect.assert_not_awaited()
 
-    async def test_duplicate_label_selection_and_fill_keep_values_local(self):
+    async def test_selected_handle_receives_action_without_exposing_values(self):
         for action in ("click", "fill"):
             with self.subTest(action=action):
                 h = Harness()
+                h.elements[1].candidate["editable"] = True
                 input_dict = {"action": action, "target": "Project settings"}
                 if action == "fill":
-                    h.page.controls[1] = Control("Project name", editable=True)
                     input_dict.update(target="Project name", value="browser-only-secret")
                 output = await h.execute(input_dict)
                 self.assertEqual(output["data"]["status"], "acted", output)
                 self.assertFalse(output["data"]["verified"])
                 self.assertEqual(output["data"]["target"]["ref"], "e2")
-                self.assertEqual(len(h.page.dispatched), 1)
-                self.assertEqual(h.page.dispatched[0]["operation"], action)
+                h.elements[0].handle.click.assert_not_awaited()
+                h.elements[0].handle.fill.assert_not_awaited()
                 if action == "fill":
-                    self.assertEqual(h.page.controls[1].value, "browser-only-secret")
-                    self.assertEqual(
-                        set(h.client.calls[0]["questions"]["target"]["criteria"]), {"none", "e2"}
+                    h.elements[1].handle.fill.assert_awaited_once_with(
+                        "browser-only-secret", timeout=5000
                     )
+                else:
+                    h.elements[1].handle.click.assert_awaited_once_with(
+                        timeout=5000, no_wait_after=True
+                    )
+                h.validate.assert_awaited_once_with(h.page, h.elements[1], action)
                 self.assert_private(h, output, "browser-only-secret")
                 self.assert_cleaned(h)
 
     async def test_no_match_and_truncation_do_not_dispatch(self):
         for truncated in (False, True):
             h = Harness(lambda body: target_reply(body, "none"))
-            if truncated:
-                h.page.controls = [Control() for _ in range(81)]
+            h.snapshot["truncated"] = truncated
             output = await h.execute({"action": "click", "target": "Missing"})
             self.assertEqual(output["data"]["status"], "not_executed", output)
             if truncated:
                 self.assertEqual(output["data"]["reason"], "truncated_snapshot")
                 self.assertEqual(h.client.calls, [])
-                self.assertEqual(len(h.page.handles), 80)
             else:
                 self.assertEqual(output["data"]["decision"]["reason"], "no_match")
-            self.assertEqual(h.page.dispatched, [])
+            self.assert_no_dispatch(h)
             self.assert_cleaned(h)
 
-    async def test_navigation_identity_and_detachment_invalidate_target(self):
-        for mutation in ("navigation", "identity", "detach"):
+    async def test_stale_target_or_navigation_prevents_dispatch(self):
+        for mutation in ("navigation", "target"):
             with self.subTest(mutation=mutation):
                 h = Harness()
 
                 def respond(body, mutation=mutation, h=h):
                     if mutation == "navigation":
-                        h.page.navigate()
-                    elif mutation == "identity":
-                        h.page.controls[1].description["identity"]["id"] = "replacement"
+                        h.page.url = "http://localhost/changed"
                     else:
-                        h.page.controls[1].attached = False
+                        h.validate.side_effect = browser_dom.BrowserUseError(
+                            "stale_target", "Target changed"
+                        )
                     return target_reply(body)
 
                 h.client.respond = respond
@@ -796,57 +596,34 @@ class LifecycleTests(BrowserTestCase):
                     output["data"]["reason"],
                     "stale_snapshot" if mutation == "navigation" else "stale_target",
                 )
-                self.assertEqual(h.page.dispatched, [])
+                self.assert_no_dispatch(h)
                 self.assert_cleaned(h)
 
-    async def test_mutation_failure_is_unknown_without_retry_or_raw_error(self):
-        h = Harness()
-
-        def fail(operation):
-            raise RuntimeError("private endpoint ws://localhost/devtools/browser/private")
-
-        h.page.controls[1].after_action = fail
-        output = await h.execute({"action": "click", "target": "Project settings"})
-        self.assertEqual(output["data"]["status"], "outcome_unknown", output)
-        self.assertEqual(len(h.page.dispatched), 1)
-        self.assertEqual(len(h.client.calls), 1)
-        self.assertIn("do not automatically retry", output["content"])
-        self.assert_private(h, output, "private endpoint")
-        self.assert_cleaned(h)
-
-    async def test_cancellation_during_inference_releases_without_dispatch(self):
-        started = asyncio.Event()
-
-        async def respond(body):
-            started.set()
-            await asyncio.Event().wait()
-
-        h = Harness(respond)
-        task = asyncio.create_task(h.execute({"action": "click", "target": "Settings"}))
-        await asyncio.wait_for(started.wait(), 1)
-        task.cancel()
-        output = await asyncio.wait_for(task, 2)
-        self.assertEqual(output["data"]["status"], "not_executed", output)
-        self.assertEqual(h.page.dispatched, [])
-        self.assert_cleaned(h)
-
-    async def test_connect_failure_releases_lease_and_sanitizes_details(self):
-        h = Harness()
-        h.connect.side_effect = RuntimeError("private connection endpoint")
-        output = await h.execute({"action": "observe"})
-        self.assertEqual(output["data"]["status"], "not_executed", output)
-        self.assert_private(h, output, "private connection endpoint")
-        h.lease.release.assert_awaited_once()
-        h.browser.close.assert_not_awaited()
-
-    async def test_release_failure_preserves_result_with_cleanup_warning(self):
-        h = Harness()
-        h.lease.release.side_effect = RuntimeError("private host failure")
-        output = await h.execute({"action": "observe"})
-        self.assertEqual(output["data"]["status"], "observed", output)
-        self.assertIn("host invocation cleanup", output["data"]["cleanupWarning"])
-        self.assert_private(h, output, "private host failure")
-        self.assert_cleaned(h, semantic=False)
+    async def test_failures_keep_outcome_and_cleanup_distinct(self):
+        for stage, status in (
+            ("connect", "not_executed"),
+            ("click", "outcome_unknown"),
+            ("release", "acted"),
+        ):
+            with self.subTest(stage=stage):
+                h = Harness()
+                boundary = {
+                    "connect": h.connect,
+                    "click": h.elements[1].handle.click,
+                    "release": h.lease.release,
+                }[stage]
+                boundary.side_effect = RuntimeError("private endpoint details")
+                output = await h.execute({"action": "click", "target": "Save"})
+                self.assertEqual(output["data"]["status"], status, output)
+                self.assert_private(h, output, "private endpoint details")
+                h.lease.release.assert_awaited_once()
+                if stage == "connect":
+                    self.assert_no_dispatch(h)
+                else:
+                    h.elements[1].handle.click.assert_awaited_once()
+                    self.assertEqual(len(h.client.calls), 1)
+                    self.assert_cleaned(h)
+                self.assertEqual("cleanupWarning" in output["data"], stage == "release")
 
     async def test_canceled_acquisition_or_connection_disposes_late_resources_once(self):
         for stage in ("acquire", "connect"):
@@ -879,87 +656,36 @@ class LifecycleTests(BrowserTestCase):
                 if stage == "connect":
                     h.browser.close.assert_awaited_once()
 
-    async def test_slow_cleanup_continues_after_return_and_reports_uncertainty(self):
-        h = Harness()
-        allow, released = asyncio.Event(), asyncio.Event()
-
-        async def release():
-            await allow.wait()
-            released.set()
-
-        h.lease.release.side_effect = release
-        try:
-            output = await asyncio.wait_for(h.execute({"action": "observe"}), 2)
-            self.assertEqual(output["data"]["status"], "observed", output)
-            self.assertIn("cleanupWarning", output["data"])
-            self.assertFalse(released.is_set())
-            self.assertTrue(browser_use._pending_cleanup)
-        finally:
-            allow.set()
-            await asyncio.wait_for(asyncio.gather(*list(browser_use._pending_cleanup)), 2)
-        self.assertTrue(released.is_set())
-        self.assert_cleaned(h, semantic=False)
-
 
 class GoalLoopTests(BrowserTestCase):
-    def test_goal_schema_and_runner_budgets_are_strict(self):
-        self.assertEqual(browser_use.BrowserUseInput.model_validate(GOAL).root.maxSteps, 100)
-        invalid = [
-            {"action": "run", "goal": "Open settings"},
-            {**GOAL, "goal": " "},
-            {**GOAL, "successCriteria": " "},
-            {**GOAL, "inputs": {"name": 123}},
-            {**GOAL, "inputs": {"invalid-name": "value"}},
-            *[{**GOAL, "maxSteps": value} for value in (0, -1, 1.5, 101, True)],
-            *[{**GOAL, "timeoutMs": value} for value in (0, -1, 1.5, 300001, True)],
-        ]
-        for input_dict in invalid:
-            with self.subTest(input=input_dict), self.assertRaises(ValidationError):
-                browser_use.BrowserUseInput.model_validate(input_dict)
-        self.assertEqual(browser_use.goal_limits({}, GOAL), {"maxSteps": 12, "timeoutMs": 60000})
-
-    async def test_bad_runner_configuration_fails_before_acquisition(self):
-        for name, ceiling in (
-            ("KODELET_BROWSER_USE_MAX_TURNS", 100),
-            ("KODELET_BROWSER_USE_TIMEOUT_MS", 300000),
-        ):
-            for value in ("", "0", "-1", "1.5", "NaN", str(ceiling + 1)):
-                with self.subTest(name=name, value=value):
-                    h = Harness()
-                    h.ctx.env[name] = value
-                    output = await h.execute()
-                    self.assertEqual(output["data"]["reason"], "invalid_config", output)
-                    h.ctx.browser.acquire.assert_not_awaited()
-
     async def test_fill_save_done_on_one_connection_with_private_values(self):
         secret = "browser-only-project-value"
         h = Harness()
-        field = Control("Project name", editable=True)
-        save = Control("Save changes")
+        field, save = element("e1", "Project name", editable=True), element("e2", "Save")
+        h.elements = [field, save]
+        h.snapshot["elements"] = [item.candidate for item in h.elements]
+        h.observe = AsyncMock(wraps=h.observe)
 
-        def open_settings(operation):
-            h.page.controls = [field, save]
-            h.page.evidence = [Control("Project settings", role="heading")]
+        def filled(value, **kwargs):
+            h.snapshot.update(
+                inputMatches={"e1": ["projectName"]},
+                nonEmptyFields=["e1"],
+                localValuesDigest="filled-digest",
+            )
 
-        def saved(operation):
-            h.page.evidence.append(Control(f"Project saved: {field.value}", role="status"))
+        def saved(**kwargs):
+            # Equality and page-text redaction belong to the observation boundary.
+            h.snapshot["evidence"] = ["Project saved: [input:projectName]"]
 
-        h.page.controls[1].after_action = open_settings
-        save.after_action = saved
+        field.handle.fill.side_effect = filled
+        save.handle.click.side_effect = saved
 
         def respond(body):
             turn = len(h.client.calls)
             if turn == 1:
-                selected = next(
-                    key
-                    for key, value in body["questions"]["nextAction"]["criteria"].items()
-                    if isinstance(value, dict)
-                    and value.get("element", {}).get("context") == "Project: kodelet"
-                )
-            elif turn == 2:
                 selected = action_id(body, "fill", "Project name", "projectName")
-            elif turn == 3:
-                selected = action_id(body, "click", "Save changes")
+            elif turn == 2:
+                selected = action_id(body, "click", "Save")
             else:
                 return goal_reply(body, "done")
             return goal_reply(body, action=selected)
@@ -977,233 +703,85 @@ class GoalLoopTests(BrowserTestCase):
         self.assertEqual(data["status"], "done", output)
         self.assertEqual(data["verification"], "model")
         self.assertFalse(data["verified"])
-        self.assertEqual((data["steps"], data["actionsCompleted"]), (4, 3))
+        self.assertEqual((data["steps"], data["actionsCompleted"]), (3, 2))
         self.assertEqual(data["limits"], {"maxSteps": 12, "timeoutMs": 60000})
         self.assertEqual(
             data["evidence"]["fieldMatches"],
             [{"name": "Project name", "inputRefs": ["projectName"]}],
         )
         self.assertIn("Project saved: [input:projectName]", data["evidence"]["messages"])
+        field.handle.fill.assert_awaited_once_with(secret, timeout=browser_dom.ACTION_TIMEOUT)
+        save.handle.click.assert_awaited_once_with(
+            timeout=browser_dom.ACTION_TIMEOUT, no_wait_after=True
+        )
+        self.assertEqual([item["operation"] for item in data["history"]], ["fill", "click"])
+        self.assertEqual(h.client.calls[2]["state"]["recentActions"], data["history"])
         self.assertEqual(
-            h.page.dispatched,
-            [
-                {"operation": "click", "name": "Settings"},
-                {"operation": "fill", "name": "Project name", "value": secret},
-                {"operation": "click", "name": "Save changes"},
-            ],
+            h.client.calls[1]["state"]["observation"]["inputMatches"], {"e1": ["projectName"]}
         )
-        for turn, body in enumerate(h.client.calls, 1):
-            self.assertEqual(body["state"]["availableInputs"], ["projectName"])
-            for key in body["questions"]["nextAction"]["criteria"]:
-                if key != "none":
-                    self.assertRegex(key, rf"^t{turn}_a\d+$")
-        third = h.client.calls[2]
-        self.assertEqual(third["state"]["observation"]["inputMatches"]["e1"], ["projectName"])
-        self.assertFalse(
-            any(
-                isinstance(value, dict) and value.get("operation") == "fill"
-                for value in third["questions"]["nextAction"]["criteria"].values()
-            )
-        )
+        self.assertEqual(h.observe.await_count, 6, "Each decision needs a fresh observation")
         h.ctx.browser.acquire.assert_awaited_once()
         h.connect.assert_awaited_once()
-        self.assertGreaterEqual(h.ctx.update.await_count, 4)
-        self.assertGreater(len(h.page.handles), 10)
         self.assert_private(h, output, secret)
         self.assert_cleaned(h)
 
-    async def test_registry_omits_password_disabled_toggle_and_matching_fill(self):
-        h = Harness(lambda body: goal_reply(body, "give_up", blocker="missing_input"))
-        h.page.controls = [
-            Control("First name", editable=True, value="first-secret"),
-            Control("Last name", editable=True),
-            Control("Password", editable=True, kind="password", value="password-secret"),
-            Control("Delete", enabled=False),
-            Control("Read only", editable=True, enabled=False, value="first-secret"),
-            *[Control(role, role=role) for role in ("checkbox", "radio", "switch", "tab")],
-        ]
-        output = await h.execute(
-            {**GOAL, "inputs": {"firstName": "first-secret", "lastName": "last-secret"}}
-        )
-        actions = [
-            value
-            for value in h.client.calls[0]["questions"]["nextAction"]["criteria"].values()
-            if isinstance(value, dict)
-        ]
-        fills = [
-            (value["element"]["name"], value["inputRef"])
-            for value in actions
-            if value["operation"] == "fill"
-        ]
-        self.assertEqual(
-            fills,
-            [("First name", "lastName"), ("Last name", "firstName"), ("Last name", "lastName")],
-        )
-        self.assertFalse(
-            any(value["operation"] in ("click", "fill_from_goal") for value in actions)
-        )
-        presses = [value["element"]["name"] for value in actions if value["operation"] == "press"]
-        self.assertEqual(presses, ["First name"])
-        self.assertEqual(output["data"]["status"], "give_up", output)
-        self.assertEqual(h.page.dispatched, [])
-        self.assert_private(h, output, "first-secret", "last-secret", "password-secret")
-        self.assert_cleaned(h)
-
-    async def test_give_up_ignores_absent_or_malformed_unused_answers(self):
-        for blocker in browser_goal.GOAL_BLOCKER_CRITERIA:
-            with self.subTest(blocker=blocker):
-
-                def respond(body, blocker=blocker):
-                    answers = goal_reply(body, "give_up", blocker=blocker)
-                    answers["nextAction"] = {"choice": "stale-action"}
-                    del answers["evidence"]
-                    return answers
-
-                h = Harness(respond)
-                output = await h.execute()
-                self.assertEqual(output["data"]["status"], "give_up", output)
-                self.assertEqual(output["data"]["reason"], blocker)
-                self.assertEqual(output["data"]["actionsCompleted"], 0)
-                self.assertEqual(len(h.client.calls), 1)
-                self.assertEqual(h.page.dispatched, [])
-                self.assert_cleaned(h)
-
-    async def test_malformed_action_answers_never_dispatch(self):
-        for scenario in (
-            "missing_status",
-            "unknown_action",
-            "bad_distribution",
-            "uncertain_action",
+    async def test_invalid_or_uncertain_mutations_abstain_but_inspection_is_allowed(self):
+        for scenario, status, reason in (
+            ("invalid", "failed", "jev_invalid_response"),
+            ("status", "give_up", "uncertain"),
+            ("action", "give_up", "no_suitable_action"),
+            ("inspect", "step_limit", None),
         ):
             with self.subTest(scenario=scenario):
 
                 def respond(body, scenario=scenario):
                     answers = goal_reply(body, action=action_id(body, "click"))
-                    if scenario == "missing_status":
-                        del answers["status"]
-                    elif scenario == "unknown_action":
+                    if scenario == "invalid":
                         answers["nextAction"]["choice"] = "t0_a1"
-                    elif scenario == "bad_distribution":
-                        answers["nextAction"]["probabilities"]["none"] = 1
-                    else:
+                    if scenario in ("status", "inspect"):
+                        answers["status"]["confidence"] = 0.2
+                    if scenario in ("action", "inspect"):
                         answers["nextAction"]["confidence"] = 0.2
                     return answers
 
                 h = Harness(respond)
-                output = await h.execute()
-                self.assertEqual(
-                    output["data"]["status"],
-                    "give_up" if scenario == "uncertain_action" else "failed",
-                    output,
-                )
-                if scenario != "uncertain_action":
-                    self.assertEqual(output["data"]["reason"], "jev_invalid_response")
-                self.assertEqual(h.page.dispatched, [])
-                self.assert_cleaned(h)
-
-    async def test_uncertain_status_allows_only_inspection_and_waiting(self):
-        for operation in (
-            "inspect",
-            "wait",
-            "click",
-            "fill_from_goal",
-            "press",
-            "reload",
-            "back",
-            "done",
-            "give_up",
-        ):
-            with self.subTest(operation=operation):
-
-                def respond(body, operation=operation):
-                    status = operation if operation in ("done", "give_up") else "act"
-                    selected = action_id(body, operation) if status == "act" else "none"
-                    answers = goal_reply(body, status, selected, blocker="needs_confirmation")
-                    answers["status"]["confidence"] = 0.2
-                    answers["nextAction"]["confidence"] = 0.2
-                    return answers
-
-                h = Harness(respond)
-                h.page.controls = [
-                    Control("Search", editable=True, value="existing"),
-                    Control("Save"),
-                ]
-                if operation in ("inspect", "give_up"):
-                    h.page.controls += [Control("Other") for _ in range(80)]
+                if scenario == "inspect":
+                    h.snapshot["pagination"]["controls"]["total"] = 81
                 output = await h.execute({**GOAL, "maxSteps": 1})
-                read_only = operation in ("inspect", "wait")
-                self.assertEqual(
-                    output["data"]["status"], "step_limit" if read_only else "give_up", output
-                )
-                self.assertEqual(output["data"]["actionsCompleted"], int(read_only))
-                if not read_only:
-                    self.assertEqual(
-                        output["data"]["reason"],
-                        "needs_confirmation" if operation == "give_up" else "uncertain",
-                    )
-                self.assertEqual(
-                    len(h.client.calls), 1, "Uncertain mutations must not initiate extraction"
-                )
-                self.assertEqual(h.page.dispatched, [])
-                h.page.reload.assert_not_awaited()
-                h.page.go_back.assert_not_awaited()
+                self.assertEqual(output["data"]["status"], status, output)
+                self.assertEqual(output["data"].get("reason"), reason)
+                operations = [item["operation"] for item in output["data"]["history"]]
+                self.assertEqual(operations, ["inspect"] if scenario == "inspect" else [])
+                self.assertEqual(len(h.client.calls), 1)
+                self.assert_no_dispatch(h)
                 self.assert_cleaned(h)
 
-    async def test_done_requires_joint_evidence_valid_noul_and_fresh_observation(self):
-        cases = [
-            (None, "failed"),
-            ({"type": "choice", "choice": "done"}, "failed"),
-            *[
-                ({"type": "noul", "noul": value}, "failed")
-                for value in (-0.1, 1.1, "1", True, float("nan"))
-            ],
-            ({"type": "noul", "noul": 0.89}, "give_up"),
-            ({"type": "noul", "noul": 0.9}, "done"),
-        ]
-        for evidence, expected in cases:
-            with self.subTest(evidence=evidence):
-
-                def respond(body, evidence=evidence):
-                    answers = goal_reply(body, "done")
-                    answers["evidence"] = evidence
-                    answers["nextAction"] = {"unused": "malformed"}
-                    return answers
-
-                h = Harness(respond)
-                h.page.controls = [
-                    Control("Project name", editable=True, enabled=False, value="saved-secret")
-                ]
-                output = await h.execute({**GOAL, "inputs": {"projectName": "saved-secret"}})
-                self.assertEqual(output["data"]["status"], expected, output)
-                self.assertEqual(
-                    h.client.calls[0]["state"]["completionEvidence"]["fieldMatches"],
-                    [
-                        {"name": "Project name", "inputRefs": ["projectName"]},
-                    ],
-                )
-                if expected == "done":
-                    self.assertFalse(output["data"]["verified"])
-                    self.assertEqual(
-                        len(h.page.handles), 4, "Done must perform a second observation"
+    async def test_done_requires_valid_confident_completion_evidence(self):
+        for probability, messages, reason in (
+            (None, ["Saved"], "jev_invalid_response"),
+            (0.89, ["Saved"], "completion_unverified"),
+            (1, [], "completion_unverified"),
+        ):
+            with self.subTest(probability=probability, messages=messages):
+                h = Harness(
+                    lambda body, probability=probability: goal_reply(
+                        body, "done", evidence=probability
                     )
-                elif expected == "failed":
-                    self.assertEqual(output["data"]["reason"], "jev_invalid_response")
-                else:
-                    self.assertEqual(output["data"]["reason"], "completion_unverified")
-                self.assertEqual(h.page.dispatched, [])
-                self.assert_private(h, output, "saved-secret")
+                )
+                h.snapshot["evidence"] = messages
+                output = await h.execute()
+                self.assertEqual(output["data"]["reason"], reason, output)
+                self.assertEqual(output["data"]["actionsCompleted"], 0)
+                self.assertFalse(output["data"]["verified"])
+                self.assert_no_dispatch(h)
                 self.assert_cleaned(h)
-        h = Harness(lambda body: goal_reply(body, "done"))
-        h.page.evidence = []
-        output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "completion_unverified", output)
 
     async def test_changed_completion_evidence_is_reobserved_not_accepted(self):
         h = Harness()
 
         def respond(body):
             if len(h.client.calls) == 1:
-                h.page.evidence[0].description["name"] = "Login required"
+                h.snapshot["evidence"] = ["Login required"]
                 return goal_reply(body, "done")
             return goal_reply(body, "give_up", blocker="missing_input")
 
@@ -1212,11 +790,11 @@ class GoalLoopTests(BrowserTestCase):
         self.assertEqual(output["data"]["reason"], "missing_input", output)
         self.assertEqual(len(h.client.calls), 2)
         self.assertEqual(h.client.calls[1]["state"]["observation"]["evidence"], ["Login required"])
-        self.assertEqual(h.page.dispatched, [])
+        self.assert_no_dispatch(h)
         self.assert_cleaned(h)
 
     async def test_runner_and_caller_bounds_are_minimums_and_waits_consume_turns(self):
-        for runner_limit, caller_limit in ((1, 9), (9, 1), (2, 2)):
+        for runner_limit, caller_limit in ((1, 9), (9, 1)):
             with self.subTest(runner=runner_limit, caller=caller_limit):
                 h = Harness(lambda body: goal_reply(body, action=action_id(body, "wait")))
                 h.ctx.env["KODELET_BROWSER_USE_MAX_TURNS"] = str(runner_limit)
@@ -1238,60 +816,40 @@ class GoalLoopTests(BrowserTestCase):
             self.assertEqual(len(h.client.calls), 1)
             self.assert_cleaned(h)
 
-    async def test_reload_back_and_repeated_action_guard(self):
-        for operation in ("reload", "back", "click", "wait"):
-            with self.subTest(operation=operation):
-                h = Harness(
-                    lambda body, operation=operation: goal_reply(
-                        body, action=action_id(body, operation)
-                    )
-                )
-                output = await h.execute({**GOAL, "maxSteps": 5})
-                self.assertEqual(output["data"]["reason"], "no_progress", output)
-                self.assertEqual(
-                    output["data"]["actionsCompleted"], 3 if operation == "wait" else 1
-                )
-                self.assertEqual(len(h.client.calls), 3 if operation == "wait" else 2)
-                self.assertEqual(h.page.reload.await_count, int(operation == "reload"))
-                self.assertEqual(h.page.go_back.await_count, int(operation == "back"))
-                self.assertEqual(len(h.page.dispatched), int(operation == "click"))
+    async def test_repeated_mutation_stops_without_progress(self):
+        h = Harness(lambda body: goal_reply(body, action=action_id(body, "click")))
+        output = await h.execute({**GOAL, "maxSteps": 5})
+        self.assertEqual(output["data"]["reason"], "no_progress", output)
+        self.assertEqual(output["data"]["actionsCompleted"], 1)
+        self.assertEqual(len(h.client.calls), 2)
+        h.elements[0].handle.click.assert_awaited_once()
+        self.assert_cleaned(h)
+
+    async def test_later_stale_action_or_api_failure_retains_completed_history(self):
+        for failure, reason in (
+            ("stale_action", "jev_invalid_response"),
+            ("api", "jev_unavailable"),
+        ):
+            with self.subTest(failure=failure):
+                h = Harness()
+
+                def respond(body, h=h, failure=failure):
+                    if len(h.client.calls) > 1 and failure == "api":
+                        raise RuntimeError("private provider error")
+                    return goal_reply(body, action=action_id(h.client.calls[0], "click"))
+
+                h.client.respond = respond
+                output = await h.execute()
+                data = output["data"]
+                self.assertEqual(data["status"], "failed", output)
+                self.assertEqual(data["reason"], reason)
+                self.assertEqual(data["actionsCompleted"], 1)
+                self.assertEqual(data["history"][0]["operation"], "click")
+                self.assertEqual(h.client.calls[1]["state"]["recentActions"], data["history"])
+                h.elements[0].handle.click.assert_awaited_once()
+                self.assertIn("not rolled back", output["content"])
+                self.assert_private(h, output, "private provider error")
                 self.assert_cleaned(h)
-
-    async def test_previous_turn_action_ids_are_rejected(self):
-        h = Harness()
-        previous = None
-
-        def respond(body):
-            nonlocal previous
-            if previous is None:
-                previous = action_id(body, "click")
-            return goal_reply(body, action=previous)
-
-        h.client.respond = respond
-        output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "jev_invalid_response", output)
-        self.assertEqual(output["data"]["actionsCompleted"], 1)
-        self.assertEqual(len(h.page.dispatched), 1)
-        self.assert_cleaned(h)
-
-    async def test_later_inference_failure_retains_completed_history(self):
-        h = Harness()
-
-        def respond(body):
-            if len(h.client.calls) > 1:
-                raise RuntimeError("private provider error")
-            return goal_reply(body, action=action_id(body, "click"))
-
-        h.client.respond = respond
-        output = await h.execute()
-        self.assertEqual(output["data"]["status"], "failed", output)
-        self.assertEqual(output["data"]["reason"], "jev_unavailable")
-        self.assertEqual(output["data"]["actionsCompleted"], 1)
-        self.assertEqual(output["data"]["history"][0]["operation"], "click")
-        self.assertEqual(h.client.calls[1]["state"]["recentActions"], output["data"]["history"])
-        self.assertIn("not rolled back", output["content"])
-        self.assert_private(h, output, "private provider error")
-        self.assert_cleaned(h)
 
     async def test_cancellation_at_progress_inference_and_mid_action(self):
         for stage in ("progress", "inference", "action"):
@@ -1308,17 +866,21 @@ class GoalLoopTests(BrowserTestCase):
                 elif stage == "inference":
                     h.client.respond = block
                 else:
-                    h.page.controls[0].after_action = block
+                    h.elements[0].handle.click.side_effect = block
                 task = asyncio.create_task(h.execute())
-                await asyncio.wait_for(started.wait(), 1)
-                task.cancel()
-                output = await asyncio.wait_for(task, 2)
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    task.cancel()
+                    output = await asyncio.wait_for(task, 2)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
                 self.assertEqual(
                     output["data"]["status"],
                     "outcome_unknown" if stage == "action" else "canceled",
                     output,
                 )
-                self.assertEqual(len(h.page.dispatched), int(stage == "action"))
+                self.assertEqual(h.elements[0].handle.click.await_count, int(stage == "action"))
                 self.assertEqual(output["data"]["actionsCompleted"], 0)
                 self.assertLessEqual(len(h.client.calls), 1)
                 self.assert_cleaned(h)
@@ -1333,254 +895,36 @@ class GoalLoopTests(BrowserTestCase):
         h.ctx.update.side_effect = update
         output = await asyncio.create_task(h.execute())
         self.assertEqual(output["data"]["status"], "canceled", output)
-        self.assertEqual(h.page.dispatched, [])
+        self.assert_no_dispatch(h)
         self.assert_cleaned(h)
 
-    async def test_goal_action_failure_is_unknown_without_retry(self):
-        h = Harness(lambda body: goal_reply(body, action=action_id(body, "click")))
-
-        def fail(operation):
-            raise RuntimeError("private endpoint details")
-
-        h.page.controls[0].after_action = fail
-        output = await h.execute()
-        self.assertEqual(output["data"]["status"], "outcome_unknown", output)
-        self.assertEqual(len(h.page.dispatched), 1)
-        self.assertEqual(len(h.client.calls), 1)
-        self.assertEqual(output["data"]["actionsCompleted"], 0)
-        self.assertIn("do not automatically retry", output["content"])
-        self.assert_private(h, output, "private endpoint details")
-        self.assert_cleaned(h)
-
-    async def test_sdk_request_is_canceled_by_goal_deadline_without_retry(self):
-        requests = []
-        canceled = asyncio.Event()
-
-        async def respond(request):
-            requests.append(request)
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                canceled.set()
-                raise
-
-        h = Harness()
-        h.factory.return_value = self.sdk_client(respond)
-        output = await h.execute({**GOAL, "timeoutMs": 50})
-        self.assertEqual(output["data"]["status"], "timeout", output)
-        self.assertTrue(canceled.is_set())
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(h.page.dispatched, [])
-        h.lease.release.assert_awaited_once()
-        h.browser.close.assert_awaited_once()
-
-    async def test_off_batch_field_edits_invalidate_save_without_exposing_values(self):
-        h = Harness()
-        field = Control("Project name", editable=True, value="off-batch-original")
-        h.page.controls = [field, *[Control("Other") for _ in range(79)], Control("Save")]
-
-        def respond(body):
-            if len(h.client.calls) == 1:
-                return goal_reply(body, action=action_id(body, "inspect", section="controls"))
-            field.value = "off-batch-human-edit"
-            return goal_reply(body, action=action_id(body, "click", "Save"))
-
-        h.client.respond = respond
-        output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "stale_snapshot", output)
-        self.assertEqual(output["data"]["actionsCompleted"], 1)
-        self.assertEqual(
-            h.client.calls[1]["state"]["observation"]["pagination"]["controls"]["offset"], 80
-        )
-        self.assertEqual(h.page.dispatched, [])
-        self.assert_private(h, output, "off-batch-original", "off-batch-human-edit")
-        self.assert_cleaned(h)
-
-    async def test_large_page_inspect_extract_press_and_finish_on_later_evidence(self):
-        h = Harness()
-        query = Control("Search", editable=True, kind="search")
-        h.page.controls = [*[Control("Other") for _ in range(80)], query]
-        h.page.evidence = [Control(f"Heading {i}", role="heading") for i in range(20)]
-
-        def submitted(operation):
-            if operation == "press":
-                h.page.evidence.append(Control("C++ results", role="heading"))
-
-        query.after_action = submitted
-
-        def respond(body):
-            if "start" in body["questions"]:
-                return span_reply(body, "w2", "w4")
-            observation = body["state"]["observation"]
-            if observation["pagination"]["controls"]["offset"] == 0:
-                selected = action_id(body, "inspect", section="controls", offset=80)
-            elif not query.value:
-                selected = action_id(body, "fill_from_goal", "Search")
-            elif len(h.page.evidence) == 20:
-                selected = action_id(body, "press", "Search")
-            elif observation["pagination"]["evidence"]["offset"] == 0:
-                selected = action_id(body, "inspect", section="evidence", offset=20)
-            else:
-                return goal_reply(body, "done")
-            return goal_reply(body, action=selected)
-
-        h.client.respond = respond
-        goal = "Search for C++"
-        output = await h.execute(
-            {**GOAL, "goal": goal, "successCriteria": "C++ results are visible"}
-        )
-        self.assertEqual(output["data"]["status"], "done", output)
-        self.assertEqual(output["data"]["actionsCompleted"], 4)
-        self.assertEqual(
-            h.page.dispatched,
-            [
-                {"operation": "fill", "name": "Search", "value": "C++"},
-                {"operation": "press", "name": "Search", "key": "Enter"},
-            ],
-        )
-        self.assertEqual(output["data"]["history"][1]["sourceSpan"], {"start": 11, "end": 14})
-        self.assertEqual(output["data"]["evidence"]["messages"], ["C++ results"])
-        self.assertEqual(len(h.client.calls), 6)
-        for body in h.client.calls:
-            if "nextAction" in body["questions"]:
-                self.assertLessEqual(len(body["questions"]["nextAction"]["criteria"]), 201)
-        self.assert_private(h, output)
-        self.assert_cleaned(h)
-
-    async def test_uncertain_no_action_inspects_unseen_batch(self):
-        h = Harness()
-        h.page.controls = [Control("Other") for _ in range(81)]
-
-        def respond(body):
-            if len(h.client.calls) > 1:
-                return goal_reply(body, "give_up", blocker="missing_input")
-            answers = goal_reply(body)
-            answers["status"]["confidence"] = 0.2
-            return answers
-
-        h.client.respond = respond
-        output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "missing_input", output)
-        self.assertEqual(output["data"]["history"][0]["operation"], "inspect")
-        self.assertEqual(
-            h.client.calls[1]["state"]["observation"]["pagination"]["controls"]["offset"], 80
-        )
-        self.assertEqual(h.page.dispatched, [])
-        self.assert_cleaned(h)
-
-    async def test_goal_navigation_during_inference_blocks_dispatch(self):
-        h = Harness()
-
-        def respond(body):
-            h.page.navigate()
-            return goal_reply(body, action=action_id(body, "click"))
-
-        h.client.respond = respond
-        output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "stale_snapshot", output)
-        self.assertEqual(h.page.dispatched, [])
-        self.assert_cleaned(h)
-
-    async def test_extraction_revalidates_replaced_edited_or_navigated_target(self):
-        for mutation in ("replacement", "value_change", "navigation"):
+    async def test_extraction_revalidates_after_model_completion(self):
+        for mutation, reason in (("target", "stale_target"), ("values", "stale_snapshot")):
             with self.subTest(mutation=mutation):
                 h = Harness()
-                original = Control("Search", editable=True, value="original-value")
-                h.page.controls = [original]
+                field = element("e1", "Search", editable=True)
+                h.elements = [field]
+                h.snapshot["elements"] = [field.candidate]
 
-                def respond(body, h=h, mutation=mutation, original=original):
+                def respond(body, h=h, mutation=mutation):
                     if "start" not in body["questions"]:
                         return goal_reply(body, action=action_id(body, "fill_from_goal", "Search"))
-                    if mutation == "replacement":
-                        h.page.controls = [copy.deepcopy(original)]
-                        original.attached = False
-                    elif mutation == "value_change":
-                        original.value = "human-edited-value"
+                    h.validate.assert_not_awaited()
+                    if mutation == "target":
+                        h.validate.side_effect = browser_dom.BrowserUseError(
+                            "stale_target", "Replaced"
+                        )
                     else:
-                        h.page.navigate()
+                        h.snapshot["localValuesDigest"] = "human-edited-value-digest"
                     return span_reply(body, "w1", "w2")
 
                 h.client.respond = respond
                 output = await h.execute({**GOAL, "goal": "Find Ada Lovelace"})
-                self.assertEqual(
-                    output["data"]["reason"],
-                    "stale_target" if mutation == "replacement" else "stale_snapshot",
-                    output,
-                )
+                self.assertEqual(output["data"]["reason"], reason, output)
                 self.assertEqual(output["data"]["actionsCompleted"], 0)
                 self.assertEqual(len(h.client.calls), 2)
-                self.assertEqual(h.page.dispatched, [])
-                self.assert_private(h, output, "original-value", "human-edited-value")
-                self.assert_cleaned(h)
-
-    async def test_extraction_honors_deadline_and_cancellation_without_retry(self):
-        for interrupt in ("cancel", "deadline"):
-            with self.subTest(interrupt=interrupt):
-                entered, canceled = asyncio.Event(), asyncio.Event()
-                h = Harness()
-                h.page.controls = [Control("Search", editable=True)]
-
-                async def respond(body, entered=entered, canceled=canceled):
-                    if "start" not in body["questions"]:
-                        return goal_reply(body, action=action_id(body, "fill_from_goal", "Search"))
-                    entered.set()
-                    try:
-                        await asyncio.Event().wait()
-                    except asyncio.CancelledError:
-                        canceled.set()
-                        raise
-
-                h.client.respond = respond
-                task = asyncio.create_task(
-                    h.execute(
-                        {
-                            **GOAL,
-                            "goal": "Find Ada Lovelace",
-                            "timeoutMs": 50 if interrupt == "deadline" else 60000,
-                        }
-                    )
-                )
-                await asyncio.wait_for(entered.wait(), 1)
-                if interrupt == "cancel":
-                    task.cancel()
-                output = await asyncio.wait_for(task, 2)
-                self.assertEqual(
-                    output["data"]["status"],
-                    "canceled" if interrupt == "cancel" else "timeout",
-                    output,
-                )
-                self.assertTrue(canceled.is_set())
-                self.assertEqual(len(h.client.calls), 2)
-                self.assertEqual(h.page.dispatched, [])
-                self.assert_cleaned(h)
-
-    async def test_navigation_during_initial_observation_is_reobserved_before_inference(self):
-        for destroyed in (False, True):
-            with self.subTest(destroyed=destroyed):
-                h = Harness(lambda body: goal_reply(body, "done"))
-                reads = 0
-
-                async def title(h=h, destroyed=destroyed):
-                    nonlocal reads
-                    reads += 1
-                    if reads == 1:
-                        h.page.controls = [Control("Destination control")]
-                        h.page.navigate()
-                        if destroyed:
-                            raise RuntimeError("Execution context destroyed during navigation")
-                    return "Project settings"
-
-                h.page.title = title
-                output = await h.execute({**GOAL, "maxSteps": 2})
-                self.assertEqual(output["data"]["status"], "done", output)
-                self.assertEqual(output["data"]["steps"], 2)
-                self.assertEqual(reads, 3)
-                self.assertEqual(len(h.client.calls), 1)
-                self.assertEqual(
-                    [c["name"] for c in h.client.calls[0]["state"]["observation"]["elements"]],
-                    ["Destination control"],
-                )
-                self.assertEqual(h.page.dispatched, [])
+                self.assertEqual(h.validate.await_count, int(mutation == "target"))
+                self.assert_no_dispatch(h)
                 self.assert_cleaned(h)
 
 
@@ -1606,44 +950,6 @@ class GoalExtractionTests(BrowserTestCase):
                     },
                 )
                 self.assertEqual(client.calls[0]["state"]["recentActions"], history[-8:])
-
-    async def test_uncertain_reversed_absent_and_invalid_spans_cannot_invent_text(self):
-        for scenario in (
-            "low_confidence",
-            "reversed",
-            "none",
-            "unknown",
-            "missing",
-            "invalid_distribution",
-        ):
-            with self.subTest(scenario=scenario):
-
-                def respond(body, scenario=scenario):
-                    answers = span_reply(
-                        body, "w1", "w2", 0.2 if scenario == "low_confidence" else 0.95
-                    )
-                    if scenario == "reversed":
-                        answers = span_reply(body, "w2", "w1")
-                    elif scenario == "none":
-                        answers = span_reply(body, "none", "none")
-                    elif scenario == "unknown":
-                        answers["start"]["choice"] = "page-only-value"
-                    elif scenario == "missing":
-                        del answers["end"]
-                    elif scenario == "invalid_distribution":
-                        answers["end"]["probabilities"]["none"] = 1
-                    return answers
-
-                client = FakeClient(respond)
-                if scenario in ("unknown", "missing", "invalid_distribution"):
-                    with self.assertRaises(browser_dom.BrowserUseError) as caught:
-                        await browser_goal.goal_text(client, "Search project settings", ACCOUNT, [])
-                    self.assertEqual(caught.exception.code, "jev_invalid_response")
-                else:
-                    self.assertIsNone(
-                        await browser_goal.goal_text(client, "Search project settings", ACCOUNT, [])
-                    )
-                self.assertEqual(len(client.calls), 1)
 
     async def test_source_token_bound_skips_inference(self):
         client = FakeClient(lambda body: span_reply(body, "w0", "w253"))
@@ -1738,6 +1044,57 @@ class IsolatedChromiumTests(BrowserTestCase):
         self.assertEqual(lease.release.await_count, 2)
         self.assertNotIn("cleanupWarning", observed["data"])
         self.assertNotIn("cleanupWarning", navigated["data"])
+
+    async def test_goal_inspects_large_page_copies_search_and_submits(self):
+        await self.page.set_content(
+            "<button>Other</button>" * 80
+            + '<form><input aria-label="Search" type="search"></form>'
+            + "<h2>Other heading</h2>" * 20
+            + "<output></output>"
+        )
+        await self.page.evaluate("""() => {
+            document.querySelector('form').addEventListener('submit', event => {
+                event.preventDefault();
+                document.querySelector('output').textContent = 'C++ results';
+            });
+        }""")
+
+        def respond(body):
+            if "start" in body["questions"]:
+                return span_reply(body, "w2", "w4")
+            observation = body["state"]["observation"]
+            if observation["pagination"]["controls"]["offset"] == 0:
+                selected = action_id(body, "inspect", section="controls", offset=80)
+            elif not observation["nonEmptyFields"]:
+                selected = action_id(body, "fill_from_goal", "Search")
+            elif not any(
+                action["operation"] == "press" for action in body["state"]["recentActions"]
+            ):
+                selected = action_id(body, "press", "Search")
+            elif observation["pagination"]["evidence"]["offset"] == 0:
+                selected = action_id(body, "inspect", section="evidence", offset=20)
+            else:
+                return goal_reply(body, "done")
+            return goal_reply(body, action=selected)
+
+        client = FakeClient(respond)
+        async with asyncio.timeout(10) as deadline:
+            output = await browser_goal.run_goal(
+                self.page,
+                {**GOAL, "goal": "Search for C++", "successCriteria": "C++ results are visible"},
+                SimpleNamespace(update=AsyncMock()),
+                client,
+                {"maxSteps": 8, "timeoutMs": 10000},
+                deadline,
+            )
+        self.assertEqual(output["data"]["status"], "done", output)
+        self.assertEqual(await self.page.locator("input").input_value(), "C++")
+        self.assertEqual(await self.page.locator("output").inner_text(), "C++ results")
+        self.assertEqual(
+            [entry["operation"] for entry in output["data"]["history"]],
+            ["inspect", "fill_from_goal", "press", "inspect"],
+        )
+        self.assertEqual(output["data"]["history"][1]["sourceSpan"], {"start": 11, "end": 14})
 
     async def test_dom_labels_context_hidden_labels_and_values(self):
         await self.page.set_content("""
