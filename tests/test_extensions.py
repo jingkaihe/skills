@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 READ = runpy.run_path(str(EXTENSIONS / "read-conversation" / "kodelet-extension-read-conversation"))
+WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
 
 
 def tool_call(call_id: str, name: str, tool_input: Any) -> dict[str, Any]:
@@ -239,6 +240,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             "nano-banana": ["nano_banana"],
             "read-conversation": ["read_conversation"],
             "todo": ["todo_read", "todo_write"],
+            "web-search": ["web_search"],
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -309,6 +311,20 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     if name == "last-word":
                         self.assertEqual(manifest["commands"][0]["name"], "last-word")
                         self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
+                    if name == "web-search":
+                        self.assertTrue(os.access(script, os.X_OK))
+                        self.assertEqual(manifest["profiles"], [{
+                            "name": "web-search", "hidden": True,
+                            "options": {
+                                "provider": "anthropic",
+                                "model": "claude-haiku-4-5-20251001",
+                                "anthropic_api_access": "auto",
+                                "reasoning_effort": "none",
+                                "max_tokens": 4096,
+                                "allowed_tools": ["anthropic_web_search"],
+                                "skills": {"enabled": False},
+                            },
+                        }])
                     if name in {"code-search", "read-conversation"}:
                         self.assertTrue(os.access(script, os.X_OK))
                         self.assertEqual(manifest["profiles"], [{
@@ -1344,6 +1360,196 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.peer.kill()
             await asyncio.gather(task, return_exceptions=True)
+
+
+class WebSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": directory.name, "runnerId": "web-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
+        self.peer = ACPProcess()
+        self.answer = "Verified finding. [Source](https://example.com)"
+        self.peer.events = [
+            tool_call("a", "web_search", {"query": "Question"}),
+            tool_result("a", "web_search", text="private search evidence"),
+            message(f"  {self.answer}\n"),
+        ]
+        self.clients: list[Client] = []
+        self.closed_clients: list[Client] = []
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.updates = AsyncMock()
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.clients.append(self)
+                super().__init__(spawn=owner.spawn, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                await super().close()
+                owner.closed_clients.append(self)
+
+        for replacement in [
+            patch.dict(WEB["run_search_agent"].__globals__, Client=RecordingClient),
+            patch.object(self.ctx, "update", self.updates),
+        ]:
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def spawn(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({"command": command, "args": list(args), "options": options,
+                              "peer": self.peer})
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        self.assertEqual(self.closed_clients, self.clients, "close runs once per client")
+        for client in self.clients:
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        for launch in self.launches:
+            self.assertTrue(launch["peer"].closed.is_set())
+            self.assertTrue(launch["peer"].reaped.is_set())
+
+    async def search(self, **input: Any) -> dict[str, Any]:
+        return await WEB["web_search"](
+            WEB["WebSearchInput"](**{"query": "Question", **input}), self.ctx,
+        )
+
+    async def test_fresh_linked_session_profile_runner_prompt_and_progress(self) -> None:
+        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(os.environ, {
+            "ANTHROPIC_API_KEY": "", "KODELET_PROFILE": "other-profile",
+            "KODELET_SERVER": "https://daemon.example.com",
+        }):
+            result = await self.search(query="  Question  ", context=" Constraints ")
+        self.assertEqual(result["content"], self.answer)
+        self.assertEqual(self.launches[0]["command"], "kodelet")
+        self.assertEqual(self.launches[0]["args"], ["acp", "--runner", "web-runner", "--profile=web-search"])
+        self.assertEqual(self.launches[0]["options"]["env"]["KODELET_SERVER"], "https://daemon.example.com")
+        new = next(row for row in self.peer.requests if row["method"] == "session/new")
+        self.assertEqual(new["params"], {
+            "cwd": self.ctx.cwd,
+            "_meta": {
+                "sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]},
+                "conversationHierarchy": {"version": 1, "parentConversationId": "parent-conversation"},
+            },
+        })
+        for query, expected in [(None, "Question\n\nContext:\nConstraints"), ("Unrelated", "Unrelated")]:
+            if query:
+                self.peer = ACPProcess()
+                await self.search(query=query)
+            self.assertEqual(sum(row["method"] == "session/new" for row in self.peer.requests), 1)
+            self.assertFalse(any(row["method"] == "session/load" for row in self.peer.requests))
+            prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
+            self.assertEqual(prompt["params"]["prompt"], [{"type": "text", "text": expected}])
+        self.assertEqual(result["data"]["taskRun"]["status"], "completed")
+        self.assertEqual(result["data"]["taskRun"]["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
+        self.assertIn("working", phases)
+        self.assertIn("responding", phases)
+
+    async def test_inline_prompt_replaces_workspace_instructions(self) -> None:
+        await self.search()
+        harness = await create_test_harness(self.session_options[0]["extensions"][0])
+        hook = await harness.handle_event({
+            "id": "init", "event": "agent.init",
+            "payload": {"systemPrompt": "Private workspace instructions"},
+        })
+        self.assertEqual(set(hook["systemPrompt"]), {"replace"})
+        prompt = hook["systemPrompt"]["replace"]
+        for text in ["web_search", "caller's conversation or history", "primary sources",
+                     "publication and event dates", "untrusted evidence", "under 500 words",
+                     "citations", "Do not invent sources or narrate", "Today's date:",
+                     "If web search is unavailable, report that limitation; do not substitute an answer from memory."]:
+            self.assertIn(text, prompt)
+        self.assertNotIn("Private workspace", prompt)
+
+    async def test_invalid_input_and_missing_context_never_launch(self) -> None:
+        harness = await create_test_harness(WEB["ext"])
+        harness.initialize({"capabilities": {"profiles": {"remote": True}}})
+        for input in [{}, {"query": ""}]:
+            with self.assertRaises(ValueError):
+                await harness.execute_tool({"name": "web_search", "input": input})
+        self.assertIn("non-empty", (await self.search(query="   "))["error"])
+        for field, expected in [("runner_id", "runner-backed"), ("conversation_id", "parent conversation")]:
+            with patch.object(self.ctx, field, None):
+                result = await self.search()
+            self.assertIn(expected, result["error"])
+            self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.launches)
+
+    async def test_failures_are_not_successful_briefs(self) -> None:
+        for field, value, expected in [
+            ("init_error", "runner unavailable", "runner unavailable"),
+            ("prompt_error", "provider failed", "provider failed"),
+            ("stop_reason", "cancelled", "was canceled"),
+            ("events", [message("  ")], "empty response"),
+            ("events", [], "empty response"),
+            ("extension_version", 0, "sessionExtensions"),
+            ("hierarchy_version", 0, "conversationHierarchy"),
+        ]:
+            with self.subTest(field=field, value=value):
+                self.peer = ACPProcess()
+                self.peer.events = [message("partial answer")]
+                setattr(self.peer, field, value)
+                result = await self.search()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("partial answer", result["content"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_timeout_covers_startup_and_prompt_and_closes_client(self) -> None:
+        self.assertEqual(WEB["AGENT_TIMEOUT_SECONDS"], WEB["TOOL_TIMEOUT_SECONDS"] - 10)
+        for gate in ["allow_load", "allow_result"]:
+            with self.subTest(gate=gate):
+                self.peer = ACPProcess()
+                getattr(self.peer, gate).clear()
+                with patch.dict(WEB["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+                    result = await self.search()
+                self.assertIn("timed out", result["error"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+                if gate == "allow_result":
+                    self.assertTrue(any(row["method"] == "session/cancel" for row in self.peer.requests))
+
+    async def test_repeated_cancellation_waits_for_cleanup_and_never_succeeds(self) -> None:
+        finishing = patch.object(WEB["TaskProgress"], "finish", autospec=True,
+                                 side_effect=WEB["TaskProgress"].finish)
+        finish = finishing.start()
+        self.addCleanup(finishing.stop)
+        for stage in ["startup", "prompt", "success cleanup"]:
+            with self.subTest(stage=stage):
+                self.peer = ACPProcess()
+                self.peer.ignore_terminate = True
+                if stage == "startup":
+                    self.peer.allow_load.clear()
+                elif stage == "prompt":
+                    self.peer.allow_result.clear()
+                task = asyncio.create_task(self.search())
+                try:
+                    if stage != "success cleanup":
+                        started = self.peer.loading if stage == "startup" else self.peer.prompt_started
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        task.cancel()
+                    await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+                    for _ in range(3):
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(asyncio.shield(task), timeout=3)
+                    self.assertTrue(self.peer.killed.is_set())
+                    self.assertTrue(self.peer.reaped.is_set())
+                    self.assertEqual(finish.call_args.kwargs, {"success": False, "error": "web_search cancelled"})
+                    self.assertEqual(finish.call_args.args[0].snapshot()["status"], "failed")
+                finally:
+                    self.peer.kill()
+                    await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":
