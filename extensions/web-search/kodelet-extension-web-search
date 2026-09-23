@@ -49,7 +49,7 @@ SEARCH_PROFILE = ext.register_profile(
     "web-search",
     provider="anthropic",
     model="claude-haiku-4-5-20251001",
-    anthropic_api_access="auto",
+    anthropic_api_access="subscription",
     reasoning_effort="none",
     max_tokens=4096,
     allowed_tools=["anthropic_web_search"],
@@ -59,8 +59,13 @@ SEARCH_PROFILE = ext.register_profile(
 
 
 class WebSearchInput(BaseModel):
-    query: str = Field(min_length=1, description="The question or research objective to investigate.")
-    context: str | None = Field(default=None, description="Relevant background or constraints.")
+    query: str = Field(
+        min_length=1,
+        description="The question or research objective to investigate.",
+    )
+    context: str | None = Field(
+        default=None, description="Relevant background or constraints.",
+    )
 
 
 class SearchCitation(BaseModel):
@@ -121,13 +126,14 @@ async def run_search_agent(
     if response.get("stopReason") == "cancelled":
         raise RuntimeError("web_search was canceled")
     # The SDK preserves native result data in raw ACP events; display text is separate.
+    blocks: list[SearchTextBlock] = []
     try:
-        blocks = [
-            SearchTextBlock.model_validate(data)
-            for event in response["events"]
-            if event["type"] == "assistant.message_delta"
-            and (data := event.get("raw", {}).get("_meta", {}).get("kodelet/textData")) is not None
-        ]
+        for event in response["events"]:
+            if event["type"] != "assistant.message_delta":
+                continue
+            data = event.get("raw", {}).get("_meta", {}).get("kodelet/textData")
+            if data is not None:
+                blocks.append(SearchTextBlock.model_validate(data))
     except ValueError as exc:
         raise RuntimeError("web_search returned invalid answer data") from exc
     if not blocks:
@@ -156,7 +162,9 @@ def format_answer(blocks: list[SearchTextBlock]) -> str:
             reference = f"[{number}](<{url}>)"
             if reference not in references:
                 references.append(reference)
-        parts.append(text + (" " + " ".join(references) if references else ""))
+        if references:
+            text += " " + " ".join(references)
+        parts.append(text)
     return "\n\n".join(parts)
 
 
@@ -192,7 +200,10 @@ async def web_search(input: WebSearchInput, ctx: ToolContext) -> ToolExecutionRe
         if input.context and input.context.strip():
             query += f"\n\nContext:\n{input.context.strip()}"
         blocks = await run_search_agent(
-            query, ctx.cwd, progress, runner=ctx.runner_id,
+            query,
+            ctx.cwd,
+            progress,
+            runner=ctx.runner_id,
             parent_conversation_id=ctx.conversation_id,
         )
         content = format_answer(blocks)
@@ -213,7 +224,13 @@ async def web_search(input: WebSearchInput, ctx: ToolContext) -> ToolExecutionRe
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
 
     snapshot = await progress.finish(success=True)
-    return {"content": content, "data": {"blocks": [block.model_dump() for block in blocks], "taskRun": snapshot}}
+    return {
+        "content": content,
+        "data": {
+            "blocks": [block.model_dump() for block in blocks],
+            "taskRun": snapshot,
+        },
+    }
 
 
 if __name__ == "__main__":

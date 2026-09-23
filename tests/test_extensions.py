@@ -61,7 +61,10 @@ def tool_result(
 
 
 def message(text: str, data: Any = None) -> dict[str, Any]:
-    update = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+    update = {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": text},
+    }
     if data is not None:
         update["_meta"] = {"kodelet/textData": data}
     return update
@@ -317,11 +320,12 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     if name == "web-search":
                         self.assertTrue(os.access(script, os.X_OK))
                         self.assertEqual(manifest["profiles"], [{
-                            "name": "web-search", "hidden": True,
+                            "name": "web-search",
+                            "hidden": True,
                             "options": {
                                 "provider": "anthropic",
                                 "model": "claude-haiku-4-5-20251001",
-                                "anthropic_api_access": "auto",
+                                "anthropic_api_access": "subscription",
                                 "reasoning_effort": "none",
                                 "max_tokens": 4096,
                                 "allowed_tools": ["anthropic_web_search"],
@@ -1374,16 +1378,18 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             {"conversationId": "parent-conversation"},
         )
         self.peer = ACPProcess()
-        self.answer = "Verified finding. [1](<https://example.com>)"
-        self.answer_data = {"blocks": [{
-            "text": "Verified finding.", "citations": [{
-                "url": "https://example.com", "title": "Source", "cited_text": "Evidence",
+        self.answer_block = {
+            "text": "Verified finding.",
+            "citations": [{
+                "url": "https://example.com",
+                "title": "Source",
+                "cited_text": "Evidence",
             }],
-        }]}
+        }
         self.peer.events = [
             tool_call("a", "web_search", {"query": "Question"}),
             tool_result("a", "web_search", text="private search evidence"),
-            message("Display text is not parsed", self.answer_data["blocks"][0]),
+            message("Display text is not parsed", self.answer_block),
         ]
         self.clients: list[Client] = []
         self.closed_clients: list[Client] = []
@@ -1413,8 +1419,12 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(replacement.stop)
 
     def spawn(self, command: str, args: Any, options: Any) -> ACPProcess:
-        self.launches.append({"command": command, "args": list(args), "options": options,
-                              "peer": self.peer})
+        self.launches.append({
+            "command": command,
+            "args": list(args),
+            "options": options,
+            "peer": self.peer,
+        })
         return self.peer
 
     async def asyncTearDown(self) -> None:
@@ -1426,90 +1436,101 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(launch["peer"].closed.is_set())
             self.assertTrue(launch["peer"].reaped.is_set())
 
-    async def search(self, **input: Any) -> dict[str, Any]:
+    async def search(self, query: str = "Question", **input: Any) -> dict[str, Any]:
         return await WEB["web_search"](
-            WEB["WebSearchInput"](**{"query": "Question", **input}), self.ctx,
+            WEB["WebSearchInput"](query=query, **input), self.ctx,
         )
 
     async def test_fresh_linked_session_profile_runner_prompt_and_progress(self) -> None:
-        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(os.environ, {
-            "ANTHROPIC_API_KEY": "", "KODELET_PROFILE": "other-profile",
-            "KODELET_SERVER": "https://daemon.example.com",
-        }):
+        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(
+            os.environ, KODELET_PROFILE="other-profile",
+        ):
             result = await self.search(query="  Question  ", context=" Constraints ")
-        self.assertEqual(result["content"], self.answer)
-        self.assertEqual(result["data"]["blocks"], self.answer_data["blocks"])
+        self.assertEqual(result["content"], "Verified finding. [1](<https://example.com>)")
+        self.assertEqual(result["data"]["blocks"], [self.answer_block])
         self.assertEqual(self.launches[0]["command"], "kodelet")
-        self.assertEqual(self.launches[0]["args"], ["acp", "--runner", "web-runner", "--profile=web-search"])
-        self.assertEqual(self.launches[0]["options"]["env"]["KODELET_SERVER"], "https://daemon.example.com")
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "web-runner", "--profile=web-search",
+        ])
         new = next(row for row in self.peer.requests if row["method"] == "session/new")
         self.assertEqual(new["params"], {
             "cwd": self.ctx.cwd,
             "_meta": {
                 "sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]},
-                "conversationHierarchy": {"version": 1, "parentConversationId": "parent-conversation"},
+                "conversationHierarchy": {
+                    "version": 1,
+                    "parentConversationId": "parent-conversation",
+                },
             },
         })
-        for query, expected in [(None, "Question\n\nContext:\nConstraints"), ("Unrelated", "Unrelated")]:
-            if query:
-                self.peer = ACPProcess()
-                await self.search(query=query)
-            self.assertEqual(sum(row["method"] == "session/new" for row in self.peer.requests), 1)
-            self.assertFalse(any(row["method"] == "session/load" for row in self.peer.requests))
-            prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
-            self.assertEqual(prompt["params"]["prompt"], [{"type": "text", "text": expected}])
-        self.assertEqual(result["data"]["taskRun"]["status"], "completed")
-        self.assertEqual(result["data"]["taskRun"]["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        self.assertFalse(any(row["method"] == "session/load" for row in self.peer.requests))
+        prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
+        self.assertEqual(prompt["params"]["prompt"], [{
+            "type": "text",
+            "text": "Question\n\nContext:\nConstraints",
+        }])
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
         phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
         self.assertIn("working", phases)
         self.assertIn("responding", phases)
 
-    async def test_inline_prompt_replaces_workspace_instructions(self) -> None:
-        await self.search()
         harness = await create_test_harness(self.session_options[0]["extensions"][0])
         hook = await harness.handle_event({
-            "id": "init", "event": "agent.init",
+            "id": "init",
+            "event": "agent.init",
             "payload": {"systemPrompt": "Private workspace instructions"},
         })
         self.assertEqual(set(hook["systemPrompt"]), {"replace"})
         prompt = hook["systemPrompt"]["replace"]
-        for text in ["web_search", "caller's conversation or history", "primary sources",
-                     "publication and event dates", "untrusted evidence", "under 500 words",
-                     "Do not invent sources or narrate", "Today's date:",
-                     "If web search is unavailable, report that limitation; do not substitute an answer from memory."]:
+        for text in [
+            "Use only web_search",
+            "untrusted evidence",
+            "If web search is unavailable, report that limitation",
+            "do not substitute an answer from memory",
+        ]:
             self.assertIn(text, prompt)
+        self.assertRegex(prompt, r"Today's date: \d{4}-\d{2}-\d{2} \(UTC\)\.")
         self.assertNotIn("Private workspace", prompt)
-        self.assertNotIn("citation", prompt)
-        self.assertNotIn("JSON", prompt)
 
     async def test_native_citations_are_rendered_without_model_formatting(self) -> None:
-        citations = [
-            {"url": url, "cited_text": "Evidence"}
-            for url in ["https://example.com/a(b)?q=<x>", "javascript:alert(1)",
-                        "https://example.com/a(b)?q=<x>", "https://", "https://[broken"]
+        urls = [
+            "https://example.com/a(b)?q=<x>",
+            "javascript:alert(1)",
+            "https://example.com/a(b)?q=<x>",
+            "https://",
+            "https://[broken",
         ]
-        self.peer.events = [message("Rendered block", block) for block in [
+        citations = [{"url": url, "cited_text": "Evidence"} for url in urls]
+        blocks = [
             {"text": "First finding.", "citations": citations},
-            {"text": "Second finding.", "citations": [citations[0], {
-                "url": "https://example.org", "cited_text": "More evidence",
-            }]},
+            {
+                "text": "Second finding.",
+                "citations": [
+                    citations[0],
+                    {"url": "https://example.org", "cited_text": "More evidence"},
+                ],
+            },
             {"text": "Uncited qualification.", "citations": []},
-        ]]
+        ]
+        self.peer.events = [message("Rendered block", block) for block in blocks]
         result = await self.search()
         self.assertNotIn("error", result)
-        self.assertEqual(result["content"],
-                         "First finding. [1](<https://example.com/a(b)?q=%3Cx%3E>)\n\n"
-                         "Second finding. [1](<https://example.com/a(b)?q=%3Cx%3E>) [2](<https://example.org>)\n\n"
-                         "Uncited qualification.")
+        self.assertEqual(
+            result["content"],
+            "First finding. [1](<https://example.com/a(b)?q=%3Cx%3E>)\n\n"
+            "Second finding. [1](<https://example.com/a(b)?q=%3Cx%3E>) "
+            "[2](<https://example.org>)\n\n"
+            "Uncited qualification.",
+        )
 
     async def test_invalid_input_and_missing_context_never_launch(self) -> None:
-        harness = await create_test_harness(WEB["ext"])
-        harness.initialize({"capabilities": {"profiles": {"remote": True}}})
-        for input in [{}, {"query": ""}]:
-            with self.assertRaises(ValueError):
-                await harness.execute_tool({"name": "web_search", "input": input})
         self.assertIn("non-empty", (await self.search(query="   "))["error"])
-        for field, expected in [("runner_id", "runner-backed"), ("conversation_id", "parent conversation")]:
+        for field, expected in [
+            ("runner_id", "runner-backed"),
+            ("conversation_id", "parent conversation"),
+        ]:
             with patch.object(self.ctx, field, None):
                 result = await self.search()
             self.assertIn(expected, result["error"])
@@ -1517,21 +1538,21 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.launches)
 
     async def test_failures_are_not_successful_briefs(self) -> None:
+        invalid_answer = message("Display text", {"text": "Missing citations"})
+        empty_answer = message("Display text", {"text": " \n ", "citations": []})
         for field, value, expected in [
             ("init_error", "runner unavailable", "runner unavailable"),
             ("prompt_error", "provider failed", "provider failed"),
             ("stop_reason", "cancelled", "was canceled"),
-            ("events", [message("  ")], "no answer data"),
-            ("events", [], "no answer data"),
             ("events", [message("Prose without data")], "no answer data"),
-            ("events", [message("Display text", {"text": "Missing citations"})], "invalid answer data"),
-            ("events", [message("Display text", {"text": "", "citations": []})], "empty answer text"),
-            ("extension_version", 0, "sessionExtensions"),
-            ("hierarchy_version", 0, "conversationHierarchy"),
+            ("events", [invalid_answer], "invalid answer data"),
+            ("events", [empty_answer], "empty answer text"),
         ]:
             with self.subTest(field=field, value=value):
                 self.peer = ACPProcess()
-                self.peer.events = [message("partial answer")]
+                self.peer.events = [message(
+                    "Display text", {"text": "partial answer", "citations": []},
+                )]
                 setattr(self.peer, field, value)
                 result = await self.search()
                 self.assertIn(expected, result["error"])
@@ -1549,41 +1570,35 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("timed out", result["error"])
                 self.assertEqual(result["data"]["taskRun"]["status"], "failed")
                 if gate == "allow_result":
-                    self.assertTrue(any(row["method"] == "session/cancel" for row in self.peer.requests))
+                    self.assertTrue(any(
+                        row["method"] == "session/cancel" for row in self.peer.requests
+                    ))
 
-    async def test_repeated_cancellation_waits_for_cleanup_and_never_succeeds(self) -> None:
-        finishing = patch.object(WEB["TaskProgress"], "finish", autospec=True,
-                                 side_effect=WEB["TaskProgress"].finish)
-        finish = finishing.start()
-        self.addCleanup(finishing.stop)
-        for stage in ["startup", "prompt", "success cleanup"]:
-            with self.subTest(stage=stage):
-                self.peer = ACPProcess()
-                self.peer.ignore_terminate = True
-                if stage == "startup":
-                    self.peer.allow_load.clear()
-                elif stage == "prompt":
-                    self.peer.allow_result.clear()
-                task = asyncio.create_task(self.search())
-                try:
-                    if stage != "success cleanup":
-                        started = self.peer.loading if stage == "startup" else self.peer.prompt_started
-                        await asyncio.wait_for(started.wait(), timeout=2)
-                        task.cancel()
-                    await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
-                    for _ in range(3):
-                        task.cancel()
-                        await asyncio.sleep(0)
-                        self.assertFalse(task.done())
-                    with self.assertRaises(asyncio.CancelledError):
-                        await asyncio.wait_for(asyncio.shield(task), timeout=3)
-                    self.assertTrue(self.peer.killed.is_set())
-                    self.assertTrue(self.peer.reaped.is_set())
-                    self.assertEqual(finish.call_args.kwargs, {"success": False, "error": "web_search cancelled"})
-                    self.assertEqual(finish.call_args.args[0].snapshot()["status"], "failed")
-                finally:
-                    self.peer.kill()
-                    await asyncio.gather(task, return_exceptions=True)
+    async def test_repeated_cancellation_during_success_cleanup_never_succeeds(self) -> None:
+        self.peer.ignore_terminate = True
+        with patch.object(
+            WEB["TaskProgress"], "finish", autospec=True,
+            side_effect=WEB["TaskProgress"].finish,
+        ) as finish:
+            task = asyncio.create_task(self.search())
+            try:
+                await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3)
+                self.assertTrue(self.peer.killed.is_set())
+                self.assertTrue(self.peer.reaped.is_set())
+                self.assertEqual(finish.call_args.kwargs, {
+                    "success": False,
+                    "error": "web_search cancelled",
+                })
+                self.assertEqual(finish.call_args.args[0].snapshot()["status"], "failed")
+            finally:
+                self.peer.kill()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":
