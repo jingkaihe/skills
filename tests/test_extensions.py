@@ -60,8 +60,11 @@ def tool_result(
     }
 
 
-def message(text: str) -> dict[str, Any]:
-    return {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+def message(text: str, data: Any = None) -> dict[str, Any]:
+    update = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+    if data is not None:
+        update["_meta"] = {"kodelet/textData": data}
+    return update
 
 
 class ACPProcess:
@@ -1371,11 +1374,16 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             {"conversationId": "parent-conversation"},
         )
         self.peer = ACPProcess()
-        self.answer = "Verified finding. [Source](https://example.com)"
+        self.answer = "Verified finding. [1](<https://example.com>)"
+        self.answer_data = {"blocks": [{
+            "text": "Verified finding.", "citations": [{
+                "url": "https://example.com", "title": "Source", "cited_text": "Evidence",
+            }],
+        }]}
         self.peer.events = [
             tool_call("a", "web_search", {"query": "Question"}),
             tool_result("a", "web_search", text="private search evidence"),
-            message(f"  {self.answer}\n"),
+            message("Display text is not parsed", self.answer_data["blocks"][0]),
         ]
         self.clients: list[Client] = []
         self.closed_clients: list[Client] = []
@@ -1430,6 +1438,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         }):
             result = await self.search(query="  Question  ", context=" Constraints ")
         self.assertEqual(result["content"], self.answer)
+        self.assertEqual(result["data"]["blocks"], self.answer_data["blocks"])
         self.assertEqual(self.launches[0]["command"], "kodelet")
         self.assertEqual(self.launches[0]["args"], ["acp", "--runner", "web-runner", "--profile=web-search"])
         self.assertEqual(self.launches[0]["options"]["env"]["KODELET_SERVER"], "https://daemon.example.com")
@@ -1466,10 +1475,32 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         prompt = hook["systemPrompt"]["replace"]
         for text in ["web_search", "caller's conversation or history", "primary sources",
                      "publication and event dates", "untrusted evidence", "under 500 words",
-                     "citations", "Do not invent sources or narrate", "Today's date:",
+                     "Do not invent sources or narrate", "Today's date:",
                      "If web search is unavailable, report that limitation; do not substitute an answer from memory."]:
             self.assertIn(text, prompt)
         self.assertNotIn("Private workspace", prompt)
+        self.assertNotIn("citation", prompt)
+        self.assertNotIn("JSON", prompt)
+
+    async def test_native_citations_are_rendered_without_model_formatting(self) -> None:
+        citations = [
+            {"url": url, "cited_text": "Evidence"}
+            for url in ["https://example.com/a(b)?q=<x>", "javascript:alert(1)",
+                        "https://example.com/a(b)?q=<x>", "https://", "https://[broken"]
+        ]
+        self.peer.events = [message("Rendered block", block) for block in [
+            {"text": "First finding.", "citations": citations},
+            {"text": "Second finding.", "citations": [citations[0], {
+                "url": "https://example.org", "cited_text": "More evidence",
+            }]},
+            {"text": "Uncited qualification.", "citations": []},
+        ]]
+        result = await self.search()
+        self.assertNotIn("error", result)
+        self.assertEqual(result["content"],
+                         "First finding. [1](<https://example.com/a(b)?q=%3Cx%3E>)\n\n"
+                         "Second finding. [1](<https://example.com/a(b)?q=%3Cx%3E>) [2](<https://example.org>)\n\n"
+                         "Uncited qualification.")
 
     async def test_invalid_input_and_missing_context_never_launch(self) -> None:
         harness = await create_test_harness(WEB["ext"])
@@ -1490,8 +1521,11 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             ("init_error", "runner unavailable", "runner unavailable"),
             ("prompt_error", "provider failed", "provider failed"),
             ("stop_reason", "cancelled", "was canceled"),
-            ("events", [message("  ")], "empty response"),
-            ("events", [], "empty response"),
+            ("events", [message("  ")], "no answer data"),
+            ("events", [], "no answer data"),
+            ("events", [message("Prose without data")], "no answer data"),
+            ("events", [message("Display text", {"text": "Missing citations"})], "invalid answer data"),
+            ("events", [message("Display text", {"text": "", "citations": []})], "empty answer text"),
             ("extension_version", 0, "sessionExtensions"),
             ("hierarchy_version", 0, "conversationHierarchy"),
         ]:
