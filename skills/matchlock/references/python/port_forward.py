@@ -8,10 +8,13 @@
 This example:
 1. Starts nginx in the guest and forwards host 8080 -> guest 80 at create-time.
 2. Adds a runtime forward host 18080 -> guest 80 after launch.
+
+Use --port and --runtime-port if the default host ports are already in use.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import time
@@ -38,7 +41,12 @@ def wait_for_http(url: str, attempts: int = 30, delay_seconds: float = 0.25) -> 
 
 
 def main() -> None:
-    sandbox = Sandbox("nginx:alpine").with_port_forward(8080, 80)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=8080, help="Create-time host port")
+    parser.add_argument("--runtime-port", type=int, default=18080, help="Runtime host port")
+    args = parser.parse_args()
+
+    sandbox = Sandbox("nginx:alpine").with_port_forward(args.port, 80)
     config = Config(binary_path=os.environ.get("MATCHLOCK_BIN", "matchlock"))
 
     client = Client(config)
@@ -49,11 +57,11 @@ def main() -> None:
 
             client.write_file("/usr/share/nginx/html/index.html", "hello matchlock\n")
 
-            body_8080 = wait_for_http("http://127.0.0.1:8080")
-            log.info("create-time forward works: 127.0.0.1:8080 -> guest:80")
-            print(body_8080)
+            body = wait_for_http(f"http://127.0.0.1:{args.port}")
+            log.info("create-time forward works: 127.0.0.1:%d -> guest:80", args.port)
+            print(body)
 
-            bindings = client.port_forward("18080:80")
+            bindings = client.port_forward(f"{args.runtime_port}:80")
             for binding in bindings:
                 log.info(
                     "runtime forward added: %s:%d -> guest:%d",
@@ -62,9 +70,9 @@ def main() -> None:
                     binding.remote_port,
                 )
 
-            body_18080 = wait_for_http("http://127.0.0.1:18080")
-            log.info("runtime forward works: 127.0.0.1:18080 -> guest:80")
-            print(body_18080)
+            body = wait_for_http(f"http://127.0.0.1:{args.runtime_port}")
+            log.info("runtime forward works: 127.0.0.1:%d -> guest:80", args.runtime_port)
+            print(body)
     finally:
         try:
             client.remove()

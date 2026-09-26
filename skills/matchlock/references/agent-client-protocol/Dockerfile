@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -s /bin/bash agent \
-    && mkdir -p /home/agent \
-    && chown -R agent:agent /home/agent
+    && mkdir -p /home/agent /workspace \
+    && chown -R agent:agent /home/agent /workspace
 
 USER agent
 

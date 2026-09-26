@@ -17,13 +17,12 @@ When software inside the VM expects a specific token shape, Matchlock also suppo
 
 ## Architecture
 
-```
-┌──────────── Host ────────────┐      ┌──── Micro-VM ─────┐
-│ Matchlock CLI / SDK          │      │ Guest Agent       │
-│ Policy Engine                │──────│ (vsock :5000)     │
-│ Transparent Proxy + TLS MITM │      │                   │
-│ VFS Server                   │──────│ /workspace (FUSE) │
-└──────────────────────────────┘      └───────────────────┘
+```diagram
+╭───────── Host ──────────╮          ╭────── Micro-VM ──────╮
+│ SDK → Matchlock CLI     │──vsock──▶│ Guest agent          │
+│ Exec and file APIs      │          │ Native guest storage │
+│ Policy + TLS MITM proxy │◀─────────│ Guest network        │
+╰─────────────────────────╯          ╰──────────────────────╯
 ```
 
 Platforms: Linux (Firecracker/KVM) and macOS (Apple Silicon via Virtualization.framework).
@@ -72,11 +71,12 @@ matchlock run --image ubuntu:24.04 \
   --secret-placeholder "GH_TOKEN=gho_sandbox_placeholder" \
   -- sh -lc 'printf "%s\n" "$GH_TOKEN"'
 
-# Mount a host directory
-matchlock run --image node:22-alpine \
-  -v /home/user/project:/workspace:host_fs \
+# Attach persistent guest storage
+matchlock volume create workdata --size 5120
+matchlock run --image alpine:latest \
+  --disk @workdata:/workspace \
   -w /workspace \
-  -- npm test
+  -- sh -c 'echo hello > greeting.txt'
 
 # Publish ports
 matchlock run --image nginx:latest -p 8080:80 --rm=false -- nginx -g "daemon off;"
@@ -114,8 +114,22 @@ Placeholder values must not overlap with each other, or with Matchlock's generat
 ```bash
 matchlock exec <vm-id> -- <command>
 matchlock exec <vm-id> -it -- bash
-matchlock exec <vm-id> -w /workspace -- ls -la
+matchlock exec <vm-id> -w /tmp -- ls -la
 ```
+
+### Explicit File Transfer
+
+Use the SDK file APIs for individual files:
+
+| Operation | Go | Python | TypeScript |
+|-----------|----|--------|------------|
+| Upload bytes | `WriteFile` / `WriteFileMode` | `write_file` | `writeFile` |
+| Download bytes | `ReadFile` | `read_file` | `readFile` |
+| List guest files | `ListFiles` | `list_files` | `listFiles` |
+
+SDK calls go through host-side `matchlock rpc`; the host communicates with the guest over vsock. The SDK read/write calls buffer file contents and encode them as base64 in JSON-RPC.
+
+For larger or binary transfers, use `ExecPipe` / `exec_pipe` / `execPipe` with stdin/stdout streams. For example, send a tar archive to a guest `tar -xf -` command, or stream a guest file/archive back through stdout. Create guest-local directories before selecting them as a working directory. See the exec-mode examples for pipe usage and the basic examples for file writes.
 
 ### Lifecycle Management
 
@@ -158,15 +172,29 @@ docker save img | matchlock image import img        # Import from tarball
 matchlock image gc                                  # Garbage-collect blobs
 ```
 
+Dockerfile builds run BuildKit in a VM. Matchlock archives the context and selected Dockerfile on the host, streams them into guest-local storage over vsock, then streams the resulting image tarball back into the host image importer. `.dockerignore` and Dockerfile-specific ignore files control the upload; Unix socket entries are skipped rather than transferred.
+
+Build storage has two separate size controls (both default to 10240 MB):
+
+| Flag | Storage |
+|------|---------|
+| `--build-cache-size` | Persistent ext4 cache attached at `/var/lib/buildkit`; contains BuildKit snapshots and cache |
+| `--build-disk` | Build VM root disk; contains the uploaded context and output tarball |
+
+The persistent cache is `~/.cache/matchlock/buildkit/cache.ext4`. A larger `--build-cache-size` grows it in place while preserving the cache. For out-of-space errors under `/var/lib/buildkit` with caching enabled, check cache capacity and host free space; increasing `--build-disk` alone does not enlarge the cache. `--no-cache` skips attaching the persistent cache, so BuildKit storage also consumes the VM root disk in that mode.
+
 ### Volume Management
 
 ```bash
 matchlock volume create mydata                      # Create named ext4 volume
 matchlock volume create mydata --size 5120          # Create with size (MB)
 matchlock volume ls                                 # List volumes
+matchlock volume ls --json                          # Include host image paths
 matchlock volume rm mydata                          # Remove volume
 matchlock volume cp mydata mydata-backup            # Copy volume
 ```
+
+Attach a named volume with `run --disk @mydata:/data`, or an existing ext4 image with `run --disk /absolute/path/data.ext4:/data`. Data on these block volumes persists after VM removal. Named volumes live in `~/.cache/matchlock/volumes/`; the separate BuildKit cache is **not** listed or managed by `matchlock volume`.
 
 ### Resource Cleanup
 
@@ -196,13 +224,13 @@ sudo matchlock setup linux --user $USER
 
 | SDK | Working examples |
 |-----|------------------|
-| Python | `references/python/basic.py`, `exec_modes.py`, `network_interception.py`, `port_forward.py`, `vfs_hooks.py` |
-| Go | `references/go/basic.go`, `exec_modes.go`, `network_interception.go`, `vfs_hooks.go` |
+| Python | `references/python/basic.py`, `exec_modes.py`, `network_interception.py`, `port_forward.py` |
+| Go | `references/go/basic.go`, `exec_modes.go`, `network_interception.go` |
 | TypeScript | `references/typescript/basic.ts`, `exec_modes.ts`, `network_interception.ts` |
 
 The Python references use PEP 723 inline dependencies and are run with `uv run`.
 
-The examples cover sandbox construction, lifecycle management, buffered and interactive execution, file operations, secret injection, network interception, port forwarding, and VFS hooks where supported. Interception callbacks run on the **host side**, so real secrets must not be passed into guest code.
+The examples cover sandbox construction, lifecycle management, buffered/streaming/interactive execution, explicit file operations, secret injection, network interception, and port forwarding. Network interception callbacks run on the **host side**, so real secrets must not be passed into guest code.
 
 SDK builders mirror the CLI options. For APIs not shown in the examples, inspect the SDK source directories listed above. Custom-placeholder helpers are `add_secret_with_placeholder` (Python), `AddSecretWithPlaceholder` (Go), and `addSecretWithPlaceholder` (TypeScript).
 

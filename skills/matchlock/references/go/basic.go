@@ -2,22 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 
-	"github.com/jingkaihe/matchlock/internal/errx"
 	"github.com/jingkaihe/matchlock/pkg/sdk"
-)
-
-var (
-	errCreateClient   = errors.New("create client")
-	errLaunchSandbox  = errors.New("launch sandbox")
-	errExecPythonVer  = errors.New("exec python3 --version")
-	errExecPipInstall = errors.New("exec pip install uv")
-	errWriteFile      = errors.New("write_file")
-	errExecStream     = errors.New("exec_stream")
 )
 
 func main() {
@@ -30,7 +19,7 @@ func main() {
 func run() error {
 	client, err := sdk.NewClient(sdk.DefaultConfig())
 	if err != nil {
-		return errx.Wrap(errCreateClient, err)
+		return fmt.Errorf("create client: %w", err)
 	}
 	defer client.Remove()
 	defer client.Close(0)
@@ -46,18 +35,18 @@ func run() error {
 
 	vmID, err := client.Launch(sandbox)
 	if err != nil {
-		return errx.Wrap(errLaunchSandbox, err)
+		return fmt.Errorf("launch sandbox: %w", err)
 	}
 	slog.Info("sandbox ready", "vm", vmID)
 
 	result, err := client.Exec(context.Background(), "python3 --version")
 	if err != nil {
-		return errx.Wrap(errExecPythonVer, err)
+		return fmt.Errorf("exec python3 --version: %w", err)
 	}
 	fmt.Print(result.Stdout)
 
 	if _, err := client.Exec(context.Background(), "pip install --quiet uv"); err != nil {
-		return errx.Wrap(errExecPipInstall, err)
+		return fmt.Errorf("exec pip install uv: %w", err)
 	}
 
 	script := `# /// script
@@ -77,7 +66,7 @@ with client.messages.stream(
 print()
 `
 	if err := client.WriteFile(context.Background(), "/workspace/ask.py", []byte(script)); err != nil {
-		return errx.Wrap(errWriteFile, err)
+		return fmt.Errorf("write_file: %w", err)
 	}
 
 	streamResult, err := client.ExecStream(context.Background(),
@@ -85,7 +74,7 @@ print()
 		os.Stdout, os.Stderr,
 	)
 	if err != nil {
-		return errx.Wrap(errExecStream, err)
+		return fmt.Errorf("exec_stream: %w", err)
 	}
 	fmt.Println()
 	slog.Info("done", "exit_code", streamResult.ExitCode, "duration_ms", streamResult.DurationMS)

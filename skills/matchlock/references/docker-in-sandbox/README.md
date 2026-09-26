@@ -2,9 +2,12 @@
 
 This example demonstrates how to run Docker inside a matchlock sandbox.
 It boots `/usr/sbin/init` (systemd) in a nested PID namespace so Docker is started
-via `docker.service`, pins Docker to `iptables-legacy` for bridge setup, and uses
+via `docker.service`, uses Docker's nftables firewall backend for bridge setup, and uses
 Docker's `vfs` storage driver (with containerd snapshotter disabled) to avoid
 overlay-on-overlay mount failures inside the guest.
+
+Rebuild older example images that selected `iptables-legacy`; they can fail to
+start Docker because the guest kernel does not provide legacy iptables NAT.
 
 ## Build the Image
 

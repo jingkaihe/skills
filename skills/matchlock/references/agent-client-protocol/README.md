@@ -46,6 +46,14 @@ flowchart TD
 - `ANTHROPIC_API_KEY` environment variable set
 - [uv](https://docs.astral.sh/uv/) installed (for running the Streamlit app)
 
+The app honors `MATCHLOCK_BIN=/absolute/path/to/matchlock`, then checks for a
+repo-local binary and `matchlock` on `PATH`. ACP sessions use the guest-local
+`/workspace` directory; the host working directory is not mounted or copied into
+the VM.
+
+The example is tested with `agent-client-protocol` 0.12.1, which is its declared
+minimum dependency version. Earlier versions have not been validated.
+
 ## Quick Start
 
 ### 1. Build the sandbox image

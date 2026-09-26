@@ -14,7 +14,7 @@ async function runExecStream(client: MatchlockClient): Promise<void> {
   const result = await client.execStream(
     "echo stream:start; sleep 1; echo stream:end",
     {
-      workingDir: "/workspace",
+      workingDir: "/tmp",
       stdout: process.stdout,
       stderr: process.stderr,
     },
@@ -28,7 +28,7 @@ async function runExecPipe(client: MatchlockClient): Promise<void> {
   const stderrChunks: Buffer[] = [];
 
   const result = await client.execPipe("cat; echo pipe-stderr >&2", {
-    workingDir: "/workspace",
+    workingDir: "/tmp",
     stdin: [Buffer.from("hello from stdin\n")],
     stdout: (chunk) => {
       stdoutChunks.push(chunk);
@@ -61,7 +61,7 @@ async function runExecInteractive(client: MatchlockClient): Promise<void> {
   process.stdin.setRawMode(true);
   try {
     const result = await client.execInteractive("sh", {
-      workingDir: "/workspace",
+      workingDir: "/tmp",
       stdin: process.stdin,
       stdout: process.stdout,
       rows,
@@ -71,14 +71,14 @@ async function runExecInteractive(client: MatchlockClient): Promise<void> {
   } finally {
     process.stdin.setRawMode(false);
     process.stdin.pause();
+    // This standalone example is done with stdin; release any pending TTY read.
+    process.stdin.destroy();
   }
 }
 
 async function main(): Promise<void> {
   const client = new Client();
-  const sandbox = new Sandbox("alpine:latest")
-    .withWorkspace("/workspace")
-    .mountMemory("/workspace");
+  const sandbox = new Sandbox("alpine:latest");
 
   try {
     const vmId = await client.launch(sandbox);

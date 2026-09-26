@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "streamlit>=1.45.0",
-#     "agent-client-protocol>=0.7.0",
+#     "agent-client-protocol>=0.12.1",
 # ]
 # ///
 """
@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 from datetime import datetime
@@ -41,7 +42,7 @@ from acp.schema import (  # type: ignore[import-not-found]
     AgentThoughtChunk,
     CreateTerminalResponse,
     EnvVariable,
-    KillTerminalCommandResponse,
+    KillTerminalResponse,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -106,13 +107,21 @@ logger = logging.getLogger(__name__)
 
 
 def find_matchlock_binary() -> str:
+    configured = os.environ.get("MATCHLOCK_BIN")
+    if configured:
+        binary = shutil.which(configured)
+        if binary:
+            return binary
+        raise RuntimeError(f"MATCHLOCK_BIN is not executable: {configured}")
+
     local = os.path.join(os.path.dirname(__file__), "..", "..", "bin", "matchlock")
     local = os.path.normpath(local)
     if os.path.isfile(local) and os.access(local, os.X_OK):
         return local
-    st.error(f"Could not find matchlock at {local}. Build with `mise run build`.")
-    st.stop()
-    raise SystemExit
+    binary = shutil.which("matchlock")
+    if binary:
+        return binary
+    raise RuntimeError("Could not find matchlock. Add it to PATH or set MATCHLOCK_BIN.")
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +230,7 @@ class _PersistentACP:
             protocol_version=PROTOCOL_VERSION, client_capabilities=None,
         )
 
-        session = await self._conn.new_session(cwd=os.getcwd(), mcp_servers=[])
+        session = await self._conn.new_session(cwd="/workspace", mcp_servers=[])
         self._session_id = session.session_id
 
     async def _cleanup(self) -> None:
@@ -349,7 +358,7 @@ class ACPClient(Client):
     async def wait_for_terminal_exit(self, session_id: str, terminal_id: str, **kwargs: Any) -> WaitForTerminalExitResponse:
         raise RequestError.method_not_found("terminal/wait_for_exit")
 
-    async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> KillTerminalCommandResponse | None:
+    async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> KillTerminalResponse | None:
         raise RequestError.method_not_found("terminal/kill")
 
     async def ext_method(self, method: str, params: dict) -> dict:

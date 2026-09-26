@@ -9,18 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jingkaihe/matchlock/internal/errx"
 	"github.com/jingkaihe/matchlock/pkg/sdk"
 	"golang.org/x/term"
-)
-
-var (
-	errCreateClient     = errors.New("create client")
-	errLaunchSandbox    = errors.New("launch sandbox")
-	errTerminalRequired = errors.New("terminal required")
-	errSetRawMode       = errors.New("set raw mode")
-	errRestoreTerm      = errors.New("restore terminal mode")
-	errExecTTY          = errors.New("exec_tty")
 )
 
 func main() {
@@ -33,21 +23,21 @@ func main() {
 func run() error {
 	client, err := sdk.NewClient(sdk.DefaultConfig())
 	if err != nil {
-		return errx.Wrap(errCreateClient, err)
+		return fmt.Errorf("create client: %w", err)
 	}
 	defer client.Remove()
 	defer client.Close(0)
 
-	sandbox := sdk.New("alpine:latest").WithWorkspace("/workspace").MountMemory("/workspace")
+	sandbox := sdk.New("alpine:latest")
 
 	vmID, err := client.Launch(sandbox)
 	if err != nil {
-		return errx.Wrap(errLaunchSandbox, err)
+		return fmt.Errorf("launch sandbox: %w", err)
 	}
 	slog.Info("sandbox ready", "vm", vmID)
 
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return errx.With(errTerminalRequired, ": run this example in an interactive terminal")
+		return errors.New("terminal required: run this example in an interactive terminal")
 	}
 
 	ctx := context.Background()
@@ -62,7 +52,7 @@ func run() error {
 
 	oldState, err := term.MakeRaw(stdinFD)
 	if err != nil {
-		return errx.Wrap(errSetRawMode, err)
+		return fmt.Errorf("set raw mode: %w", err)
 	}
 	restored := false
 	defer func() {
@@ -97,7 +87,7 @@ func run() error {
 	}()
 
 	ttyResult, err := client.ExecInteractive(ctx, "sh", &sdk.ExecInteractiveOptions{
-		WorkingDir: "/workspace",
+		WorkingDir: "/tmp",
 		Rows:       uint16(rows),
 		Cols:       uint16(cols),
 		Stdin:      os.Stdin,
@@ -105,10 +95,10 @@ func run() error {
 		Resize:     resizeCh,
 	})
 	if err != nil {
-		return errx.Wrap(errExecTTY, err)
+		return fmt.Errorf("exec_tty: %w", err)
 	}
 	if err := term.Restore(stdinFD, oldState); err != nil {
-		return errx.Wrap(errRestoreTerm, err)
+		return fmt.Errorf("restore terminal mode: %w", err)
 	}
 	restored = true
 
