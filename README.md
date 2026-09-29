@@ -24,12 +24,11 @@ A collection of CLI tool skill definitions for AI assistants.
 |-----------|------------------|-------------|
 | [browser-use](./extensions/browser-use/README.md) | `browser_use` | Goal-driven automation in the browser shared with the user |
 | [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
+| [conversation](./extensions/conversation/kodelet-extension-conversation) | `read_conversation`, `search_conversation` | Search saved conversations for ranked IDs and highlighted excerpts, then extract relevant evidence with read-only agentic research |
 | [goal](./extensions/goal/kodelet-extension-goal) | `/goal`, `get_goal`, `update_goal` | Persistent conversation objectives with completion audits and automatic follow-up turns |
 | [last-word](./extensions/last-word/kodelet-extension-last-word) | `/last-word`, `ctrl+alt+w` | Save the most recent completed agent response to a Markdown file |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
-| [read-conversation](./extensions/read-conversation/kodelet-extension-read-conversation) | `read_conversation` | Read-only agentic research over saved conversation snapshots, with transcript-line evidence |
-| [search-conversation](./extensions/search-conversation/kodelet-extension-search-conversation) | `search_conversation` | Full-text search over saved conversations, returning ranked IDs with highlighted excerpts to pass to `read_conversation` |
 | [todo](./extensions/todo/kodelet-extension-todo) | `todo_read`, `todo_write` | Track conversation tasks with progress summaries, status checklists, and a live composer widget |
 | [web-search](./extensions/web-search/kodelet-extension-web-search) | `web_search` | Web research with concise, source-linked answers |
 
@@ -38,6 +37,8 @@ A collection of CLI tool skill definitions for AI assistants.
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.
 
 The runner needs `kodelet` on `PATH`, CLI daemon configuration (`KODELET_SERVER` or saved config), and client/API authentication (`KODELET_AUTH_TOKEN` or CLI auth config) for history export, conversation search, and SDK session creation. A runner-only token is insufficient. `search_conversation` needs a kodelet release that includes `kodelet conversation search`; it runs one search without a model call and excludes the current conversation.
+
+The `conversation` extension replaces the separate `read-conversation` and `search-conversation` extensions. Update any extension allow/deny entries to the new executable/directory path (or plugin ID `jingkaihe@skills/conversation`) and process configuration to `conversation`. Tool names and per-tool configuration are unchanged, as is the hidden `read-conversation` profile.
 
 The durable subagent extension now lives in the standalone [`jingkaihe/kodelet-subagent`](https://github.com/jingkaihe/kodelet-subagent) repository. Install it separately with `uvx kodelet-subagent install`.
 

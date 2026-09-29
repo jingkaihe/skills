@@ -39,8 +39,7 @@ from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
-READ = runpy.run_path(str(EXTENSIONS / "read-conversation" / "kodelet-extension-read-conversation"))
-FIND = runpy.run_path(str(EXTENSIONS / "search-conversation" / "kodelet-extension-search-conversation"))
+CONVERSATION = runpy.run_path(str(EXTENSIONS / "conversation" / "kodelet-extension-conversation"))
 WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
 
 
@@ -237,15 +236,50 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(direct_url, "Default run must test the published minimum wheel")
         self.assertEqual(ACP_MESSAGE_LIMIT, 64 * 1024 * 1024)
 
+    async def test_conversation_tools_dispatch_in_one_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = await create_test_harness(CONVERSATION["ext"])
+            harness.initialize({
+                "capabilities": {"profiles": {"remote": True}},
+                "extension": {
+                    "id": "conversation", "cwd": directory, "runnerId": "conversation-runner",
+                },
+            })
+            context = {"conversationId": "current", "cwd": directory}
+            search = AsyncMock(return_value={"total": 1, "conversations": [search_hit("saved")]})
+            export = AsyncMock()
+            read = AsyncMock(return_value="Evidence: conversation saved, transcript lines 1-3.")
+            with patch.dict(CONVERSATION["read_conversation"].__globals__, {
+                "run_search": search, "export_transcript": export, "run_read_agent": read,
+            }):
+                found = await harness.execute_tool({
+                    "name": "search_conversation", "input": {"query": "earlier work"}, "context": context,
+                })
+                result = await harness.execute_tool({
+                    "name": "read_conversation",
+                    "input": {"conversation_id": "saved", "goal": "What changed?"}, "context": context,
+                })
+            self.assertNotIn("error", found)
+            self.assertIn("`saved`", found["content"])
+            search.assert_awaited_once_with("earlier work", None, 11, directory)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["content"], read.return_value)
+            export.assert_awaited_once()
+            self.assertEqual(export.await_args.args[0], "saved")
+            read.assert_awaited_once()
+            self.assertEqual(read.await_args.kwargs, {
+                "runner": "conversation-runner", "parent_conversation_id": "current",
+            })
+
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
             "browser-use": ["browser_use"],
             "code-search": ["code_search"],
+            "conversation": ["read_conversation", "search_conversation"],
             "goal": ["get_goal", "update_goal"],
             "last-word": [],
             "look-at": ["look_at"],
             "nano-banana": ["nano_banana"],
-            "read-conversation": ["read_conversation"],
             "todo": ["todo_read", "todo_write"],
             "web-search": ["web_search"],
         }
@@ -333,10 +367,11 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                                 "skills": {"enabled": False},
                             },
                         }])
-                    if name in {"code-search", "read-conversation"}:
+                    if name in {"code-search", "conversation"}:
                         self.assertTrue(os.access(script, os.X_OK))
                         self.assertEqual(manifest["profiles"], [{
-                            "name": name, "hidden": True,
+                            "name": "read-conversation" if name == "conversation" else name,
+                            "hidden": True,
                             "options": {
                                 "provider": "openai",
                                 "model": "gpt-6-luna",
@@ -1147,7 +1182,7 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         self.real_spawn = asyncio.create_subprocess_exec
         self.updates = AsyncMock()
         for replacement in [
-            patch.dict(READ["run_read_agent"].__globals__, Client=RecordingClient),
+            patch.dict(CONVERSATION["run_read_agent"].__globals__, Client=RecordingClient),
             patch("asyncio.create_subprocess_exec", side_effect=self.spawn_exporter),
             patch.object(self.ctx, "update", self.updates),
         ]:
@@ -1184,7 +1219,7 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(transcript.parent.exists(), "all temporary files must be removed")
 
     async def read(self, **kwargs: Any) -> dict[str, Any]:
-        return await READ["read_conversation"](READ["ReadConversationInput"](**{
+        return await CONVERSATION["read_conversation"](CONVERSATION["ReadConversationInput"](**{
             "conversation_id": "parent-conversation", "goal": " What changed? ", **kwargs,
         }), self.ctx)
 
@@ -1237,14 +1272,16 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
                          "parent-conversation")
         harness = await create_test_harness(options["extensions"][0])
         callback = await harness.handle_event({"event": "agent.init", "payload": {
-            "allowedTools": ["file_read", "grep_tool", "glob_tool", "bash", "read_conversation"],
+            "allowedTools": [
+                "file_read", "grep_tool", "glob_tool", "bash", "read_conversation", "search_conversation",
+            ],
         }})
         self.assertEqual(callback["tools"], {
-            "disable": ["glob_tool", "bash", "read_conversation"],
+            "disable": ["glob_tool", "bash", "read_conversation", "search_conversation"],
             "enable": ["file_read", "grep_tool"],
         })
         instructions = callback["systemPrompt"]["append"]
-        self.assertEqual(instructions, READ["build_sysprompt_text"](7))
+        self.assertEqual(instructions, CONVERSATION["build_sysprompt_text"](7))
         for evidence in ["7 turns", "100-200 lines", "untrusted historical data",
                          "orientation only", "reverts", "attempts, not successes",
                          "transcript lines", "Never cite temporary", "unverified facts"]:
@@ -1267,7 +1304,7 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.export_kwargs), {"cwd", "stdin", "stdout", "stderr"})
         self.assertEqual(self.export_kwargs["cwd"], str(self.root))
         self.assertEqual(self.export_kwargs["stdin"], asyncio.subprocess.DEVNULL)
-        self.assertEqual(READ["ReadConversationInput"](conversation_id="id", goal="g").max_turns, 12)
+        self.assertEqual(CONVERSATION["ReadConversationInput"](conversation_id="id", goal="g").max_turns, 12)
         self.assertNotIn("max_turns", self.session_options[0])
 
     async def test_invalid_input_or_missing_parent_context_never_exports(self) -> None:
@@ -1289,7 +1326,7 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("partial transcript discarded", result["error"])
         self.assertIn("response exceeds 64 MiB", result["error"])
         self.assertNotIn("ignored prefix", result["error"])
-        self.assertLess(len(result["error"]), READ["ERROR_TAIL_BYTES"] + 200)
+        self.assertLess(len(result["error"]), CONVERSATION["ERROR_TAIL_BYTES"] + 200)
         self.assertEqual(result["data"]["taskRun"]["status"], "failed")
         self.assertFalse(self.clients)
 
@@ -1317,14 +1354,14 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_export_timeout_kills_and_reaps_without_child(self) -> None:
         self.export_program = "import time; time.sleep(60)"
-        with patch.dict(READ["export_transcript"].__globals__, EXPORT_TIMEOUT_SECONDS=0.1):
+        with patch.dict(CONVERSATION["export_transcript"].__globals__, EXPORT_TIMEOUT_SECONDS=0.1):
             self.assertIn("timed out exporting", (await self.read())["error"])
         self.assertEqual(self.exporters[0].returncode, -9)
         self.assertFalse(self.clients)
 
     async def test_child_timeout_cancels_session_and_cleans_transcript(self) -> None:
         self.peer.allow_result.clear()
-        with patch.dict(READ["run_read_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+        with patch.dict(CONVERSATION["run_read_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
             self.assertIn("timed out", (await self.read())["error"])
         self.assertTrue(any(row["method"] == "session/cancel" for row in self.peer.requests))
 
@@ -1409,7 +1446,7 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(process.returncode, "search process must be reaped")
 
     async def search(self, **kwargs: Any) -> dict[str, Any]:
-        return await FIND["search_conversation"](FIND["SearchConversationInput"](**{
+        return await CONVERSATION["search_conversation"](CONVERSATION["SearchConversationInput"](**{
             "query": " fts5 index ", **kwargs,
         }), self.ctx)
 
@@ -1461,7 +1498,7 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_input_never_spawns(self) -> None:
         self.assertIn("non-empty", (await self.search(query="   "))["error"])
         with self.assertRaises(ValueError):
-            FIND["SearchConversationInput"](query="x", limit=FIND["MAX_LIMIT"] + 1)
+            CONVERSATION["SearchConversationInput"](query="x", limit=CONVERSATION["MAX_LIMIT"] + 1)
         self.assertFalse(self.spawned)
 
     async def test_failures_are_errors_with_bounded_detail(self) -> None:
@@ -1475,13 +1512,13 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.search()
                 self.assertIn(expected, result["error"])
                 self.assertNotIn("ignored", result["error"])
-                self.assertLess(len(result["error"]), FIND["ERROR_TAIL_CHARS"] + 200)
+                self.assertLess(len(result["error"]), CONVERSATION["ERROR_TAIL_CHARS"] + 200)
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("missing kodelet")):
             self.assertIn("missing kodelet", (await self.search())["error"])
 
     async def test_timeout_and_cancellation_kill_and_reap(self) -> None:
         self.program = "import time; time.sleep(60)"
-        with patch.dict(FIND["run_search"].__globals__, SEARCH_TIMEOUT_SECONDS=0.1):
+        with patch.dict(CONVERSATION["run_search"].__globals__, SEARCH_TIMEOUT_SECONDS=0.1):
             self.assertIn("timed out", (await self.search())["error"])
         self.assertEqual(self.spawned[-1].returncode, -9)
 
