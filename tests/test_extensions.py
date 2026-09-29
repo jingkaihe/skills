@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 READ = runpy.run_path(str(EXTENSIONS / "read-conversation" / "kodelet-extension-read-conversation"))
+FIND = runpy.run_path(str(EXTENSIONS / "search-conversation" / "kodelet-extension-search-conversation"))
 WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
 
 
@@ -1367,6 +1368,132 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.peer.kill()
             await asyncio.gather(task, return_exceptions=True)
+
+
+def search_hit(conversation_id: str, title: str = "", **fields: Any) -> dict[str, Any]:
+    return {
+        "id": conversation_id, "title": title, "cwd": "/srv/project",
+        "created_at": "2026-09-29T18:00:00Z", "updated_at": "2026-09-29T18:23:12.476821083Z",
+        "message_count": 4, "match_count": 1, "matches": [], **fields,
+    }
+
+
+class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "search-runner"}},
+            {"conversationId": "current"},
+        )
+        self.response: dict[str, Any] = {"conversations": [], "total": 0}
+        self.program: str | None = None
+        self.spawned: list[asyncio.subprocess.Process] = []
+        self.started = asyncio.Event()
+        self.real_spawn = asyncio.create_subprocess_exec
+        replacement = patch("asyncio.create_subprocess_exec", side_effect=self.spawn)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    async def spawn(self, *args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        self.args, self.kwargs = args, kwargs
+        program = self.program or f"import sys; sys.stdout.write({json.dumps(json.dumps(self.response))})"
+        process = await self.real_spawn(sys.executable, "-c", program, **kwargs)
+        self.spawned.append(process)
+        self.started.set()
+        return process
+
+    async def asyncTearDown(self) -> None:
+        for process in self.spawned:
+            self.assertIsNotNone(process.returncode, "search process must be reaped")
+
+    async def search(self, **kwargs: Any) -> dict[str, Any]:
+        return await FIND["search_conversation"](FIND["SearchConversationInput"](**{
+            "query": " fts5 index ", **kwargs,
+        }), self.ctx)
+
+    async def test_argv_is_literal_and_current_conversation_is_excluded(self) -> None:
+        self.response = {"total": 5, "conversations": [
+            search_hit("current", "This conversation"),
+            search_hit("alpha", "Search design", match_count=3, matches=[
+                {"entry_index": 2, "role": "user", "kind": "text", "snippet": "add an **fts5** **index**"},
+                {"entry_index": 5, "role": "assistant", "kind": "tool-use", "snippet": "bash command: rg **fts5**"},
+            ]),
+            search_hit("beta", "", cwd="", matches=[
+                {"entry_index": -1, "kind": "title", "snippet": "**fts5** **index** notes"},
+            ]),
+        ]}
+        query = "--help;$(touch unsafe)"
+        result = await self.search(query=f" {query} ", cwd=" /srv/project ", limit=2)
+        self.assertNotIn("error", result)
+        self.assertEqual(self.args, (
+            "kodelet", "conversation", "search", "--json", "--limit", "3", "--matches", "3",
+            "--cwd", "/srv/project", "--", query,
+        ))
+        self.assertEqual(self.kwargs["cwd"], str(self.root))
+        self.assertEqual(self.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+        self.assertEqual(result["content"], "\n".join([
+            (
+                f"Found 4 matching conversations in `/srv/project` for `{query}`; showing the 2 most relevant."
+                " Use read_conversation with an ID and a goal to read one."
+            ),
+            "",
+            "1. `alpha` - Search design",
+            "   updated 2026-09-29 18:23 UTC · /srv/project · 3 matching messages",
+            "   - user: add an **fts5** **index**",
+            "   - tool input: bash command: rg **fts5**",
+            "",
+            "2. `beta` - (untitled)",
+            "   updated 2026-09-29 18:23 UTC · 1 matching message",
+            "   - title: **fts5** **index** notes",
+        ]))
+
+    async def test_defaults_and_empty_results_suggest_broader_queries(self) -> None:
+        self.response = {"conversations": [search_hit("current")], "total": 1, "search_pending": 3}
+        result = await self.search()
+        self.assertNotIn("error", result)
+        self.assertEqual(self.args[4:], ("--limit", "11", "--matches", "3", "--", "fts5 index"))
+        self.assertIn("No saved conversations match `fts5 index`.", result["content"])
+        self.assertIn("try fewer or different words", result["content"])
+        self.assertIn("Note: 3 conversations are still being indexed", result["content"])
+
+    async def test_invalid_input_never_spawns(self) -> None:
+        self.assertIn("non-empty", (await self.search(query="   "))["error"])
+        with self.assertRaises(ValueError):
+            FIND["SearchConversationInput"](query="x", limit=FIND["MAX_LIMIT"] + 1)
+        self.assertFalse(self.spawned)
+
+    async def test_failures_are_errors_with_bounded_detail(self) -> None:
+        for program, expected in [
+            ("import sys; sys.stderr.write('ignored' + 'x' * 10_000 + 'HTTP 401'); sys.exit(1)", "HTTP 401"),
+            ("print('not json')", "invalid JSON"),
+            ("print('[]')", "unexpected response"),
+        ]:
+            with self.subTest(expected=expected):
+                self.program = program
+                result = await self.search()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("ignored", result["error"])
+                self.assertLess(len(result["error"]), FIND["ERROR_TAIL_CHARS"] + 200)
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("missing kodelet")):
+            self.assertIn("missing kodelet", (await self.search())["error"])
+
+    async def test_timeout_and_cancellation_kill_and_reap(self) -> None:
+        self.program = "import time; time.sleep(60)"
+        with patch.dict(FIND["run_search"].__globals__, SEARCH_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out", (await self.search())["error"])
+        self.assertEqual(self.spawned[-1].returncode, -9)
+
+        self.started.clear()
+        task = asyncio.create_task(self.search())
+        await asyncio.wait_for(self.started.wait(), timeout=3)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=3)
+        self.assertEqual(self.spawned[-1].returncode, -9)
 
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):

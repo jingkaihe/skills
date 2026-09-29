@@ -1,0 +1,194 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk>=0.5.5,<0.6"]
+# ///
+
+from __future__ import annotations
+
+import asyncio
+import json
+import textwrap
+from contextlib import suppress
+from datetime import datetime
+from typing import Any
+
+from kodelet_sdk import BaseModel, Extension, Field, ToolContext, ToolExecutionResult
+
+DESCRIPTION = textwrap.dedent(
+    """
+    Search saved conversations by keyword and return matching conversation IDs with highlighted
+    excerpts, most relevant first. Use it to find earlier work, decisions, or discussions when you
+    do not know the conversation ID, then call read_conversation with an ID and a goal for details.
+    Searches conversation titles, IDs, working directories, user and assistant messages, tool call
+    inputs, and compaction summaries; thinking and tool output are not searched. Bare words match as
+    prefixes and "quoted text" matches an exact phrase. All terms must appear in the same message,
+    so use a few distinctive words and retry with fewer or different words if nothing matches.
+    The current conversation is excluded.
+    """
+).strip()
+
+SEARCH_TIMEOUT_SECONDS = 30
+MATCHES_PER_CONVERSATION = 3
+MAX_LIMIT = 25
+ERROR_TAIL_CHARS = 4096
+
+MATCH_LABELS = {"title": "title", "tool-use": "tool input", "compaction": "compaction summary"}
+
+ext = Extension(name="search-conversation", version="0.1.0")
+
+
+class SearchError(RuntimeError):
+    """The kodelet CLI could not complete the search."""
+
+
+class SearchConversationInput(BaseModel):
+    query: str = Field(
+        min_length=1,
+        description='A few distinctive words or "exact phrases"; all terms must appear in the same message',
+    )
+    cwd: str | None = Field(
+        default=None,
+        description="Only search conversations saved with this exact absolute working directory",
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=MAX_LIMIT,
+        description="Maximum number of conversations to return",
+    )
+
+
+async def reap(process: asyncio.subprocess.Process) -> None:
+    """Kill and wait for the search process, even through repeated cancellation."""
+    if process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+    waiting = asyncio.ensure_future(process.wait())
+    cancelled = False
+    while not waiting.done():
+        try:
+            await asyncio.shield(waiting)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def run_search(query: str, cwd: str | None, limit: int, working_directory: str) -> dict[str, Any]:
+    # Inherit the runner's KODELET_SERVER/auth configuration; do not access a local DB.
+    argv = [
+        "kodelet", "conversation", "search", "--json",
+        "--limit", str(limit), "--matches", str(MATCHES_PER_CONVERSATION),
+    ]
+    if cwd:
+        argv += ["--cwd", cwd]
+    argv += ["--", query]
+    process = await asyncio.create_subprocess_exec(
+        *argv, cwd=working_directory, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(SEARCH_TIMEOUT_SECONDS):
+            stdout, stderr = await process.communicate()
+    except TimeoutError:
+        raise TimeoutError("search_conversation timed out waiting for kodelet") from None
+    finally:
+        if process.returncode is None:
+            await reap(process)
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[-ERROR_TAIL_CHARS:]
+        raise SearchError(f"conversation search failed (exit {process.returncode}): {detail or '(no output)'}")
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise SearchError(f"conversation search returned invalid JSON: {exc}") from None
+    if not isinstance(result, dict) or not isinstance(result.get("conversations"), list):
+        raise SearchError("conversation search returned an unexpected response")
+    return result
+
+
+def format_updated(value: Any) -> str:
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%Y-%m-%d %H:%M %Z").strip()
+    except ValueError:
+        return str(value)
+
+
+def format_results(
+    query: str, cwd: str | None, result: dict[str, Any], conversations: list[dict[str, Any]], total: int,
+) -> str:
+    scope = f" in `{cwd}`" if cwd else ""
+    lines: list[str] = []
+    if not conversations:
+        lines.append(f"No saved conversations{scope} match `{query}`.")
+        lines.append(
+            "All terms must appear in the same message; try fewer or different words, "
+            "or drop exact-phrase quotes."
+        )
+    else:
+        shown = len(conversations)
+        summary = f"Found {total} matching conversation{'s' if total != 1 else ''}{scope} for `{query}`"
+        if total > shown:
+            summary += f"; showing the {shown} most relevant"
+        lines.append(summary + ". Use read_conversation with an ID and a goal to read one.")
+        for index, conversation in enumerate(conversations, start=1):
+            title = str(conversation.get("title") or "").strip() or "(untitled)"
+            lines.append("")
+            lines.append(f"{index}. `{conversation.get('id')}` - {title}")
+            details = [f"updated {format_updated(conversation.get('updated_at'))}"]
+            if conversation.get("cwd"):
+                details.append(str(conversation["cwd"]))
+            count = int(conversation.get("match_count") or 0)
+            details.append(f"{count} matching message{'s' if count != 1 else ''}")
+            lines.append("   " + " · ".join(details))
+            for match in conversation.get("matches") or []:
+                label = MATCH_LABELS.get(match.get("kind")) or match.get("role") or match.get("kind")
+                lines.append(f"   - {label}: {match.get('snippet', '')}")
+    pending = int(result.get("search_pending") or 0)
+    if pending:
+        lines.append("")
+        lines.append(
+            f"Note: {pending} conversation{'s are' if pending != 1 else ' is'} still being indexed, "
+            "so results may be incomplete."
+        )
+    return "\n".join(lines)
+
+
+@ext.tool(
+    "search_conversation",
+    description=DESCRIPTION,
+    input_schema=SearchConversationInput,
+    timeout_in_sec=SEARCH_TIMEOUT_SECONDS + 5,
+)
+async def search_conversation(input: SearchConversationInput, ctx: ToolContext) -> ToolExecutionResult:
+    query = input.query.strip()
+    cwd = (input.cwd or "").strip() or None
+    if not query:
+        message = "query must be a non-empty string"
+        return {"content": message, "error": message}
+
+    # Ask for one extra result so excluding the current conversation keeps the limit.
+    try:
+        result = await run_search(query, cwd, input.limit + 1, ctx.cwd)
+    except TimeoutError as exc:
+        message = str(exc)
+        return {"content": message, "error": message}
+    except (OSError, SearchError) as exc:
+        message = f"search_conversation failed: {exc}"
+        return {"content": message, "error": message}
+
+    total = int(result.get("total") or 0)
+    conversations = [
+        conversation for conversation in result["conversations"]
+        if not ctx.conversation_id or conversation.get("id") != ctx.conversation_id
+    ]
+    if len(conversations) < len(result["conversations"]):
+        total = max(total - 1, len(conversations))
+    conversations = conversations[:input.limit]
+    return {"content": format_results(query, cwd, result, conversations, total)}
+
+
+if __name__ == "__main__":
+    ext.run_sync()
