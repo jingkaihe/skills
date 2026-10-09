@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.5.5,<0.6"]
+# dependencies = ["kodelet-sdk>=0.6.0,<0.7"]
 # ///
 
 from __future__ import annotations
@@ -43,6 +43,17 @@ class Goal(BaseModel):
     reason: str = ""
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")
+
+
+GOAL_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"anyOf": [Goal.model_json_schema(by_alias=True), {"type": "null"}]},
+        "active": {"type": "boolean"},
+    },
+    "required": ["goal", "active"],
+    "additionalProperties": False,
+}
 
 
 class GetGoalInput(BaseModel):
@@ -111,9 +122,11 @@ def format_goal(goal: Goal) -> str:
 def goal_result(goal: Goal, content: str) -> ToolExecutionResult:
     return {
         "content": content,
-        "data": {
+        "structuredContent": {
             "goal": goal.model_dump(mode="json", by_alias=True),
             "active": goal.status == "active",
+        },
+        "data": {
             "presentation": {
                 "summary": f"Goal {goal.status}",
                 "body": format_goal(goal),
@@ -213,6 +226,8 @@ async def set_goal(_input: Any, ctx: CommandContext) -> CommandResult:
     "get_goal",
     description="Get the current goal for this thread, including status and objective.",
     input_schema=GetGoalInput,
+    output_schema=GOAL_OUTPUT_SCHEMA,
+    short="Get the current thread goal and status.",
 )
 async def get_goal(_input: GetGoalInput, ctx: ToolContext) -> ToolExecutionResult:
     try:
@@ -224,7 +239,7 @@ async def get_goal(_input: GetGoalInput, ctx: ToolContext) -> ToolExecutionResul
     if goal is None:
         return {
             "content": "No goal is currently defined for this thread.",
-            "data": {"active": False},
+            "structuredContent": {"goal": None, "active": False},
         }
     return goal_result(goal, format_goal(goal))
 
@@ -243,6 +258,8 @@ Once the blocked threshold is satisfied, do not keep reporting that you are stil
 Do not use "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
 Do not mark a goal complete merely because you are stopping work.""",
     input_schema=UpdateGoalInput,
+    output_schema=GOAL_OUTPUT_SCHEMA,
+    short="Update the existing thread goal's status.",
 )
 async def update_goal(input: UpdateGoalInput, ctx: ToolContext) -> ToolExecutionResult:
     try:

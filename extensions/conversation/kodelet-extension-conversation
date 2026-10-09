@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.5.5,<0.6"]
+# dependencies = ["kodelet-sdk>=0.6.0,<0.7"]
 # ///
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from kodelet_sdk import (
     Client,
     EventContext,
     EventResult,
+    ExecutionOptions,
     Extension,
     Field,
     TaskProgress,
@@ -224,6 +225,7 @@ async def run_read_agent(
         async with asyncio.timeout(AGENT_TIMEOUT_SECONDS):
             session = await client.create_session(
                 profile=READ_PROFILE,
+                options=ExecutionOptions(code_mode="off"),
                 extensions=[read_instructions(max_turns)],
                 parent_conversation_id=parent_conversation_id,
             )
@@ -255,6 +257,8 @@ async def run_read_agent(
     "read_conversation",
     description=READ_DESCRIPTION,
     input_schema=ReadConversationInput,
+    output_schema={"type": "string", "description": "Evidence with conversation and transcript references."},
+    short="Read a saved conversation and extract evidence relevant to a goal.",
     timeout_in_sec=TOOL_TIMEOUT_SECONDS,
 )
 async def read_conversation(input: ReadConversationInput, ctx: ToolContext) -> ToolExecutionResult:
@@ -307,7 +311,7 @@ async def read_conversation(input: ReadConversationInput, ctx: ToolContext) -> T
         return {"content": message, "error": message, "data": {"taskRun": snapshot}}
 
     snapshot = await progress.finish(success=True)
-    return {"content": content, "data": {"taskRun": snapshot}}
+    return {"content": content, "structuredContent": content, "data": {"taskRun": snapshot}}
 
 
 class SearchError(RuntimeError):
@@ -432,6 +436,29 @@ def format_results(
     "search_conversation",
     description=SEARCH_DESCRIPTION,
     input_schema=SearchConversationInput,
+    output_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "cwd": {"type": ["string", "null"]},
+            "total": {"type": "integer"},
+            "search_pending": {"type": "integer"},
+            "conversations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": ["string", "null"]},
+                        "cwd": {"type": ["string", "null"]},
+                        "matches": {"type": "array", "items": {"type": "object"}},
+                    },
+                },
+            },
+        },
+        "required": ["query", "cwd", "total", "search_pending", "conversations"],
+    },
+    short="Find saved conversations by keyword, returning ranked IDs and excerpts.",
     timeout_in_sec=SEARCH_TIMEOUT_SECONDS + 5,
 )
 async def search_conversation(input: SearchConversationInput, ctx: ToolContext) -> ToolExecutionResult:
@@ -459,7 +486,16 @@ async def search_conversation(input: SearchConversationInput, ctx: ToolContext) 
     if len(conversations) < len(result["conversations"]):
         total = max(total - 1, len(conversations))
     conversations = conversations[:input.limit]
-    return {"content": format_results(query, cwd, result, conversations, total)}
+    return {
+        "content": format_results(query, cwd, result, conversations, total),
+        "structuredContent": {
+            "query": query,
+            "cwd": cwd,
+            "total": total,
+            "search_pending": int(result.get("search_pending") or 0),
+            "conversations": conversations,
+        },
+    }
 
 
 if __name__ == "__main__":

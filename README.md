@@ -32,6 +32,10 @@ A collection of CLI tool skill definitions for AI assistants.
 | [todo](./extensions/todo/kodelet-extension-todo) | `todo_read`, `todo_write` | Track conversation tasks with progress summaries, status checklists, and a live composer widget |
 | [web-search](./extensions/web-search/kodelet-extension-web-search) | `web_search` | Web research with concise, source-linked answers |
 
+Extensions require `kodelet-sdk>=0.6.0,<0.7`. Tools advertise output schemas and short catalog descriptions for code mode, with canonical JSON results in `structuredContent` (exposed as `reply.data` to code-mode callers); presentation and progress metadata remain in `data`. Image results remain host-ingested attachments: use `emit.image(reply.attachments[0])` for model-visible pixels or `emit.artifact(reply.attachments[0])` to retain an image without sending pixels.
+
+The code-search, conversation-reading, and web-search child sessions explicitly disable code mode so their restricted direct-tool workflows do not inherit the runner's code-mode setting.
+
 `browser_use` requires a host with the shared-browser capability. Set `TYPESAFE_API_KEY` in the runner environment for semantic click/fill and goal execution; observe and navigate do not need it.
 
 `/last-word` and `ctrl+alt+w` prompt for a workspace-relative path, defaulting to `last-word.md`. Use `/last-word path=notes/final.md` to skip the dialog; headless hosts also use the default when no path is supplied.

@@ -1,7 +1,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "kodelet-sdk==0.5.5",
+#   "kodelet-sdk==0.6.0",
+#   "jsonschema>=4,<5",
 #   "typesafe-sdk==0.7.1",
 #   "playwright==1.63.0",
 # ]
@@ -30,6 +31,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx2
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as SchemaValidationError
 from kodelet_sdk import create_test_harness
 from playwright.async_api import async_playwright
 from pydantic import ValidationError
@@ -226,12 +229,16 @@ class Harness:
             patch.object(browser_use, "validate_target", self.validate),
             patch.object(browser_goal, "validate_target", self.validate),
         ):
-            return await browser_use.execute_browser_use(
+            output = await browser_use.execute_browser_use(
                 input_dict or GOAL,
                 self.ctx,
                 connect=self.connect,
                 client_factory=self.factory,
             )
+        Draft202012Validator(browser_use.OUTPUT_SCHEMA).validate(output["structuredContent"])
+        if "data" in output:
+            raise AssertionError("Machine results must not be duplicated in presentation data")
+        return output
 
 
 class BrowserTestCase(unittest.IsolatedAsyncioTestCase):
@@ -428,8 +435,8 @@ class SDKSelectionTests(BrowserTestCase):
         client = self.sdk_client(respond)
         h.factory.return_value = client
         output = await h.execute()
-        self.assertEqual(output["data"]["status"], "give_up", output)
-        self.assertEqual(output["data"]["reason"], "needs_confirmation")
+        self.assertEqual(output["structuredContent"]["status"], "give_up", output)
+        self.assertEqual(output["structuredContent"]["reason"], "needs_confirmation")
         self.assertEqual(len(requests), 1)
         self.assert_no_dispatch(h)
         h.lease.release.assert_awaited_once()
@@ -437,6 +444,81 @@ class SDKSelectionTests(BrowserTestCase):
 
 
 class LifecycleTests(BrowserTestCase):
+    async def test_sdk_registration_advertises_canonical_output_schema(self):
+        harness = await create_test_harness(browser_use.ext)
+        tool = harness.initialize()["tools"][0]
+        self.assertEqual(tool["name"], "browser_use")
+        self.assertEqual(
+            tool["short"],
+            "Observe, navigate, or act on the shared browser, including bounded multi-step goals.",
+        )
+        self.assertNotIn("group", tool)
+        schema = tool["outputSchema"]
+        self.assertEqual(schema, browser_use.OUTPUT_SCHEMA)
+        self.assertEqual(schema["required"], ["status"])
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+        statuses = {
+            "observed",
+            "navigated",
+            "acted",
+            "not_executed",
+            "outcome_unknown",
+            "done",
+            "give_up",
+            "step_limit",
+            "timeout",
+            "canceled",
+            "failed",
+        }
+        self.assertEqual(set(schema["properties"]["status"]["enum"]), statuses)
+        for status in statuses:
+            with self.subTest(status=status):
+                validator.validate({"status": status})
+        # An interrupted goal may stop before history/limits/observations exist.
+        validator.validate({"status": "canceled", "steps": 0, "actionsCompleted": 0})
+        for invalid in (
+            {},
+            {"status": "act"},
+            {"status": "failed", "steps": -1},
+            {"status": "done", "verified": True},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(SchemaValidationError):
+                validator.validate(invalid)
+
+    async def test_sdk_preserves_canonical_nulls_without_presentation_duplicate(self):
+        harness = await create_test_harness(browser_use.ext)
+        data = {
+            "steps": 0,
+            "actionsCompleted": 0,
+            "history": [],
+            "verified": False,
+            "decision": {"target": None, "alternatives": [None, {"ref": None, "label": ""}]},
+            "cleanupWarning": "Lease release was not acknowledged.",
+        }
+        expected = {
+            "content": "Browser operation failed.",
+            "error": "Sanitized failure.",
+            "structuredContent": {"status": "failed", **data},
+        }
+        with patch.object(
+            browser_use,
+            "execute_browser_use",
+            new_callable=AsyncMock,
+            return_value=browser_use.result("failed", expected["content"], data, expected["error"]),
+        ):
+            output = await harness.execute_tool({"name": "browser_use", "input": GOAL})
+        self.assertEqual(output, expected)
+        self.assertNotIn("data", output)
+        Draft202012Validator(browser_use.OUTPUT_SCHEMA).validate(output["structuredContent"])
+        self.assertEqual(
+            browser_use.result("navigated", "Navigation reached DOMContentLoaded."),
+            {
+                "content": "Navigation reached DOMContentLoaded.",
+                "structuredContent": {"status": "navigated"},
+            },
+        )
+
     async def test_sdk_validation_errors_never_echo_rejected_secret_values(self):
         secret = "never-echo-this-private-input"
         cases = [
@@ -496,7 +578,7 @@ class LifecycleTests(BrowserTestCase):
                         self.assertIn(task, done, "CDP teardown blocked disconnect/release")
                         output = task.result()
                         self.assertEqual(
-                            output["data"]["status"],
+                            output["structuredContent"]["status"],
                             "canceled" if interrupt == "cancel" else "timeout",
                             output,
                         )
@@ -532,7 +614,7 @@ class LifecycleTests(BrowserTestCase):
             with self.subTest(input=input_dict):
                 h = Harness(key=None)
                 output = await h.execute(input_dict)
-                self.assertEqual(output["data"]["reason"], reason, output)
+                self.assertEqual(output["structuredContent"]["reason"], reason, output)
                 h.ctx.browser.acquire.assert_not_awaited()
                 h.connect.assert_not_awaited()
 
@@ -545,9 +627,9 @@ class LifecycleTests(BrowserTestCase):
                 if action == "fill":
                     input_dict.update(target="Project name", value="browser-only-secret")
                 output = await h.execute(input_dict)
-                self.assertEqual(output["data"]["status"], "acted", output)
-                self.assertFalse(output["data"]["verified"])
-                self.assertEqual(output["data"]["target"]["ref"], "e2")
+                self.assertEqual(output["structuredContent"]["status"], "acted", output)
+                self.assertFalse(output["structuredContent"]["verified"])
+                self.assertEqual(output["structuredContent"]["target"]["ref"], "e2")
                 h.elements[0].handle.click.assert_not_awaited()
                 h.elements[0].handle.fill.assert_not_awaited()
                 if action == "fill":
@@ -567,12 +649,12 @@ class LifecycleTests(BrowserTestCase):
             h = Harness(lambda body: target_reply(body, "none"))
             h.snapshot["truncated"] = truncated
             output = await h.execute({"action": "click", "target": "Missing"})
-            self.assertEqual(output["data"]["status"], "not_executed", output)
+            self.assertEqual(output["structuredContent"]["status"], "not_executed", output)
             if truncated:
-                self.assertEqual(output["data"]["reason"], "truncated_snapshot")
+                self.assertEqual(output["structuredContent"]["reason"], "truncated_snapshot")
                 self.assertEqual(h.client.calls, [])
             else:
-                self.assertEqual(output["data"]["decision"]["reason"], "no_match")
+                self.assertEqual(output["structuredContent"]["decision"]["reason"], "no_match")
             self.assert_no_dispatch(h)
             self.assert_cleaned(h)
 
@@ -593,7 +675,7 @@ class LifecycleTests(BrowserTestCase):
                 h.client.respond = respond
                 output = await h.execute({"action": "click", "target": "Project settings"})
                 self.assertEqual(
-                    output["data"]["reason"],
+                    output["structuredContent"]["reason"],
                     "stale_snapshot" if mutation == "navigation" else "stale_target",
                 )
                 self.assert_no_dispatch(h)
@@ -614,7 +696,7 @@ class LifecycleTests(BrowserTestCase):
                 }[stage]
                 boundary.side_effect = RuntimeError("private endpoint details")
                 output = await h.execute({"action": "click", "target": "Save"})
-                self.assertEqual(output["data"]["status"], status, output)
+                self.assertEqual(output["structuredContent"]["status"], status, output)
                 self.assert_private(h, output, "private endpoint details")
                 h.lease.release.assert_awaited_once()
                 if stage == "connect":
@@ -623,7 +705,9 @@ class LifecycleTests(BrowserTestCase):
                     h.elements[1].handle.click.assert_awaited_once()
                     self.assertEqual(len(h.client.calls), 1)
                     self.assert_cleaned(h)
-                self.assertEqual("cleanupWarning" in output["data"], stage == "release")
+                self.assertEqual(
+                    "cleanupWarning" in output["structuredContent"], stage == "release"
+                )
 
     async def test_canceled_acquisition_or_connection_disposes_late_resources_once(self):
         for stage in ("acquire", "connect"):
@@ -643,7 +727,7 @@ class LifecycleTests(BrowserTestCase):
                     await asyncio.wait_for(entered.wait(), 1)
                     task.cancel()
                     output = await asyncio.wait_for(task, 2)
-                    self.assertEqual(output["data"]["status"], "not_executed", output)
+                    self.assertEqual(output["structuredContent"]["status"], "not_executed", output)
                     if stage == "acquire":
                         h.lease.release.assert_not_awaited()
                     else:
@@ -699,7 +783,7 @@ class GoalLoopTests(BrowserTestCase):
                 "successCriteria": "Project saved is visible and Project name matches projectName",
             }
         )
-        data = output["data"]
+        data = output["structuredContent"]
         self.assertEqual(data["status"], "done", output)
         self.assertEqual(data["verification"], "model")
         self.assertFalse(data["verified"])
@@ -748,9 +832,9 @@ class GoalLoopTests(BrowserTestCase):
                 if scenario == "inspect":
                     h.snapshot["pagination"]["controls"]["total"] = 81
                 output = await h.execute({**GOAL, "maxSteps": 1})
-                self.assertEqual(output["data"]["status"], status, output)
-                self.assertEqual(output["data"].get("reason"), reason)
-                operations = [item["operation"] for item in output["data"]["history"]]
+                self.assertEqual(output["structuredContent"]["status"], status, output)
+                self.assertEqual(output["structuredContent"].get("reason"), reason)
+                operations = [item["operation"] for item in output["structuredContent"]["history"]]
                 self.assertEqual(operations, ["inspect"] if scenario == "inspect" else [])
                 self.assertEqual(len(h.client.calls), 1)
                 self.assert_no_dispatch(h)
@@ -770,9 +854,9 @@ class GoalLoopTests(BrowserTestCase):
                 )
                 h.snapshot["evidence"] = messages
                 output = await h.execute()
-                self.assertEqual(output["data"]["reason"], reason, output)
-                self.assertEqual(output["data"]["actionsCompleted"], 0)
-                self.assertFalse(output["data"]["verified"])
+                self.assertEqual(output["structuredContent"]["reason"], reason, output)
+                self.assertEqual(output["structuredContent"]["actionsCompleted"], 0)
+                self.assertFalse(output["structuredContent"]["verified"])
                 self.assert_no_dispatch(h)
                 self.assert_cleaned(h)
 
@@ -787,7 +871,7 @@ class GoalLoopTests(BrowserTestCase):
 
         h.client.respond = respond
         output = await h.execute()
-        self.assertEqual(output["data"]["reason"], "missing_input", output)
+        self.assertEqual(output["structuredContent"]["reason"], "missing_input", output)
         self.assertEqual(len(h.client.calls), 2)
         self.assertEqual(h.client.calls[1]["state"]["observation"]["evidence"], ["Login required"])
         self.assert_no_dispatch(h)
@@ -800,9 +884,9 @@ class GoalLoopTests(BrowserTestCase):
                 h.ctx.env["KODELET_BROWSER_USE_MAX_TURNS"] = str(runner_limit)
                 output = await h.execute({**GOAL, "maxSteps": caller_limit})
                 limit = min(runner_limit, caller_limit)
-                self.assertEqual(output["data"]["status"], "step_limit", output)
-                self.assertEqual(output["data"]["steps"], limit)
-                self.assertEqual(output["data"]["actionsCompleted"], limit)
+                self.assertEqual(output["structuredContent"]["status"], "step_limit", output)
+                self.assertEqual(output["structuredContent"]["steps"], limit)
+                self.assertEqual(output["structuredContent"]["actionsCompleted"], limit)
                 self.assertEqual(len(h.client.calls), limit)
                 self.assert_cleaned(h)
 
@@ -811,16 +895,16 @@ class GoalLoopTests(BrowserTestCase):
             h = Harness(lambda body: goal_reply(body, action=action_id(body, "wait")))
             h.ctx.env["KODELET_BROWSER_USE_TIMEOUT_MS"] = str(runner_ms)
             output = await h.execute({**GOAL, "timeoutMs": caller_ms})
-            self.assertEqual(output["data"]["status"], "timeout", output)
-            self.assertEqual(output["data"]["actionsCompleted"], 0)
+            self.assertEqual(output["structuredContent"]["status"], "timeout", output)
+            self.assertEqual(output["structuredContent"]["actionsCompleted"], 0)
             self.assertEqual(len(h.client.calls), 1)
             self.assert_cleaned(h)
 
     async def test_repeated_mutation_stops_without_progress(self):
         h = Harness(lambda body: goal_reply(body, action=action_id(body, "click")))
         output = await h.execute({**GOAL, "maxSteps": 5})
-        self.assertEqual(output["data"]["reason"], "no_progress", output)
-        self.assertEqual(output["data"]["actionsCompleted"], 1)
+        self.assertEqual(output["structuredContent"]["reason"], "no_progress", output)
+        self.assertEqual(output["structuredContent"]["actionsCompleted"], 1)
         self.assertEqual(len(h.client.calls), 2)
         h.elements[0].handle.click.assert_awaited_once()
         self.assert_cleaned(h)
@@ -840,7 +924,7 @@ class GoalLoopTests(BrowserTestCase):
 
                 h.client.respond = respond
                 output = await h.execute()
-                data = output["data"]
+                data = output["structuredContent"]
                 self.assertEqual(data["status"], "failed", output)
                 self.assertEqual(data["reason"], reason)
                 self.assertEqual(data["actionsCompleted"], 1)
@@ -876,12 +960,12 @@ class GoalLoopTests(BrowserTestCase):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                 self.assertEqual(
-                    output["data"]["status"],
+                    output["structuredContent"]["status"],
                     "outcome_unknown" if stage == "action" else "canceled",
                     output,
                 )
                 self.assertEqual(h.elements[0].handle.click.await_count, int(stage == "action"))
-                self.assertEqual(output["data"]["actionsCompleted"], 0)
+                self.assertEqual(output["structuredContent"]["actionsCompleted"], 0)
                 self.assertLessEqual(len(h.client.calls), 1)
                 self.assert_cleaned(h)
 
@@ -894,7 +978,7 @@ class GoalLoopTests(BrowserTestCase):
 
         h.ctx.update.side_effect = update
         output = await asyncio.create_task(h.execute())
-        self.assertEqual(output["data"]["status"], "canceled", output)
+        self.assertEqual(output["structuredContent"]["status"], "canceled", output)
         self.assert_no_dispatch(h)
         self.assert_cleaned(h)
 
@@ -920,8 +1004,8 @@ class GoalLoopTests(BrowserTestCase):
 
                 h.client.respond = respond
                 output = await h.execute({**GOAL, "goal": "Find Ada Lovelace"})
-                self.assertEqual(output["data"]["reason"], reason, output)
-                self.assertEqual(output["data"]["actionsCompleted"], 0)
+                self.assertEqual(output["structuredContent"]["reason"], reason, output)
+                self.assertEqual(output["structuredContent"]["actionsCompleted"], 0)
                 self.assertEqual(len(h.client.calls), 2)
                 self.assertEqual(h.validate.await_count, int(mutation == "target"))
                 self.assert_no_dispatch(h)
@@ -1023,10 +1107,11 @@ class IsolatedChromiumTests(BrowserTestCase):
             browser_use, "jev_client", side_effect=AssertionError("No provider is allowed")
         ):
             observed = await browser_use.execute_browser_use({"action": "observe"}, ctx)
-            self.assertEqual(observed["data"]["status"], "observed", observed)
-            self.assertEqual(observed["data"]["snapshot"]["title"], "Shared tab")
+            self.assertEqual(observed["structuredContent"]["status"], "observed", observed)
+            self.assertEqual(observed["structuredContent"]["snapshot"]["title"], "Shared tab")
             self.assertEqual(
-                [c["name"] for c in observed["data"]["snapshot"]["elements"]], ["Selected target"]
+                [c["name"] for c in observed["structuredContent"]["snapshot"]["elements"]],
+                ["Selected target"],
             )
             self.assertEqual(
                 await shared.evaluate("6 * 7"), 42, "CDP cleanup must not close Chromium"
@@ -1034,7 +1119,7 @@ class IsolatedChromiumTests(BrowserTestCase):
             navigated = await browser_use.execute_browser_use(
                 {"action": "navigate", "url": "about:blank"}, ctx
             )
-        self.assertEqual(navigated["data"]["status"], "navigated", navigated)
+        self.assertEqual(navigated["structuredContent"]["status"], "navigated", navigated)
         self.assertEqual(await shared.title(), "")
         self.assertEqual(await other.title(), "Unrelated tab")
         self.assertEqual(await other.locator("button").inner_text(), "Do not touch")
@@ -1042,8 +1127,8 @@ class IsolatedChromiumTests(BrowserTestCase):
         self.assertEqual(len(self.context.pages), 2)
         self.assertEqual(await shared.evaluate("6 * 7"), 42)
         self.assertEqual(lease.release.await_count, 2)
-        self.assertNotIn("cleanupWarning", observed["data"])
-        self.assertNotIn("cleanupWarning", navigated["data"])
+        self.assertNotIn("cleanupWarning", observed["structuredContent"])
+        self.assertNotIn("cleanupWarning", navigated["structuredContent"])
 
     async def test_goal_inspects_large_page_copies_search_and_submits(self):
         await self.page.set_content(
@@ -1087,14 +1172,16 @@ class IsolatedChromiumTests(BrowserTestCase):
                 {"maxSteps": 8, "timeoutMs": 10000},
                 deadline,
             )
-        self.assertEqual(output["data"]["status"], "done", output)
+        self.assertEqual(output["structuredContent"]["status"], "done", output)
         self.assertEqual(await self.page.locator("input").input_value(), "C++")
         self.assertEqual(await self.page.locator("output").inner_text(), "C++ results")
         self.assertEqual(
-            [entry["operation"] for entry in output["data"]["history"]],
+            [entry["operation"] for entry in output["structuredContent"]["history"]],
             ["inspect", "fill_from_goal", "press", "inspect"],
         )
-        self.assertEqual(output["data"]["history"][1]["sourceSpan"], {"start": 11, "end": 14})
+        self.assertEqual(
+            output["structuredContent"]["history"][1]["sourceSpan"], {"start": 11, "end": 14}
+        )
 
     async def test_dom_labels_context_hidden_labels_and_values(self):
         await self.page.set_content("""

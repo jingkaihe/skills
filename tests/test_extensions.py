@@ -1,7 +1,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "kodelet-sdk==0.5.5",
+#   "kodelet-sdk==0.6.0",
+#   "jsonschema>=4,<5",
 #   "filetype",
 #   "google-genai",
 #   "pillow",
@@ -13,7 +14,7 @@
 """Run with `uv run --script tests/test_extensions.py`; no provider calls.
 
 For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
-../kodelet-python-sdk --with filetype --with google-genai --with pillow
+../kodelet-python-sdk --with filetype --with google-genai --with pillow --with jsonschema
 --with typesafe-sdk==0.7.1 --with playwright==1.63.0
 -- python tests/test_extensions.py
 """
@@ -33,6 +34,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import kodelet_sdk
+from jsonschema import Draft202012Validator
 from kodelet_sdk import Client, ToolContext, create_test_harness
 from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
 
@@ -206,7 +208,8 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["attachments"], [{
             "type": "image", "path": str(output_path), "mimeType": "image/png", "alt": "A drawing",
         }])
-        self.assertEqual(result["data"], {"success": True})
+        self.assertEqual(result["structuredContent"], {"success": True})
+        self.assertNotIn("data", result)
         self.assertEqual(result["content"], "Generated image.")
         self.assertNotIn(str(output_path), json.dumps({
             key: value for key, value in result.items() if key != "attachments"
@@ -217,13 +220,36 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
         }])
         self.assertEqual(len(long_result["attachments"][0]["alt"]), 1000)
         self.assertLess(len(long_result["attachments"][0]["alt"].encode("utf-8")), 4096)
-        self.assertEqual(long_result["data"], {"success": True})
+        self.assertEqual(long_result["structuredContent"], {"success": True})
         self.assertEqual(long_result["content"], result["content"])
+        schema = harness.initialize()["tools"][0]["outputSchema"]
+        Draft202012Validator(schema).validate(result["structuredContent"])
+        with patch.dict(handler.__globals__, {"generate_image": Mock(side_effect=RuntimeError("unavailable"))}):
+            failed = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": "A drawing"}})
+        self.assertEqual(failed["structuredContent"], {"success": False, "error": failed["error"]})
+        self.assertNotIn("attachments", failed)
+        self.assertNotIn("data", failed)
+        Draft202012Validator(schema).validate(failed["structuredContent"])
+
+    async def test_look_at_returns_canonical_analysis(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "look-at" / "kodelet-extension-look-at"))
+        harness = await create_test_harness(module["ext"])
+        schema = harness.initialize()["tools"][0]["outputSchema"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.txt"
+            path.write_text("Evidence")
+            with patch.dict(module["look_at"].__globals__, {"analyze_file": Mock(return_value="Findings")}):
+                result = await harness.execute_tool({
+                    "name": "look_at",
+                    "input": {"path": str(path), "objective": "Extract facts", "context": "Research"},
+                })
+        self.assertEqual(result, {"content": "Findings", "structuredContent": "Findings"})
+        Draft202012Validator(schema).validate(result["structuredContent"])
 
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.5.5")
+        self.assertEqual(package.version, "0.6.0")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -292,7 +318,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.5.5,<0.6", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.6.0,<0.7", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",
@@ -341,6 +367,10 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     manifest = response["result"]
                     self.assertEqual(manifest["name"], name)
                     self.assertEqual([tool["name"] for tool in manifest["tools"]], tools)
+                    for tool in manifest["tools"]:
+                        self.assertTrue(tool["short"].strip())
+                        self.assertNotIn("\n", tool["short"])
+                        Draft202012Validator.check_schema(tool["outputSchema"])
                     if name == "goal":
                         self.assertTrue(os.access(script, os.X_OK))
                         self.assertEqual(manifest["commands"][0]["name"], "goal")
@@ -420,9 +450,12 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
         })
 
     async def tool(self, name: str, **input: Any) -> dict[str, Any]:
-        return await self.harness.execute_tool({
+        result = await self.harness.execute_tool({
             "name": name, "input": input, "context": self.context,
         })
+        if "structuredContent" in result:
+            Draft202012Validator(self.module["GOAL_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
+        return result
 
     async def event(self, name: str, **payload: Any) -> dict[str, Any]:
         return await self.harness.handle_event({
@@ -448,8 +481,8 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored["createdAt"].endswith("Z"))
 
         read = await self.tool("get_goal")
-        self.assertEqual(read["data"]["goal"], stored)
-        self.assertTrue(read["data"]["active"])
+        self.assertEqual(read["structuredContent"], {"goal": stored, "active": True})
+        self.assertEqual(set(read["data"]), {"presentation"})
         self.assertEqual(read["data"]["presentation"], {
             "summary": "Goal active", "body": read["content"], "format": "text",
         })
@@ -463,7 +496,7 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
         read = await self.tool("get_goal")
         self.assertNotIn("error", read)
         self.assertEqual(read["content"], "No goal is currently defined for this thread.")
-        self.assertFalse(read["data"]["active"])
+        self.assertEqual(read["structuredContent"], {"goal": None, "active": False})
         self.assertIn("no goal", (await self.tool("update_goal", status="complete"))["error"])
         self.assertEqual(await self.init(), {})
         self.assertEqual(await self.event("agent.end"), {})
@@ -494,13 +527,13 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.event("agent.end", messages=[]), follow_up)
 
         self.context["conversationId"] = "forked-conversation"
-        self.assertFalse((await self.tool("get_goal"))["data"]["active"])
+        self.assertFalse((await self.tool("get_goal"))["structuredContent"]["active"])
         self.assertEqual(await self.init(), {})
         self.assertEqual(await self.event("agent.end"), {})
         await self.command("/goal a different task")
         self.assertIn("a different task", (await self.init())["systemPrompt"]["append"])
         self.context["conversationId"] = "parent-conversation"
-        self.assertEqual((await self.tool("get_goal"))["data"]["goal"]["objective"],
+        self.assertEqual((await self.tool("get_goal"))["structuredContent"]["goal"]["objective"],
                          "verify <all> requirements")
 
     async def test_transition_matrix_rejects_invalid_changes_without_mutation(self) -> None:
@@ -531,7 +564,7 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(stored["status"], status)
                     self.assertEqual(stored["reason"], "evidence")
                     self.assertEqual(stored["createdAt"], json.loads(before)["createdAt"])
-                    self.assertEqual(result["data"]["active"], status == "active")
+                    self.assertEqual(result["structuredContent"]["active"], status == "active")
 
     async def test_pause_block_resume_complete_and_clear_control_continuation(self) -> None:
         await self.command()
@@ -562,7 +595,7 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("followUpMessages", await self.event("agent.end"))
                 self.assertEqual(await self.event("agent.init", **payload), {})
                 self.assertEqual(await self.event("agent.end"), {})
-                self.assertTrue((await self.tool("get_goal"))["data"]["active"])
+                self.assertTrue((await self.tool("get_goal"))["structuredContent"]["active"])
 
     async def test_invalid_tool_input_is_rejected_by_sdk(self) -> None:
         await self.command()
@@ -654,9 +687,11 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patched.stop)
 
     async def write(self, todos: list[dict[str, str]]) -> dict[str, Any]:
-        return await self.module["todo_write"](
+        result = await self.module["todo_write"](
             self.module["TodoWriteInput"](todos=todos), self.ctx,
         )
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
+        return result
 
     async def test_read_write_and_live_updates_share_checklist_in_plan_order(self) -> None:
         todos = [
@@ -679,11 +714,13 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(written["content"], "Todo list updated.")
         self.assertEqual(written["data"]["presentation"], expected)
         self.assertEqual(json.loads(self.path.read_text()), {"todos": todos})
-        self.assertEqual(written["data"]["statistics"], {
+        self.assertEqual(set(written["data"]), {"presentation"})
+        self.assertEqual(written["structuredContent"]["statistics"], {
             "total": 4, "completed": 1, "in_progress": 1, "pending": 1, "canceled": 1,
         })
 
         read = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(read["structuredContent"])
         expected_read = {**expected, "summary": "Todo read"}
         self.assertEqual(read["data"]["presentation"], expected_read)
         self.assertEqual(read["content"], (
@@ -696,7 +733,7 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.updates.await_count, 2)
         for call, presentation in zip(self.updates.call_args_list, [expected, expected_read]):
             self.assertEqual(call.args[1]["presentation"], presentation)
-            self.assertEqual(call.args[1]["todo"]["statistics"], written["data"]["statistics"])
+            self.assertEqual(call.args[1]["todo"]["statistics"], written["structuredContent"]["statistics"])
         self.assertEqual(self.widget.await_count, 2)
 
     async def test_terminal_lists_keep_presentation_after_widget_is_removed(self) -> None:
@@ -723,7 +760,7 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
             ),
             "format": "markdown",
         })
-        self.assertEqual(result["data"]["todos"][0]["content"], content)
+        self.assertEqual(result["structuredContent"]["todos"][0]["content"], content)
 
     async def test_presentation_survives_unavailable_live_ui(self) -> None:
         self.updates.side_effect = RuntimeError("disconnected")
@@ -739,7 +776,9 @@ class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_list_does_not_claim_successful_progress(self) -> None:
         result = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
         self.assertIn("todo file not found", result["error"])
-        self.assertNotIn("presentation", result["data"])
+        self.assertNotIn("data", result)
+        self.assertEqual(result["structuredContent"], {"success": False, "error": result["error"]})
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
         self.updates.assert_not_awaited()
 
 
@@ -832,6 +871,7 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "src").mkdir()
         result = await self.search(query="  Find the handler.  ", cwd="src", max_turns=5)
         self.assertEqual(result["content"], "Found src/handler.go:20-40.")
+        self.assertEqual(result["structuredContent"], result["content"])
         self.assertNotIn("error", result)
         self.assertEqual(
             self.client_kwargs, {"cwd": str(self.root / "src"), "runner": "search-runner"},
@@ -840,12 +880,13 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.ctx._host_rpc_client)
         self.assertEqual(self.launches[0]["command"], "kodelet")
         self.assertEqual(self.launches[0]["args"], [
-            "acp", "--runner", "search-runner", "--profile=code-search",
+            "acp", "--runner", "search-runner", "--code-mode=off", "--profile=code-search",
         ])
         # No noExtensions flag: the inline prompt hook must remain attached.
         self.assertEqual(
-            set(self.session_options[0]), {"profile", "extensions", "parent_conversation_id"},
+            set(self.session_options[0]), {"profile", "options", "extensions", "parent_conversation_id"},
         )
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
         self.assertEqual(self.session_options[0]["parent_conversation_id"], "parent-conversation")
         self.assertEqual(self.session_options[0]["profile"], "code-search")
         await self.prompt_patch(5)
@@ -1255,15 +1296,17 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
                 result = await task
         self.assertNotIn("error", result)
         self.assertIn("conversation parent-conversation, transcript lines 1-3", result["content"])
+        self.assertEqual(result["structuredContent"], result["content"])
         self.assertEqual(self.client_kwargs, {"cwd": str(self.root), "runner": "read-runner"})
         self.assertEqual(self.launches[0]["args"], [
-            "acp", "--runner", "read-runner", "--profile=read-conversation",
+            "acp", "--runner", "read-runner", "--code-mode=off", "--profile=read-conversation",
         ])
         env = self.launches[0]["options"]["env"]
         self.assertEqual(env["KODELET_SERVER"], "http://saved-history")
         self.assertEqual(env["KODELET_AUTH_TOKEN"], "inherited-test-token")
         options = self.session_options[0]
-        self.assertEqual(set(options), {"profile", "extensions", "parent_conversation_id"})
+        self.assertEqual(set(options), {"profile", "options", "extensions", "parent_conversation_id"})
+        self.assertEqual(options["options"].to_wire(), {"codeMode": "off"})
         self.assertEqual(options["parent_conversation_id"], "parent-conversation")
         self.assertEqual(options["profile"], "read-conversation")
         new = next(row for row in self.peer.requests if row["method"] == "session/new")
@@ -1464,6 +1507,10 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
         query = "--help;$(touch unsafe)"
         result = await self.search(query=f" {query} ", cwd=" /srv/project ", limit=2)
         self.assertNotIn("error", result)
+        self.assertEqual(result["structuredContent"], {
+            "query": query, "cwd": "/srv/project", "total": 4, "search_pending": 0,
+            "conversations": self.response["conversations"][1:],
+        })
         self.assertEqual(self.args, (
             "kodelet", "conversation", "search", "--json", "--limit", "3", "--matches", "3",
             "--cwd", "/srv/project", "--", query,
@@ -1494,6 +1541,29 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No saved conversations match `fts5 index`.", result["content"])
         self.assertIn("try fewer or different words", result["content"])
         self.assertIn("Note: 3 conversations are still being indexed", result["content"])
+        self.assertEqual(result["structuredContent"], {
+            "query": "fts5 index", "cwd": None, "total": 0, "search_pending": 3,
+            "conversations": [],
+        })
+
+    async def test_sdk_preserves_search_nulls_and_only_returns_visible_hits(self) -> None:
+        hit = search_hit("saved", title=None, cwd=None, matches=[{"snippet": "evidence", "role": None}])
+        self.response = {"total": 3, "conversations": [search_hit("current"), hit, search_hit("extra")]}
+        harness = await create_test_harness(CONVERSATION["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {"cwd": str(self.root)},
+        })
+        result = await harness.execute_tool({
+            "name": "search_conversation", "input": {"query": "evidence", "limit": 1},
+            "context": {"conversationId": "current"},
+        })
+        self.assertEqual(result["structuredContent"], {
+            "query": "evidence", "cwd": None, "total": 2, "search_pending": 0, "conversations": [hit],
+        })
+        self.assertNotIn("data", result)
+        schema = next(tool["outputSchema"] for tool in manifest["tools"] if tool["name"] == "search_conversation")
+        Draft202012Validator(schema).validate(result["structuredContent"])
 
     async def test_invalid_input_never_spawns(self) -> None:
         self.assertIn("non-empty", (await self.search(query="   "))["error"])
@@ -1611,11 +1681,16 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await self.search(query="  Question  ", context=" Constraints ")
         self.assertEqual(result["content"], "Verified finding. [1](<https://example.com>)")
-        self.assertEqual(result["data"]["blocks"], [self.answer_block])
+        self.assertEqual(result["structuredContent"], {
+            "content": result["content"], "blocks": [self.answer_block],
+        })
+        self.assertEqual(set(result["data"]), {"taskRun"})
+        Draft202012Validator(WEB["WebSearchOutput"].model_json_schema()).validate(result["structuredContent"])
         self.assertEqual(self.launches[0]["command"], "kodelet")
         self.assertEqual(self.launches[0]["args"], [
-            "acp", "--runner", "web-runner", "--profile=web-search",
+            "acp", "--runner", "web-runner", "--code-mode=off", "--profile=web-search",
         ])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
         new = next(row for row in self.peer.requests if row["method"] == "session/new")
         self.assertEqual(new["params"], {
             "cwd": self.ctx.cwd,
