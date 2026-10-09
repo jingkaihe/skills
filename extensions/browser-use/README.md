@@ -4,7 +4,7 @@ A Python port of Kodelet's TypeScript browser-use extension. It operates the con
 
 ## Setup
 
-Install this plugin repository with `kodelet plugin add jingkaihe/skills`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. This extension requires `kodelet-sdk>=0.6.0,<0.7` and pins `typesafe-sdk==0.7.1` and `playwright==1.63.0`.
+Install this plugin repository with `kodelet plugin add jingkaihe/skills`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. All extensions in this repository now require `kodelet-sdk>=0.6.0,<0.7`; this extension also pins `typesafe-sdk==0.7.1` and `playwright==1.63.0`.
 
 Use a Kodelet host advertising browser capability version 1. Configure Chrome on the runner and enable browser access on the control-plane host, rather than in repository model-profile overrides:
 
@@ -80,11 +80,9 @@ Invalid settings fail before acquisition. Per-call `maxSteps` and `timeoutMs` on
 
 ## Outcomes and browser lifetime
 
-The canonical JSON result is in `structuredContent`, separate from the human-readable `content` and optional `error`. Machine fields are not duplicated in presentation `data`. Code-mode callers receive this canonical payload as `reply.data`; for example, read `reply.data.status`. The tool advertises a raw JSON output schema and a concise catalog summary; the host supplies the owning extension's default group. Only `status` is always present; other fields depend on the action and how far execution progressed.
-
 Single-step results distinguish `observed`, `navigated`, `acted`, `not_executed`, and `outcome_unknown`. A successful click/fill is not proof of application success. An unknown outcome must be inspected, not automatically retried.
 
-Goal results include `structuredContent.status`, `steps`, `actionsCompleted`, `history`, effective `limits`, the last `decision`, and the last `observation` when available. Setup failures and early interruptions may omit these goal details:
+Goal results include `structuredContent.status`, `steps`, `actionsCompleted`, `history`, effective `limits`, the last `decision`, and the last `observation` when available:
 
 | Status | Meaning |
 | --- | --- |
