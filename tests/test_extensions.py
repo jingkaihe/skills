@@ -42,8 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 CONVERSATION = runpy.run_path(str(EXTENSIONS / "conversation" / "kodelet-extension-conversation"))
-with patch.dict(os.environ):
-    os.environ.pop("KODELET_WEB_SEARCH_PROVIDER", None)
+with patch.dict(os.environ, KODELET_WEB_SEARCH_PROVIDER="anthropic"):
     WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
 
 
@@ -390,12 +389,17 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                             "name": "web-search",
                             "hidden": True,
                             "options": {
-                                "provider": "anthropic",
-                                "model": "claude-haiku-4-5-20251001",
-                                "anthropic_api_access": "subscription",
+                                "provider": "openai",
+                                "model": "gpt-6-luna",
                                 "reasoning_effort": "none",
                                 "max_tokens": 4096,
-                                "allowed_tools": ["anthropic_web_search"],
+                                "openai": {
+                                    "api_mode": "responses",
+                                    "platform": "codex",
+                                    "service_tier": "fast",
+                                    "enable_search": True,
+                                },
+                                "allowed_tools": ["openai_web_search"],
                                 "skills": {"enabled": False},
                             },
                         }])
@@ -1607,7 +1611,7 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_env_registers_only_selected_native_search_profile(self) -> None:
-        default = WEB["ext"].initialize({"capabilities": {"profiles": {"remote": True}}})
+        baseline = WEB["ext"].initialize({"capabilities": {"profiles": {"remote": True}}})
         for provider in [None, "anthropic", "openai"]:
             with self.subTest(provider=provider), patch.dict(os.environ):
                 if provider is None:
@@ -1618,12 +1622,12 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                 harness = await create_test_harness(module["ext"])
                 manifest = harness.initialize({"capabilities": {"profiles": {"remote": True}}})
                 options = {
-                    "provider": provider or "anthropic",
+                    "provider": provider or "openai",
                     "reasoning_effort": "none",
                     "max_tokens": 4096,
                     "skills": {"enabled": False},
                 }
-                if provider == "openai":
+                if provider in {None, "openai"}:
                     options.update({
                         "model": "gpt-6-luna",
                         "openai": {
@@ -1636,7 +1640,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                     })
                 else:
                     options.update({
-                        "model": "claude-haiku-4-5-20251001",
+                        "model": "claude-haiku-5-5",
                         "anthropic_api_access": "subscription",
                         "allowed_tools": ["anthropic_web_search"],
                     })
@@ -1644,7 +1648,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                     "name": "web-search", "hidden": True, "options": options,
                 }])
                 self.assertEqual(module["SEARCH_PROFILE"], "web-search")
-                self.assertEqual(manifest["tools"], default["tools"])
+                self.assertEqual(manifest["tools"], baseline["tools"])
                 self.assertEqual(module["TOOL_TIMEOUT_SECONDS"], 5 * 60)
 
     def test_invalid_provider_env_fails_at_startup_without_registering_profile(self) -> None:
@@ -1656,6 +1660,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                     runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
                 self.assertIn(f"KODELET_WEB_SEARCH_PROVIDER={provider!r}", str(error.exception))
                 self.assertIn("expected 'anthropic' or 'openai'", str(error.exception))
+                self.assertIn("unset defaults to 'openai'", str(error.exception))
                 register.assert_not_called()
 
     async def asyncSetUp(self) -> None:

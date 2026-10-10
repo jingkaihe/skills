@@ -46,11 +46,11 @@ assistant message containing your findings.
 If web search is unavailable, report that limitation; do not substitute an answer from memory.
 """
 
-SEARCH_PROVIDER = os.environ.get("KODELET_WEB_SEARCH_PROVIDER", "anthropic")
+SEARCH_PROVIDER = os.environ.get("KODELET_WEB_SEARCH_PROVIDER", "openai")
 if SEARCH_PROVIDER not in {"anthropic", "openai"}:
     raise ValueError(
         f"Invalid KODELET_WEB_SEARCH_PROVIDER={SEARCH_PROVIDER!r}; "
-        "expected 'anthropic' or 'openai' (unset defaults to 'anthropic')"
+        "expected 'anthropic' or 'openai' (unset defaults to 'openai')"
     )
 
 ext = Extension(name="web-search", version="0.1.0")
@@ -58,7 +58,7 @@ if SEARCH_PROVIDER == "anthropic":
     SEARCH_PROFILE = ext.register_profile(
         "web-search",
         provider="anthropic",
-        model="claude-haiku-4-5-20251001",
+        model="claude-haiku-5-5",
         anthropic_api_access="subscription",
         reasoning_effort="none",
         max_tokens=4096,

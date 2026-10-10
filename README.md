@@ -44,12 +44,12 @@ The durable subagent extension now lives in the standalone [`jingkaihe/kodelet-s
 
 ### Web search provider
 
-Set `KODELET_WEB_SEARCH_PROVIDER` in the **runner environment** before the `web-search` extension starts:
+Web search defaults to OpenAI/Codex. To select a backend explicitly, set `KODELET_WEB_SEARCH_PROVIDER` in the **runner environment** before the `web-search` extension starts:
 
 | Value | Backend |
 |-------|---------|
-| Unset or `anthropic` | Existing Anthropic subscription backend, `claude-haiku-4-5-20251001` |
-| `openai` | OpenAI `gpt-6-luna` via Codex subscription authentication and the Responses API |
+| Unset or `openai` | OpenAI `gpt-6-luna` via Codex subscription authentication and the Responses API, fast tier |
+| `anthropic` | Anthropic subscription backend, `claude-haiku-5-5` |
 
 Only the exact values `anthropic` and `openai` are accepted. An explicitly empty value or any other value causes a clear startup error; there is no silent provider fallback. Restart the extension (or its runner) after changing the variable.
 
@@ -60,8 +60,10 @@ Authenticate your Codex subscription on the selected **Kodelet daemon**, not in 
 ```bash
 kodelet codex login
 kodelet codex status
-# Set in the environment that starts the runner:
+# Optional: explicitly select the default in the runner environment:
 export KODELET_WEB_SEARCH_PROVIDER=openai
+# Or use the existing Anthropic backend instead:
+# export KODELET_WEB_SEARCH_PROVIDER=anthropic
 ```
 
 These auth commands require administrator access to the configured daemon (`KODELET_SERVER` or saved CLI config); provider credentials remain on the daemon. OpenAI search requires an updated daemon that emits structured OpenAI citation data in ACP `kodelet/textData`. Update/restart the daemon and restart the extension when upgrading; older daemons that return only display text fail with `web_search returned no answer data`, rather than parsing prose or fabricating citations. The tool keeps the same query/context inputs and content/blocks output: OpenAI citations carry URL/title with `cited_text: null` when no excerpt is supplied, while Anthropic excerpts are preserved.
