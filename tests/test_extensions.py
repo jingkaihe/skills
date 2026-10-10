@@ -42,7 +42,9 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 CONVERSATION = runpy.run_path(str(EXTENSIONS / "conversation" / "kodelet-extension-conversation"))
-WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+with patch.dict(os.environ):
+    os.environ.pop("KODELET_WEB_SEARCH_PROVIDER", None)
+    WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
 
 
 def tool_call(call_id: str, name: str, tool_input: Any) -> dict[str, Any]:
@@ -1604,6 +1606,58 @@ class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_env_registers_only_selected_native_search_profile(self) -> None:
+        default = WEB["ext"].initialize({"capabilities": {"profiles": {"remote": True}}})
+        for provider in [None, "anthropic", "openai"]:
+            with self.subTest(provider=provider), patch.dict(os.environ):
+                if provider is None:
+                    os.environ.pop("KODELET_WEB_SEARCH_PROVIDER", None)
+                else:
+                    os.environ["KODELET_WEB_SEARCH_PROVIDER"] = provider
+                module = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+                harness = await create_test_harness(module["ext"])
+                manifest = harness.initialize({"capabilities": {"profiles": {"remote": True}}})
+                options = {
+                    "provider": provider or "anthropic",
+                    "reasoning_effort": "none",
+                    "max_tokens": 4096,
+                    "skills": {"enabled": False},
+                }
+                if provider == "openai":
+                    options.update({
+                        "model": "gpt-6-luna",
+                        "openai": {
+                            "api_mode": "responses",
+                            "platform": "codex",
+                            "service_tier": "fast",
+                            "enable_search": True,
+                        },
+                        "allowed_tools": ["openai_web_search"],
+                    })
+                else:
+                    options.update({
+                        "model": "claude-haiku-4-5-20251001",
+                        "anthropic_api_access": "subscription",
+                        "allowed_tools": ["anthropic_web_search"],
+                    })
+                self.assertEqual(manifest["profiles"], [{
+                    "name": "web-search", "hidden": True, "options": options,
+                }])
+                self.assertEqual(module["SEARCH_PROFILE"], "web-search")
+                self.assertEqual(manifest["tools"], default["tools"])
+                self.assertEqual(module["TOOL_TIMEOUT_SECONDS"], 5 * 60)
+
+    def test_invalid_provider_env_fails_at_startup_without_registering_profile(self) -> None:
+        for provider in ["", " ", "gemini", "OpenAI", " openai "]:
+            with self.subTest(provider=provider), patch.dict(
+                os.environ, KODELET_WEB_SEARCH_PROVIDER=provider,
+            ), patch.object(kodelet_sdk.Extension, "register_profile") as register:
+                with self.assertRaises(ValueError) as error:
+                    runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+                self.assertIn(f"KODELET_WEB_SEARCH_PROVIDER={provider!r}", str(error.exception))
+                self.assertIn("expected 'anthropic' or 'openai'", str(error.exception))
+                register.assert_not_called()
+
     async def asyncSetUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1645,6 +1699,7 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
                 await super().close()
                 owner.closed_clients.append(self)
 
+        self.client_class = RecordingClient
         for replacement in [
             patch.dict(WEB["run_search_agent"].__globals__, Client=RecordingClient),
             patch.object(self.ctx, "update", self.updates),
@@ -1763,6 +1818,47 @@ class WebSearchTests(unittest.IsolatedAsyncioTestCase):
             "[2](<https://example.org>)\n\n"
             "Uncited qualification.",
         )
+
+    async def test_openai_metadata_without_excerpts_returns_valid_extension_result(self) -> None:
+        with patch.dict(os.environ, KODELET_WEB_SEARCH_PROVIDER="openai"):
+            module = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+        del self.answer_block["citations"][0]["cited_text"]
+        harness = await create_test_harness(module["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {
+                "id": "web-search", "cwd": self.ctx.cwd, "runnerId": "web-runner",
+            },
+        })
+        with patch.dict(module["run_search_agent"].__globals__, Client=self.client_class):
+            result = await harness.execute_tool({
+                "name": "web_search", "input": {"query": "Question"},
+                "context": {"conversationId": "parent-conversation", "cwd": self.ctx.cwd},
+            })
+        self.assertNotIn("error", result)
+        self.assertEqual(result["content"], "Verified finding. [1](<https://example.com>)")
+        self.assertEqual(result["structuredContent"], {
+            "content": result["content"],
+            "blocks": [{
+                **self.answer_block,
+                "citations": [{**self.answer_block["citations"][0], "cited_text": None}],
+            }],
+        })
+        schema = manifest["tools"][0]["outputSchema"]
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+        validator.validate(result["structuredContent"])
+        validator.validate({"content": result["content"], "blocks": [self.answer_block]})
+        self.assertNotIn("cited_text", schema["$defs"]["SearchCitation"]["required"])
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "web-runner", "--code-mode=off", "--profile=web-search",
+        ])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        self.assertEqual(self.session_options[0]["parent_conversation_id"], "parent-conversation")
+        self.assertEqual(result["data"]["taskRun"]["status"], "completed")
+        self.assertEqual(result["data"]["taskRun"]["counts"], {
+            "succeeded": 1, "failed": 0, "running": 0,
+        })
 
     async def test_invalid_input_and_missing_context_never_launch(self) -> None:
         self.assertIn("non-empty", (await self.search(query="   "))["error"])
