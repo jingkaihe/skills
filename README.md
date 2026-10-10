@@ -40,10 +40,10 @@ kodelet plugin add jingkaihe/skills      # current repo only
 
 Extensions run with `uv` (Python 3.11+). Some need extra setup:
 
-- **browser-use**: a Kodelet host with browser access enabled; `TYPESAFE_API_KEY` for `click`, `fill`, and `run`.
-- **look-at**, **nano-banana**: Gemini credentials (`GEMINI_API_KEY`, or `GOOGLE_CLOUD_PROJECT` for Vertex AI).
-- **web-search**: OpenAI via Codex by default (`kodelet codex login`); set `KODELET_WEB_SEARCH_PROVIDER=anthropic` to switch.
-- **code-search**, **conversation**, **web-search**: `kodelet` on `PATH`, configured and authenticated against your daemon.
+- `browser-use`: a Kodelet host with browser access enabled; `TYPESAFE_API_KEY` for `click`, `fill`, and `run`.
+- `look-at`, `nano-banana`: Gemini credentials (`GEMINI_API_KEY`, or `GOOGLE_CLOUD_PROJECT` for Vertex AI).
+- `web-search`: OpenAI via Codex by default (`kodelet codex login`); set `KODELET_WEB_SEARCH_PROVIDER=anthropic` to switch.
+- `code-search`, `conversation`, `web-search`: `kodelet` on `PATH`, configured and authenticated against your daemon.
 
 Looking for subagents? See [jingkaihe/kodelet-subagent](https://github.com/jingkaihe/kodelet-subagent).
 
