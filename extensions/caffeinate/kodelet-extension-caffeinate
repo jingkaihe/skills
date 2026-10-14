@@ -1,0 +1,97 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk>=0.1.12"]
+# ///
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+from kodelet_sdk import (
+    AgentEndEvent,
+    AgentStartEvent,
+    EventContext,
+    Extension,
+    SessionEndEvent,
+    TurnStartEvent,
+)
+
+ext = Extension(name="caffeinate", version="0.1.0")
+RunKey = tuple[str | None, str | None]
+_processes: dict[RunKey, subprocess.Popen] = {}
+
+
+def run_key(ctx: EventContext) -> RunKey:
+    return ctx.session_id, ctx.conversation_id
+
+
+def start(key: RunKey) -> None:
+    if sys.platform != "darwin":
+        return
+    process = _processes.get(key)
+    if process is not None and process.poll() is None:
+        return
+    # Each process owns only its own assertion. macOS keeps idle sleep disabled
+    # until the last assertion is released, even across independent Kodelet hosts.
+    # -w also releases it if this extension dies without receiving agent.end.
+    _processes[key] = subprocess.Popen(
+        ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop(key: RunKey) -> None:
+    process = _processes.pop(key, None)
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+    except ProcessLookupError:
+        process.wait(timeout=1)
+
+
+def stop_all() -> None:
+    for key in list(_processes):
+        stop(key)
+
+
+async def on_start(_event: AgentStartEvent | TurnStartEvent, ctx: EventContext) -> None:
+    # turn.start restores the assertion if an agent.end handler requested a
+    # follow-up, and covers resource reloads during a run. Starts are idempotent.
+    try:
+        start(run_key(ctx))
+    except OSError as exc:
+        ctx.log.warn(f"Failed to start caffeinate: {exc}")  # noqa: G010
+
+
+async def on_end(_event: AgentEndEvent, ctx: EventContext) -> None:
+    stop(run_key(ctx))
+
+
+async def on_session_end(_event: SessionEndEvent, _ctx: EventContext) -> None:
+    # session.end closes the entire extension runtime, not one conversation.
+    stop_all()
+
+
+if sys.platform == "darwin":
+    ext.on("agent.start", on_start)
+    ext.on("turn.start", on_start)
+    ext.on("agent.end", on_end)
+    ext.on("session.end", on_session_end)
+
+
+if __name__ == "__main__":
+    try:
+        ext.run_sync()
+    finally:
+        stop_all()

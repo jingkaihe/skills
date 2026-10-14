@@ -30,6 +30,7 @@ A collection of CLI tool skill definitions for AI assistants.
 
 | Extension | Tools | Description |
 |-----------|-------|-------------|
+| [caffeinate](./extensions/caffeinate/kodelet-extension-caffeinate) | None (lifecycle hooks only) | Automatically prevent macOS idle sleep during agent runs, with independent assertions for concurrent sessions |
 | [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
 | [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
 | [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
