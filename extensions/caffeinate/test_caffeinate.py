@@ -1,4 +1,4 @@
-"""Run: uv run --with 'kodelet-sdk>=0.1.12' -- python -m unittest discover -s extensions/caffeinate"""
+"""Run: uv run --with 'kodelet-sdk==0.6.1' -- python -m unittest discover -s extensions/caffeinate"""
 
 import asyncio
 import importlib.machinery
@@ -43,16 +43,22 @@ class CaffeinateTests(unittest.IsolatedAsyncioTestCase):
         self.a = {"sessionId": "host", "conversationId": "a"}
         self.b = {"sessionId": "host", "conversationId": "b"}
 
-    async def event(self, name, context=None):
+    async def event(self, name, context=None, payload=None):
+        if payload is None and name == "agent.finished":
+            payload = {"status": "succeeded"}
         return await extension.ext.handle_event(
-            {"event": name, "context": self.a if context is None else context}
+            {
+                "event": name,
+                "context": self.a if context is None else context,
+                "payload": payload or {},
+            }
         )
 
     async def test_idle_and_registration(self):
         self.assertEqual(self.metadata["tools"], [])
         self.assertEqual(
             {s["event"] for s in self.metadata["subscriptions"]},
-            {"agent.start", "turn.start", "agent.end", "session.end"},
+            {"agent.start", "turn.start", "agent.finished", "session.end"},
         )
         await self.event("session.start")
         self.assertFalse(extension._processes)
@@ -68,8 +74,10 @@ class CaffeinateTests(unittest.IsolatedAsyncioTestCase):
             stderr=subprocess.DEVNULL,
         )
         self.assertIs(extension._processes[("host", "a")], self.processes[0])
-        await self.event("agent.end")
-        await self.event("agent.end")
+        await self.event(
+            "agent.finished", payload={"status": "canceled", "reason": "canceled"}
+        )
+        await self.event("agent.finished")
         self.processes[0].terminate.assert_called_once()
         self.processes[0].wait.assert_called_once_with(timeout=1)
         self.assertFalse(extension._processes)
@@ -78,24 +86,31 @@ class CaffeinateTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(
             self.event("agent.start", self.a), self.event("agent.start", self.b)
         )
-        await self.event("agent.end", self.a)
+        await self.event("agent.finished", self.a)
         self.processes[0].terminate.assert_called_once()
         self.processes[1].terminate.assert_not_called()
         self.assertEqual(extension._processes, {("host", "b"): self.processes[1]})
-        await self.event("agent.end", self.b)
+        await self.event("agent.finished", self.b)
         self.assertFalse(extension._processes)
 
     async def test_same_conversation_in_distinct_sessions(self):
         other = {"sessionId": "other-host", "conversationId": "a"}
         await self.event("agent.start")
         await self.event("agent.start", other)
-        await self.event("agent.end")
+        await self.event("agent.finished")
         self.assertEqual(extension._processes, {("other-host", "a"): self.processes[1]})
         self.assertEqual(self.spawn.call_count, 2)
 
-    async def test_followup_or_reload_restores_protection(self):
+    async def test_followup_keeps_existing_protection(self):
         await self.event("agent.start")
         await self.event("agent.end")
+        await self.event("turn.start")
+        self.spawn.assert_called_once()
+        self.processes[0].terminate.assert_not_called()
+
+    async def test_reload_restores_protection(self):
+        await self.event("agent.start")
+        await self.event("session.end")
         await self.event("turn.start")
         self.assertEqual(self.spawn.call_count, 2)
         self.assertIs(extension._processes[("host", "a")], self.processes[1])
@@ -135,6 +150,6 @@ class CaffeinateTests(unittest.IsolatedAsyncioTestCase):
         await self.event("agent.start")
         process = self.processes[0]
         process.wait.side_effect = [subprocess.TimeoutExpired("caffeinate", 1), 0]
-        await self.event("agent.end")
+        await self.event("agent.finished")
         process.kill.assert_called_once()
         self.assertEqual(process.wait.call_count, 2)

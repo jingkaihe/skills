@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.12"]
+# dependencies = ["kodelet-sdk>=0.6.1,<0.7"]
 # ///
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 from kodelet_sdk import (
-    AgentEndEvent,
+    AgentFinishedEvent,
     AgentStartEvent,
     EventContext,
     Extension,
@@ -36,7 +36,7 @@ def start(key: RunKey) -> None:
         return
     # Each process owns only its own assertion. macOS keeps idle sleep disabled
     # until the last assertion is released, even across independent Kodelet hosts.
-    # -w also releases it if this extension dies without receiving agent.end.
+    # -w also releases it if this extension dies without receiving agent.finished.
     _processes[key] = subprocess.Popen(
         ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
         stdin=subprocess.DEVNULL,
@@ -66,15 +66,15 @@ def stop_all() -> None:
 
 
 async def on_start(_event: AgentStartEvent | TurnStartEvent, ctx: EventContext) -> None:
-    # turn.start restores the assertion if an agent.end handler requested a
-    # follow-up, and covers resource reloads during a run. Starts are idempotent.
+    # turn.start covers resource reloads during a run. Starts are idempotent,
+    # and agent.end follow-ups keep the same assertion until agent.finished.
     try:
         start(run_key(ctx))
     except OSError as exc:
         ctx.log.warn(f"Failed to start caffeinate: {exc}")  # noqa: G010
 
 
-async def on_end(_event: AgentEndEvent, ctx: EventContext) -> None:
+async def on_finished(_event: AgentFinishedEvent, ctx: EventContext) -> None:
     stop(run_key(ctx))
 
 
@@ -86,7 +86,7 @@ async def on_session_end(_event: SessionEndEvent, _ctx: EventContext) -> None:
 if sys.platform == "darwin":
     ext.on("agent.start", on_start)
     ext.on("turn.start", on_start)
-    ext.on("agent.end", on_end)
+    ext.on("agent.finished", on_finished)
     ext.on("session.end", on_session_end)
 
 

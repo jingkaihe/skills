@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "kodelet-sdk>=0.6.0,<0.7",
+#   "kodelet-sdk>=0.6.1,<0.7",
 #   "typesafe-sdk==0.7.1",
 #   "playwright==1.63.0",
 # ]

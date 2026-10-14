@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "kodelet-sdk==0.6.0",
+#   "kodelet-sdk==0.6.1",
 #   "jsonschema>=4,<5",
 #   "filetype",
 #   "google-genai",
@@ -250,7 +250,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     def test_sdk_distribution_and_transport_support(self) -> None:
         package = distribution("kodelet-sdk")
         direct_url = package.read_text("direct_url.json")
-        self.assertEqual(package.version, "0.6.0")
+        self.assertEqual(package.version, "0.6.1")
         if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
             self.assertIsNotNone(direct_url)
             self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
@@ -301,6 +301,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
             "browser-use": ["browser_use"],
+            "caffeinate": [],
             "code-search": ["code_search"],
             "conversation": ["read_conversation", "search_conversation"],
             "goal": ["get_goal", "update_goal"],
@@ -319,7 +320,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             for name, tools in expected.items():
                 with self.subTest(extension=name):
                     script = EXTENSIONS / name / f"kodelet-extension-{name}"
-                    self.assertIn("kodelet-sdk>=0.6.0,<0.7", script.read_text())
+                    self.assertIn("kodelet-sdk>=0.6.1,<0.7", script.read_text())
                     payload = json.dumps(
                         {
                             "jsonrpc": "2.0",

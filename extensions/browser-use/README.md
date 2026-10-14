@@ -4,7 +4,7 @@ A Python port of Kodelet's TypeScript browser-use extension. It operates the con
 
 ## Setup
 
-Install this plugin repository with `kodelet plugin add jingkaihe/skills`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. All extensions in this repository now require `kodelet-sdk>=0.6.0,<0.7`; this extension also pins `typesafe-sdk==0.7.1` and `playwright==1.63.0`.
+Install this plugin repository with `kodelet plugin add jingkaihe/skills`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. All extensions in this repository require `kodelet-sdk>=0.6.1,<0.7`; this extension also pins `typesafe-sdk==0.7.1` and `playwright==1.63.0`.
 
 Use a Kodelet host advertising browser capability version 1. Configure Chrome on the runner and enable browser access on the control-plane host, rather than in repository model-profile overrides:
 
