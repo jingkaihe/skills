@@ -4,7 +4,7 @@
 # dependencies = [
 #   "filetype",
 #   "google-genai",
-#   "kodelet-sdk>=0.1.8",
+#   "kodelet-sdk>=0.6.0,<0.7",
 # ]
 # ///
 
@@ -299,6 +299,8 @@ def analyze_file(
     "look_at",
     description=DESCRIPTION,
     input_schema=LookAtInput,
+    output_schema={"type": "string", "description": "Findings relevant to the requested objective."},
+    short="Extract targeted information from local documents, images, audio, or video.",
     timeout_in_sec=0,
 )
 async def look_at(input: LookAtInput, ctx: ToolContext) -> ToolExecutionResult:
@@ -322,7 +324,7 @@ async def look_at(input: LookAtInput, ctx: ToolContext) -> ToolExecutionResult:
             reference_files,
             ctx.cwd,
         )
-        return {"content": result}
+        return {"content": result, "structuredContent": result}
     except Exception as exc:
         message = f"Failed to analyze file: {exc}"
         return {"content": message, "error": message}

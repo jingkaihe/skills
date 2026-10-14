@@ -36,7 +36,7 @@ export ANTHROPIC_API_KEY=...
 From repo root:
 
 ```bash
-uv run ./sdk/python examples/claude-code-with-docker/main.py
+uv run --with-editable ./sdk/python examples/claude-code-with-docker/main.py
 ```
 
 Optional flags:
@@ -52,4 +52,6 @@ The script uses `matchlock` from `PATH` by default. Override with `MATCHLOCK_BIN
 
 - This example launches an interactive shell as the `agent` user.
 - Docker is expected to work inside the sandbox.
+- Rebuild older images that selected `iptables-legacy`; the Dockerfile now uses
+  Docker's nftables firewall backend with guest IP forwarding enabled.
 - After attaching, try `docker info`, `docker run --rm hello-world`, and `claude --dangerously-skip-permissions`.

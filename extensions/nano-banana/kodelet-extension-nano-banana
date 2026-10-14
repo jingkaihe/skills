@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "google-genai",
-#   "kodelet-sdk>=0.1.8",
+#   "kodelet-sdk>=0.6.0,<0.7",
 #   "pillow",
 # ]
 # ///
@@ -24,10 +24,10 @@ from kodelet_sdk import BaseModel, Extension, Field, ToolContext, ToolExecutionR
 
 
 DESCRIPTION = (
-    "Generate an image from a prompt using Google Gemini Nano Banana and save it "
-    "under $HOME/.cache/nano-banana."
+    "Generate an image from a prompt using Google Gemini Nano Banana and return it "
+    "as an image attachment."
 )
-DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image"
 DEFAULT_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 CACHE_DIR = Path.home() / ".cache" / "nano-banana"
 VALID_ASPECT_RATIOS = {
@@ -63,7 +63,7 @@ class NanoBananaInput(BaseModel):
     )
     model: str | None = Field(
         default=None,
-        description="Optional Gemini image generation model. Defaults to gemini-3.1-flash-image-preview.",
+        description="Optional Gemini image generation model. Defaults to gemini-3.1-flash-image.",
     )
 
 
@@ -105,7 +105,7 @@ def save_generated_image(response: Any, prompt: str) -> Path:
     raise RuntimeError("The model response did not contain an image.")
 
 
-def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
+def generate_image(input: NanoBananaInput) -> Path:
     prompt = input.prompt.strip()
     if not prompt:
         raise ValueError("Missing required parameter: prompt")
@@ -135,27 +135,43 @@ def generate_image(input: NanoBananaInput) -> tuple[Path, str]:
         contents=prompt,
         config=config,
     )
-    output_path = save_generated_image(response, prompt)
-    return output_path, model
+    return save_generated_image(response, prompt)
 
 
 @ext.tool(
     "nano_banana",
     description=DESCRIPTION,
     input_schema=NanoBananaInput,
+    output_schema={
+        "type": "object",
+        "properties": {"success": {"type": "boolean"}, "error": {"type": "string"}},
+        "required": ["success"],
+    },
+    short="Generate an image from a prompt and return it as an image attachment.",
     timeout_in_sec=0,
 )
 async def nano_banana(input: NanoBananaInput, _ctx: ToolContext) -> ToolExecutionResult:
     try:
-        output_path, model = await asyncio.to_thread(generate_image, input)
-        content = f"Generated image saved to {output_path} using {model}."
+        output_path = await asyncio.to_thread(generate_image, input)
         return {
-            "content": content,
-            "data": {"success": True, "image_path": str(output_path), "model": model},
+            "content": "Generated image.",
+            "attachments": [
+                {
+                    "type": "image",
+                    "path": str(output_path),
+                    "mimeType": "image/png",
+                    "alt": input.prompt.strip()[:1000],
+                }
+            ],
+            "structuredContent": {"success": True},
         }
     except Exception as exc:
         message = f"Image generation failed: {exc}"
-        return {"content": message, "data": {"success": False, "error": message}, "error": message}
+        return {
+            "content": message,
+            "structuredContent": {"success": False, "error": message},
+            "error": message,
+        }
 
 
 if __name__ == "__main__":

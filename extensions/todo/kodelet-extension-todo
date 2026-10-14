@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["kodelet-sdk>=0.1.12"]
+# dependencies = ["kodelet-sdk>=0.6.0,<0.7"]
 # ///
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from kodelet_sdk import (
     SessionStartEvent,
     ToolContext,
     ToolExecutionResult,
+    ToolPresentation,
     UIFrameLine,
     UIStyledSpan,
 )
@@ -64,6 +65,51 @@ class TodoItem(BaseModel):
     )
     status: TodoStatus = Field(description="The current status of the todo.")
     priority: TodoPriority = Field(description="The priority of the todo.")
+
+
+TODO_OUTPUT_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "write"]},
+                "file_path": {"type": "string"},
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            **TodoItem.model_json_schema()["properties"],
+                        },
+                        "required": ["id", "content", "status", "priority"],
+                        "additionalProperties": False,
+                    },
+                },
+                "statistics": {
+                    "type": "object",
+                    "properties": {
+                        key: {"type": "integer", "minimum": 0}
+                        for key in ["total", "completed", "in_progress", "pending", "canceled"]
+                    },
+                    "required": ["total", "completed", "in_progress", "pending", "canceled"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["action", "file_path", "todos", "statistics"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "success": {"const": False},
+                "error": {"type": "string"},
+            },
+            "required": ["success", "error"],
+            "additionalProperties": False,
+        },
+    ],
+}
 
 
 class TodoList(BaseModel):
@@ -216,6 +262,30 @@ def format_todos(todos: list[TodoItem]) -> str:
     return "\n".join(lines)
 
 
+def todo_presentation(
+    action: Literal["read", "write"], todos: list[TodoItem]
+) -> ToolPresentation:
+    summary = "Todo updated" if action == "write" else "Todo read"
+    lines = []
+    for todo in todos:
+        # Keep each item on one line and display task text literally in Markdown.
+        content = re.sub(
+            r"([\\`*_{}\[\]()<>#+.!|~&-])", r"\\\1", " ".join(todo.content.split())
+        )
+        if todo.status == "in_progress":
+            content = f"**→ {content}** · in progress"
+        elif todo.status == "completed":
+            content = f"✓ ~~{content}~~"
+        elif todo.status == "canceled":
+            content = f"× ~~{content}~~ · canceled"
+        else:
+            content = f"○ {content}"
+        lines.append(f"{content} · {todo.priority} priority")
+
+    # Markdown hard breaks keep the status-marked rows separate without bullets.
+    return {"summary": summary, "body": "  \n".join(lines), "format": "markdown"}
+
+
 def all_todos_finished(todos: list[TodoItem]) -> bool:
     return bool(todos) and all(todo.status in TERMINAL_STATUSES for todo in todos)
 
@@ -295,7 +365,7 @@ async def publish_progress(
     try:
         await ctx.update(
             f"Todo progress: {finished}/{statistics['total']} finished",
-            {"todo": progress},
+            {"todo": progress, "presentation": todo_presentation(action, todos)},
         )
     except RuntimeError as exc:
         ctx.log.warn(f"failed to stream todo progress: {exc}")  # noqa: G010
@@ -310,7 +380,7 @@ def error_result(message: str) -> ToolExecutionResult:
     return {
         "content": message,
         "error": message,
-        "data": {"success": False, "error": message},
+        "structuredContent": {"success": False, "error": message},
     }
 
 
@@ -321,6 +391,8 @@ def error_result(message: str) -> ToolExecutionResult:
         "active item, or recover context when work has gone off track."
     ),
     input_schema=TodoReadInput,
+    output_schema=TODO_OUTPUT_SCHEMA,
+    short="Read the current conversation's todo list and progress.",
 )
 async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionResult:
     try:
@@ -350,7 +422,8 @@ async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionRes
         await publish_progress(ctx, "read", path, todos)
     return {
         "content": format_todos(sorted_todos),
-        "data": snapshot("read", path, sorted_todos),
+        "structuredContent": snapshot("read", path, sorted_todos),
+        "data": {"presentation": todo_presentation("read", todos)},
     }
 
 
@@ -364,6 +437,8 @@ async def todo_read(_input: TodoReadInput, ctx: ToolContext) -> ToolExecutionRes
         "their state changes."
     ),
     input_schema=TodoWriteInput,
+    output_schema=TODO_OUTPUT_SCHEMA,
+    short="Replace the current conversation's full todo list.",
 )
 async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionResult:
     try:
@@ -380,7 +455,8 @@ async def todo_write(input: TodoWriteInput, ctx: ToolContext) -> ToolExecutionRe
         await publish_progress(ctx, "write", path, todos)
     return {
         "content": "Todo list updated.",
-        "data": snapshot("write", path, todos),
+        "structuredContent": snapshot("write", path, todos),
+        "data": {"presentation": todo_presentation("write", todos)},
     }
 
 

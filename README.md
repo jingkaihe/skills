@@ -1,61 +1,60 @@
 # Skills
 
-A collection of CLI tool skill definitions for AI assistants.
+A [Kodelet](https://github.com/jingkaihe/kodelet) plugin with agent skills and extensions.
 
-## Available Skills
+## Install
+
+```bash
+kodelet plugin add jingkaihe/skills -g   # global
+kodelet plugin add jingkaihe/skills      # current repo only
+```
+
+## Skills
 
 | Skill | Description |
 |-------|-------------|
-| [ast-grep](./skills/ast-grep/SKILL.md) | Structural code search with ast-grep using AST-aware patterns |
-| [google-workspace](./skills/google-workspace/SKILL.md) | Google Workspace MCP integration through maco - Gmail, Calendar, Contacts, and Drive |
-| [librarian](./skills/librarian/SKILL.md) | Maintain a local cache of remote Git repositories for code research and exploration |
-| [icloud-cli](./skills/icloud-cli/SKILL.md) | Manage iCloud calendars, events, and email via the CLI |
-| [matchlock](./skills/matchlock/SKILL.md) | Run AI agents in ephemeral micro-VMs with VM-level isolation, network allowlisting, and secret injection - CLI, Go SDK, and Python SDK |
-| [schedule](./skills/schedule/SKILL.md) | Manage scheduled, background agentic tasks |
-| [strix-halo-llm](./skills/strix-halo-llm/SKILL.md) | Run, benchmark, and serve local GGUF models on AMD Strix Halo using kyuz0 toolboxes, memory estimation, and reproducible podman commands |
-| [tmux](./skills/tmux/SKILL.md) | Run interactive CLIs and long-running tasks in isolated tmux sessions - manage session lifecycle, scrape pane output, and poll for patterns |
-| [uv](./skills/uv/SKILL.md) | Astral uv usage for `uv run`, PEP 723 inline script dependencies, dependency compilation/locking, and `uv_build` backend setup |
-| [waitrose-cli](./skills/waitrose-cli/SKILL.md) | Manage Waitrose grocery shopping - trolley, product search, delivery slots, and orders |
+| [cloudflare-tunnel](./skills/cloudflare-tunnel/SKILL.md) | Expose local services with Cloudflare Tunnel |
+| [google-workspace](./skills/google-workspace/SKILL.md) | Gmail, Calendar, Contacts, and Drive via the google-workspace MCP server |
+| [icloud-cli](./skills/icloud-cli/SKILL.md) | iCloud calendars, events, and email |
+| [librarian](./skills/librarian/SKILL.md) | Local cache of remote Git repositories for code research |
+| [matchlock](./skills/matchlock/SKILL.md) | Run agents and code in isolated micro-VMs |
+| [screen-recording](./skills/screen-recording/SKILL.md) | Record terminal and browser demos, including on headless Linux |
+| [strix-halo-llm](./skills/strix-halo-llm/SKILL.md) | Run and benchmark local llama.cpp models on AMD Strix Halo |
+| [tmux](./skills/tmux/SKILL.md) | Run interactive CLIs and long-running tasks in tmux sessions |
+| [uv](./skills/uv/SKILL.md) | Python packages, environments, and scripts with uv |
+| [waitrose-cli](./skills/waitrose-cli/SKILL.md) | Waitrose grocery shopping |
 
-## Available Recipes
+## Extensions
 
-| Recipe | Description |
-|--------|-------------|
-| [code/architect](./recipes/code/architect.md) | Analyzes codebase patterns and designs architectural solutions with implementation blueprints |
-| [code/reviewer](./recipes/code/reviewer.md) | Performs a comprehensive code review of changes with focus on quality, security, and best practices |
-| [ralph/init](./recipes/ralph/init.md) | Generate a PRD (Product Requirements Document) based on discussion and design docs for autonomous development |
-| [ralph/iterate](./recipes/ralph/iterate.md) | Iteratively work through a feature list, implementing one feature at a time with progress tracking |
+| Extension | Provides | Description |
+|-----------|----------|-------------|
+| [browser-use](./extensions/browser-use/README.md) | `browser_use` | Goal-driven automation in the shared browser |
+| [caffeinate](./extensions/caffeinate) | Lifecycle hooks only | Automatically prevent macOS idle sleep during agent runs, with independent assertions for concurrent sessions |
+| [code-search](./extensions/code-search) | `code_search` | Find code by behaviour or concept |
+| [conversation](./extensions/conversation) | `search_conversation`, `read_conversation` | Find past conversations and extract what's relevant |
+| [goal](./extensions/goal) | `/goal`, `get_goal`, `update_goal` | Keep working toward a goal until it's done |
+| [last-word](./extensions/last-word) | `/last-word`, `ctrl+alt+w` | Save the last response to a Markdown file |
+| [look-at](./extensions/look-at) | `look_at` | Analyse PDFs, images, audio, and video |
+| [nano-banana](./extensions/nano-banana) | `nano_banana` | Generate images with Gemini |
+| [todo](./extensions/todo) | `todo_read`, `todo_write` | Track tasks with a live progress widget |
+| [web-search](./extensions/web-search) | `web_search` | Web research with cited answers |
 
-## Available Extensions
+Extensions run with `uv` (Python 3.11+). Some need extra setup:
 
-| Extension | Tools | Description |
-|-----------|-------|-------------|
-| [caffeinate](./extensions/caffeinate/kodelet-extension-caffeinate) | None (lifecycle hooks only) | Automatically prevent macOS idle sleep during agent runs, with independent assertions for concurrent sessions |
-| [code-search](./extensions/code-search/kodelet-extension-code-search) | `code_search` | Agentic codebase search for complex, multi-step code discovery tasks |
-| [look-at](./extensions/look-at/kodelet-extension-look-at) | `look_at` | Targeted analysis of local files, including PDFs, images, audio, video, and documents |
-| [nano-banana](./extensions/nano-banana/kodelet-extension-nano-banana) | `nano_banana` | Generate images with Gemini Nano Banana and save them under `~/.cache/nano-banana` |
-| [subagent](./extensions/subagent/kodelet-extension-subagent) | `subagent` | Delegate self-contained tasks to an independent Kodelet session using the default profile |
+- `browser-use`: a Kodelet host with browser access enabled; `TYPESAFE_API_KEY` for `click`, `fill`, and `run`.
+- `look-at`, `nano-banana`: Gemini credentials (`GEMINI_API_KEY`, or `GOOGLE_CLOUD_PROJECT` for Vertex AI).
+- `web-search`: OpenAI via Codex by default (`kodelet codex login`); set `KODELET_WEB_SEARCH_PROVIDER=anthropic` to switch.
+- `code-search`, `conversation`, `web-search`: `kodelet` on `PATH`, configured and authenticated against your daemon.
 
-## Structure
+Looking for subagents? See [jingkaihe/kodelet-subagent](https://github.com/jingkaihe/kodelet-subagent).
 
-Each skill is contained in its own directory with a `SKILL.md` file that provides:
-- Metadata (name, description, trigger conditions)
-- Prerequisites and setup instructions
-- Command reference and usage examples
-- Common workflows and troubleshooting tips
-
-Extensions live under `extensions/` as executable `kodelet-extension-*` Python SDK scripts with inline `uv` dependency metadata.
-
-## Installation
+## Development
 
 ```bash
-# Install this plugin repository globally
-kodelet plugin add jingkaihe/skills -g
-
-# Install locally for the current repo
-kodelet plugin add jingkaihe/skills
+uv run --script tests/test_extensions.py
+uv run --script tests/test_browser_use.py
 ```
 
-## Usage
+## License
 
-These skill definitions are designed to be loaded by AI assistants to enable interaction with external CLI tools. Each `SKILL.md` follows a standard format with YAML frontmatter for metadata.
+[MIT](./LICENSE)

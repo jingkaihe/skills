@@ -1,0 +1,1945 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "kodelet-sdk==0.6.0",
+#   "jsonschema>=4,<5",
+#   "filetype",
+#   "google-genai",
+#   "pillow",
+#   "typesafe-sdk==0.7.1",
+#   "playwright==1.63.0",
+# ]
+# ///
+
+"""Run with `uv run --script tests/test_extensions.py`; no provider calls.
+
+For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
+../kodelet-python-sdk --with filetype --with google-genai --with pillow --with jsonschema
+--with typesafe-sdk==0.7.1 --with playwright==1.63.0
+-- python tests/test_extensions.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import runpy
+import sys
+import tempfile
+import unittest
+from importlib.metadata import distribution
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
+
+import kodelet_sdk
+from jsonschema import Draft202012Validator
+from kodelet_sdk import Client, ToolContext, create_test_harness
+from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
+
+ROOT = Path(__file__).resolve().parents[1]
+EXTENSIONS = ROOT / "extensions"
+SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
+CONVERSATION = runpy.run_path(str(EXTENSIONS / "conversation" / "kodelet-extension-conversation"))
+with patch.dict(os.environ, KODELET_WEB_SEARCH_PROVIDER="anthropic"):
+    WEB = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+
+
+def tool_call(call_id: str, name: str, tool_input: Any) -> dict[str, Any]:
+    return {
+        "sessionUpdate": "tool_call", "toolCallId": call_id,
+        "toolName": name, "rawInput": tool_input,
+    }
+
+
+def tool_result(
+    call_id: str, name: str, status: str = "completed", text: str = "",
+) -> dict[str, Any]:
+    return {
+        "sessionUpdate": "tool_call_update", "toolCallId": call_id,
+        "toolName": name, "status": status,
+        "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+    }
+
+
+def message(text: str, data: Any = None) -> dict[str, Any]:
+    update = {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": text},
+    }
+    if data is not None:
+        update["_meta"] = {"kodelet/textData": data}
+    return update
+
+
+class ACPProcess:
+    """Provider-free line transport; Client, Session, RPC, and progress are real SDK code."""
+
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.stdin = self
+        self.requests: list[dict[str, Any]] = []
+        self.tasks: set[asyncio.Task[None]] = set()
+        self.closed = asyncio.Event()
+        self.terminating = asyncio.Event()
+        self.killed = asyncio.Event()
+        self.reaped = asyncio.Event()
+        self.ignore_terminate = False
+        self.loading = asyncio.Event()
+        self.prompt_started = asyncio.Event()
+        self.allow_load = asyncio.Event()
+        self.allow_load.set()
+        self.allow_result = asyncio.Event()
+        self.allow_result.set()
+        self.init_error: str | None = None
+        self.prompt_error: str | None = None
+        self.stop_reason = "end_turn"
+        self.extension_version = 1
+        self.hierarchy_version = 1
+        self.events = [
+            tool_call("a", "grep_tool", {"pattern": "parser", "path": "."}),
+            tool_result("a", "grep_tool", text="src/handler.go:20: parser"),
+            message("  Found src/handler.go:20-40.\n"),
+        ]
+
+    def write(self, chunk: bytes) -> None:
+        for line in chunk.splitlines():
+            request = json.loads(line)
+            self.requests.append(request)
+            if "id" in request:
+                task = asyncio.create_task(self.handle(request))
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.terminate()
+
+    def terminate(self) -> None:
+        self.terminating.set()
+        if not self.ignore_terminate:
+            self._exit()
+
+    def _exit(self) -> None:
+        if not self.closed.is_set():
+            self.closed.set()
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            for task in self.tasks:
+                task.cancel()
+
+    def kill(self) -> None:
+        self.killed.set()
+        self._exit()
+
+    async def wait(self) -> int:
+        await self.closed.wait()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.reaped.set()
+        return 0
+
+    def send(self, value: dict[str, Any]) -> None:
+        self.stdout.feed_data((json.dumps({"jsonrpc": "2.0", **value}) + "\n").encode())
+
+    async def handle(self, request: dict[str, Any]) -> None:
+        method = request["method"]
+        error: str | None = None
+        if method == "initialize":
+            result = {"protocolVersion": 1, "_meta": {
+                "sessionExtensions": {"version": self.extension_version},
+                "conversationHierarchy": {"version": self.hierarchy_version},
+            }}
+        elif method == "session/new":
+            self.loading.set()
+            await self.allow_load.wait()
+            error = self.init_error
+            result = {"sessionId": "search-conversation"}
+        elif method == "session/prompt":
+            self.prompt_started.set()
+            for event in self.events:
+                self.send({"method": "session/update", "params": {
+                    "sessionId": "search-conversation", "update": event,
+                }})
+                # Let the real reader and TaskProgress publish intermediate snapshots.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            await self.allow_result.wait()
+            error = self.prompt_error
+            result = {"stopReason": self.stop_reason}
+        else:
+            error = f"Unexpected ACP method: {method}"
+            result = {}
+        self.send({"id": request["id"], **(
+            {"error": {"code": -1, "message": error}} if error else {"result": result}
+        )})
+
+
+class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
+    def test_nano_banana_uses_image_model_default_and_override(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
+        generate = module["generate_image"]
+        for model, expected in [(None, "gemini-3.1-flash-image"), (" custom-model ", "custom-model")]:
+            with self.subTest(model=model):
+                client = Mock()
+                output_path = Path("/runner/cache/generated.png")
+                save_image = Mock(return_value=output_path)
+                with patch.dict(generate.__globals__, {
+                    "build_client": Mock(return_value=client), "save_generated_image": save_image,
+                }):
+                    result = generate(module["NanoBananaInput"](prompt=" A drawing ", model=model))
+                self.assertEqual(result, output_path)
+                client.models.generate_content.assert_called_once()
+                self.assertEqual(client.models.generate_content.call_args.kwargs["model"], expected)
+                self.assertEqual(client.models.generate_content.call_args.kwargs["contents"], "A drawing")
+                save_image.assert_called_once_with(client.models.generate_content.return_value, "A drawing")
+
+    async def test_nano_banana_declares_image_attachment(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
+        handler = module["nano_banana"]
+        output_path = Path("/runner/cache/generated.png")
+        with patch.dict(handler.__globals__, {"generate_image": lambda _input: output_path}):
+            harness = await create_test_harness(module["ext"])
+            result = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": " A drawing "}})
+            long_prompt = "  " + "\U0001f3a8" * 1500 + "  "
+            long_result = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": long_prompt}})
+        self.assertEqual(result["attachments"], [{
+            "type": "image", "path": str(output_path), "mimeType": "image/png", "alt": "A drawing",
+        }])
+        self.assertEqual(result["structuredContent"], {"success": True})
+        self.assertNotIn("data", result)
+        self.assertEqual(result["content"], "Generated image.")
+        self.assertNotIn(str(output_path), json.dumps({
+            key: value for key, value in result.items() if key != "attachments"
+        }), "The runner path must only appear in the host-ingested attachment")
+        self.assertEqual(long_result["attachments"], [{
+            "type": "image", "path": str(output_path), "mimeType": "image/png",
+            "alt": long_prompt.strip()[:1000],
+        }])
+        self.assertEqual(len(long_result["attachments"][0]["alt"]), 1000)
+        self.assertLess(len(long_result["attachments"][0]["alt"].encode("utf-8")), 4096)
+        self.assertEqual(long_result["structuredContent"], {"success": True})
+        self.assertEqual(long_result["content"], result["content"])
+        schema = harness.initialize()["tools"][0]["outputSchema"]
+        Draft202012Validator(schema).validate(result["structuredContent"])
+        with patch.dict(handler.__globals__, {"generate_image": Mock(side_effect=RuntimeError("unavailable"))}):
+            failed = await harness.execute_tool({"name": "nano_banana", "input": {"prompt": "A drawing"}})
+        self.assertEqual(failed["structuredContent"], {"success": False, "error": failed["error"]})
+        self.assertNotIn("attachments", failed)
+        self.assertNotIn("data", failed)
+        Draft202012Validator(schema).validate(failed["structuredContent"])
+
+    async def test_look_at_returns_canonical_analysis(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "look-at" / "kodelet-extension-look-at"))
+        harness = await create_test_harness(module["ext"])
+        schema = harness.initialize()["tools"][0]["outputSchema"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.txt"
+            path.write_text("Evidence")
+            with patch.dict(module["look_at"].__globals__, {"analyze_file": Mock(return_value="Findings")}):
+                result = await harness.execute_tool({
+                    "name": "look_at",
+                    "input": {"path": str(path), "objective": "Extract facts", "context": "Research"},
+                })
+        self.assertEqual(result, {"content": "Findings", "structuredContent": "Findings"})
+        Draft202012Validator(schema).validate(result["structuredContent"])
+
+    def test_sdk_distribution_and_transport_support(self) -> None:
+        package = distribution("kodelet-sdk")
+        direct_url = package.read_text("direct_url.json")
+        self.assertEqual(package.version, "0.6.0")
+        if os.environ.get("KODELET_TEST_LOCAL_SDK") == "1":
+            self.assertIsNotNone(direct_url)
+            self.assertTrue(json.loads(direct_url)["dir_info"]["editable"])
+            self.assertEqual(
+                Path(kodelet_sdk.__file__).resolve(),
+                ROOT.parent / "kodelet-python-sdk" / "src" / "kodelet_sdk" / "__init__.py",
+            )
+            self.assertFalse(hasattr(ToolContext(None), "children"))
+        else:
+            self.assertIsNone(direct_url, "Default run must test the published minimum wheel")
+        self.assertEqual(ACP_MESSAGE_LIMIT, 64 * 1024 * 1024)
+
+    async def test_conversation_tools_dispatch_in_one_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = await create_test_harness(CONVERSATION["ext"])
+            harness.initialize({
+                "capabilities": {"profiles": {"remote": True}},
+                "extension": {
+                    "id": "conversation", "cwd": directory, "runnerId": "conversation-runner",
+                },
+            })
+            context = {"conversationId": "current", "cwd": directory}
+            search = AsyncMock(return_value={"total": 1, "conversations": [search_hit("saved")]})
+            export = AsyncMock()
+            read = AsyncMock(return_value="Evidence: conversation saved, transcript lines 1-3.")
+            with patch.dict(CONVERSATION["read_conversation"].__globals__, {
+                "run_search": search, "export_transcript": export, "run_read_agent": read,
+            }):
+                found = await harness.execute_tool({
+                    "name": "search_conversation", "input": {"query": "earlier work"}, "context": context,
+                })
+                result = await harness.execute_tool({
+                    "name": "read_conversation",
+                    "input": {"conversation_id": "saved", "goal": "What changed?"}, "context": context,
+                })
+            self.assertNotIn("error", found)
+            self.assertIn("`saved`", found["content"])
+            search.assert_awaited_once_with("earlier work", None, 11, directory)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["content"], read.return_value)
+            export.assert_awaited_once()
+            self.assertEqual(export.await_args.args[0], "saved")
+            read.assert_awaited_once()
+            self.assertEqual(read.await_args.kwargs, {
+                "runner": "conversation-runner", "parent_conversation_id": "current",
+            })
+
+    async def test_all_extensions_initialize_over_real_stdio(self) -> None:
+        expected = {
+            "browser-use": ["browser_use"],
+            "code-search": ["code_search"],
+            "conversation": ["read_conversation", "search_conversation"],
+            "goal": ["get_goal", "update_goal"],
+            "last-word": [],
+            "look-at": ["look_at"],
+            "nano-banana": ["nano_banana"],
+            "todo": ["todo_read", "todo_write"],
+            "web-search": ["web_search"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "not-a-state-directory"
+            state.write_text("unusable client store", encoding="utf-8")
+            # No CLI executable or client/provider credentials are needed to register.
+            env = {"HOME": directory, "PATH": "", "KODELET_HOME": str(state)}
+            for name, tools in expected.items():
+                with self.subTest(extension=name):
+                    script = EXTENSIONS / name / f"kodelet-extension-{name}"
+                    self.assertIn("kodelet-sdk>=0.6.0,<0.7", script.read_text())
+                    payload = json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "extension.initialize",
+                            "params": {
+                                "capabilities": {"profiles": {"remote": True}},
+                                "extension": {
+                                    "id": name,
+                                    "cwd": directory,
+                                    "dataDir": str(root / "data"),
+                                }
+                            },
+                        }
+                    ).encode()
+                    request = f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload
+                    process = await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        str(script),
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=directory,
+                        env=env,
+                    )
+                    assert process.stdin is not None and process.stdout is not None
+                    try:
+                        process.stdin.write(request)
+                        await process.stdin.drain()
+                        # Keep stdin open until initialization is acknowledged:
+                        # EOF correctly cancels unfinished SDK request handlers.
+                        async with asyncio.timeout(15):
+                            header = await process.stdout.readuntil(b"\r\n\r\n")
+                            length = int(header.decode().split(":", 1)[1].strip())
+                            response = json.loads(await process.stdout.readexactly(length))
+                    finally:
+                        process.stdin.close()
+                        try:
+                            _, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+                        except TimeoutError:
+                            process.kill()
+                            await process.communicate()
+                            raise
+                    self.assertEqual(process.returncode, 0, stderr.decode())
+                    self.assertNotIn("error", response)
+                    manifest = response["result"]
+                    self.assertEqual(manifest["name"], name)
+                    self.assertEqual([tool["name"] for tool in manifest["tools"]], tools)
+                    for tool in manifest["tools"]:
+                        self.assertTrue(tool["short"].strip())
+                        self.assertNotIn("\n", tool["short"])
+                        Draft202012Validator.check_schema(tool["outputSchema"])
+                    if name == "goal":
+                        self.assertTrue(os.access(script, os.X_OK))
+                        self.assertEqual(manifest["commands"][0]["name"], "goal")
+                        self.assertEqual(manifest["commands"][0]["aliases"], ["/goal"])
+                        self.assertEqual(
+                            {row["event"]: row["priority"] for row in manifest["subscriptions"]},
+                            {"agent.init": -1000, "agent.end": 0},
+                        )
+                    if name == "last-word":
+                        self.assertEqual(manifest["commands"][0]["name"], "last-word")
+                        self.assertEqual(manifest["shortcuts"][0]["key"], "ctrl+alt+w")
+                    if name == "web-search":
+                        self.assertTrue(os.access(script, os.X_OK))
+                        self.assertEqual(manifest["profiles"], [{
+                            "name": "web-search",
+                            "hidden": True,
+                            "options": {
+                                "provider": "openai",
+                                "model": "gpt-6-luna",
+                                "reasoning_effort": "none",
+                                "max_tokens": 4096,
+                                "openai": {
+                                    "api_mode": "responses",
+                                    "platform": "codex",
+                                    "service_tier": "fast",
+                                    "enable_search": True,
+                                },
+                                "allowed_tools": ["openai_web_search"],
+                                "skills": {"enabled": False},
+                            },
+                        }])
+                    if name in {"code-search", "conversation"}:
+                        self.assertTrue(os.access(script, os.X_OK))
+                        self.assertEqual(manifest["profiles"], [{
+                            "name": "read-conversation" if name == "conversation" else name,
+                            "hidden": True,
+                            "options": {
+                                "provider": "openai",
+                                "model": "gpt-6-luna",
+                                "reasoning_effort": "none",
+                                "openai": {
+                                    "api_mode": "responses",
+                                    "platform": "codex",
+                                    "service_tier": "fast",
+                                },
+                                "allowed_tools": ["file_read", "grep_tool"] + (
+                                    ["glob_tool"] if name == "code-search" else []
+                                ),
+                                "enable_fs_search_tools": True,
+                                "skills": {"enabled": False},
+                            },
+                        }])
+            self.assertEqual(state.read_text(), "unusable client store")
+            self.assertFalse((root / "data").exists())
+
+
+class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.data_dir = self.root / "data"
+        self.context = {"conversationId": "parent-conversation", "cwd": str(self.root)}
+        self.module, self.harness = await self.new_harness()
+        self.path = self.data_dir / self.module["goal_storage_path"](
+            self.context["conversationId"],
+        )
+
+    async def new_harness(self) -> tuple[dict[str, Any], Any]:
+        module = runpy.run_path(str(EXTENSIONS / "goal" / "kodelet-extension-goal"))
+        harness = await create_test_harness(module["ext"])
+        harness.initialize({"extension": {
+            "id": "goal", "cwd": str(self.root), "dataDir": str(self.data_dir),
+        }})
+        return module, harness
+
+    async def command(self, raw: str = "/goal finish the migration") -> dict[str, Any]:
+        return await self.harness.execute_command({
+            "name": "goal", "context": self.context,
+            "input": {"text": "deliberately lossy", "name": "parsed value"},
+            "invocation": {"raw": raw, "commandName": "goal", "args": [], "flags": {}},
+        })
+
+    async def tool(self, name: str, **input: Any) -> dict[str, Any]:
+        result = await self.harness.execute_tool({
+            "name": name, "input": input, "context": self.context,
+        })
+        if "structuredContent" in result:
+            Draft202012Validator(self.module["GOAL_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
+        return result
+
+    async def event(self, name: str, **payload: Any) -> dict[str, Any]:
+        return await self.harness.handle_event({
+            "event": name, "context": self.context, "payload": payload,
+        })
+
+    async def init(self) -> dict[str, Any]:
+        return await self.event(
+            "agent.init", systemPrompt="Current host prompt", allowedTools=["update_goal"],
+        )
+
+    async def test_command_preserves_raw_objective_and_generic_presentation(self) -> None:
+        objective = 'ship name="a  b" --strict\n\tkeep </objective> & "quotes"  intact'
+        result = await self.command(f"  /goal   {objective}  \n")
+        self.assertEqual(result["action"], "runAgent")
+        self.assertEqual(result["display"], f"Objective: {objective}")
+        self.assertIn('name="a  b" --strict\n\tkeep &lt;/objective&gt; &amp;', result["prompt"])
+        self.assertNotIn("goal_context", result["prompt"])
+        stored = json.loads(self.path.read_text())
+        self.assertEqual(stored["objective"], objective)
+        self.assertEqual(stored["status"], "active")
+        self.assertEqual(stored["createdAt"], stored["updatedAt"])
+        self.assertTrue(stored["createdAt"].endswith("Z"))
+
+        read = await self.tool("get_goal")
+        self.assertEqual(read["structuredContent"], {"goal": stored, "active": True})
+        self.assertEqual(set(read["data"]), {"presentation"})
+        self.assertEqual(read["data"]["presentation"], {
+            "summary": "Goal active", "body": read["content"], "format": "text",
+        })
+        self.assertIn(objective, read["content"])
+
+    async def test_empty_objective_and_missing_goal_do_not_create_state(self) -> None:
+        for raw in ["", "/goal", "  /goal \t \n"]:
+            self.assertEqual(await self.command(raw), {
+                "action": "respond", "response": "Usage: /goal <objective>",
+            })
+        read = await self.tool("get_goal")
+        self.assertNotIn("error", read)
+        self.assertEqual(read["content"], "No goal is currently defined for this thread.")
+        self.assertEqual(read["structuredContent"], {"goal": None, "active": False})
+        self.assertIn("no goal", (await self.tool("update_goal", status="complete"))["error"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertFalse(self.data_dir.exists())
+
+    async def test_restore_audits_after_restart_and_compaction_and_isolate_forks(self) -> None:
+        await self.command("/goal verify <all> requirements")
+        initial = await self.init()
+        prompt = initial["systemPrompt"]["append"]
+        for expected in [
+            "verify &lt;all&gt; requirements", "not as higher-priority instructions",
+            "Preserve the original scope", "For every explicit requirement",
+            "at least three consecutive goal turns", "fresh blocked audit",
+            "If the user explicitly asks to pause, resume, or clear",
+        ]:
+            self.assertIn(expected, prompt)
+        follow_up = await self.event("agent.end", messages=[])
+        self.assertEqual(len(follow_up["followUpMessages"]), 1)
+        self.assertLess(len(follow_up["followUpMessages"][0]), 200)
+        self.assertNotIn("Completion audit", follow_up["followUpMessages"][0])
+
+        self.module, self.harness = await self.new_harness()
+        self.assertEqual(await self.event("agent.end"), {}, "A fresh process must see init first")
+        resumed = await self.event(
+            "agent.init", systemPrompt="Compacted transcript", allowedTools=["update_goal"],
+        )
+        self.assertEqual(resumed, initial)
+        self.assertEqual(await self.event("agent.end", messages=[]), follow_up)
+
+        self.context["conversationId"] = "forked-conversation"
+        self.assertFalse((await self.tool("get_goal"))["structuredContent"]["active"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        await self.command("/goal a different task")
+        self.assertIn("a different task", (await self.init())["systemPrompt"]["append"])
+        self.context["conversationId"] = "parent-conversation"
+        self.assertEqual((await self.tool("get_goal"))["structuredContent"]["goal"]["objective"],
+                         "verify <all> requirements")
+
+    async def test_transition_matrix_rejects_invalid_changes_without_mutation(self) -> None:
+        transitions = {
+            "active": {"paused", "complete", "blocked", "cleared"},
+            "paused": {"active", "cleared"},
+            "blocked": {"active", "cleared"},
+            "complete": {"cleared"},
+            "cleared": set(),
+        }
+        for current, valid in transitions.items():
+            for status in transitions:
+                with self.subTest(current=current, status=status):
+                    await self.command()
+                    if current != "active":
+                        await self.tool("update_goal", status=current)
+                    before = self.path.read_text()
+                    result = await self.tool("update_goal", status=status, reason="  evidence  ")
+                    if status not in valid:
+                        self.assertIn("error", result)
+                        self.assertEqual(self.path.read_text(), before)
+                        continue
+                    self.assertNotIn("error", result)
+                    self.assertTrue(result["content"].startswith(
+                        f"Goal marked {status}.\nReason: evidence",
+                    ))
+                    stored = json.loads(self.path.read_text())
+                    self.assertEqual(stored["status"], status)
+                    self.assertEqual(stored["reason"], "evidence")
+                    self.assertEqual(stored["createdAt"], json.loads(before)["createdAt"])
+                    self.assertEqual(result["structuredContent"]["active"], status == "active")
+
+    async def test_pause_block_resume_complete_and_clear_control_continuation(self) -> None:
+        await self.command()
+        for status in ["paused", "blocked", "complete", "cleared"]:
+            with self.subTest(status=status):
+                await self.command()
+                await self.init()
+                await self.tool("update_goal", status=status)
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertEqual(await self.init(), {})
+                if status in {"paused", "blocked"}:
+                    resumed = await self.tool("update_goal", status="active")
+                    self.assertIn("Completion audit:", resumed["content"])
+                    self.assertIn("fresh blocked audit", resumed["content"])
+                    self.assertIn("finish the migration", resumed["content"])
+                    self.assertNotIn("Completion audit:", resumed["data"]["presentation"]["body"])
+                    self.assertIn("followUpMessages", await self.event("agent.end"))
+                    prompt = (await self.init())["systemPrompt"]["append"]
+                    self.assertIn("fresh blocked audit", prompt)
+                    self.assertIn("followUpMessages", await self.event("agent.end"))
+
+    async def test_missing_or_disabled_update_tool_fails_closed_and_clears_cached_permission(self) -> None:
+        await self.command()
+        for payload in [{}, {"allowedTools": []}, {"allowedTools": ["get_goal", "bash"]},
+                        {"allowedTools": None}, {"allowedTools": "update_goal"}]:
+            with self.subTest(payload=payload):
+                await self.init()
+                self.assertIn("followUpMessages", await self.event("agent.end"))
+                self.assertEqual(await self.event("agent.init", **payload), {})
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertTrue((await self.tool("get_goal"))["structuredContent"]["active"])
+
+    async def test_invalid_tool_input_is_rejected_by_sdk(self) -> None:
+        await self.command()
+        before = self.path.read_text()
+        for payload in [{}, {"status": "bad"}, {"status": "active", "objective": "overwrite"}]:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                await self.tool("update_goal", **payload)
+        self.assertEqual(self.path.read_text(), before)
+
+    async def test_missing_conversation_id_is_an_error_and_never_shared_state(self) -> None:
+        self.context = {}
+        self.assertIn("conversation ID", (await self.command())["response"])
+        self.assertIn("conversation ID", (await self.tool("get_goal"))["error"])
+        self.assertIn("conversation ID", (await self.tool("update_goal", status="paused"))["error"])
+        self.assertEqual(await self.init(), {})
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertFalse(self.data_dir.exists())
+
+    async def test_storage_identifiers_cannot_escape_data_directory(self) -> None:
+        self.context["conversationId"] = "../../outside/你好"
+        await self.command()
+        path = self.data_dir / self.module["goal_storage_path"](self.context["conversationId"])
+        self.assertEqual(path.parent, self.data_dir / "goals")
+        self.assertRegex(path.name, r"^[a-f0-9]{64}\.json$")
+        self.assertTrue(path.exists())
+
+    async def test_corrupt_or_unreadable_storage_stops_continuation(self) -> None:
+        for broken in ["{", '{"objective":"missing fields"}', '[]']:
+            with self.subTest(broken=broken):
+                await self.command()
+                await self.init()
+                self.path.write_text(broken)
+                self.assertIn("error", await self.tool("get_goal"))
+                self.assertIn("error", await self.tool("update_goal", status="paused"))
+                self.assertEqual(await self.event("agent.end"), {})
+                self.assertEqual(await self.init(), {})
+                self.assertEqual(self.path.read_text(), broken)
+        await self.command()
+        await self.init()
+        self.path.unlink()
+        self.path.mkdir()
+        self.assertIn("error", await self.tool("get_goal"))
+        self.assertEqual(await self.event("agent.end"), {})
+        self.assertEqual(await self.init(), {})
+        self.assertEqual((await self.command())["action"], "respond")
+
+    async def test_failed_writes_report_errors_without_claiming_success(self) -> None:
+        from kodelet_sdk.context import StorageContext
+
+        await self.command()
+        before = self.path.read_text()
+        with patch.object(StorageContext, "write_json", AsyncMock(side_effect=OSError("disk full"))):
+            command = await self.command("/goal replacement")
+            self.assertEqual(command["action"], "respond")
+            self.assertIn("disk full", command["response"])
+            result = await self.tool("update_goal", status="complete")
+            self.assertIn("disk full", result["error"])
+        self.assertEqual(self.path.read_text(), before)
+
+    async def test_parallel_updates_serialize_transitions(self) -> None:
+        await self.command()
+        results = await asyncio.gather(
+            self.tool("update_goal", status="complete"),
+            self.tool("update_goal", status="paused"),
+        )
+        self.assertEqual(sum("error" not in result for result in results), 1)
+        stored = json.loads(self.path.read_text())
+        self.assertIn(stored["status"], {"complete", "paused"})
+
+
+class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.module = runpy.run_path(str(EXTENSIONS / "todo" / "kodelet-extension-todo"))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "test-todos.json"
+        env = patch.dict(os.environ, CUSTOM_TOOL_TODO_DIR=directory.name)
+        env.start()
+        self.addCleanup(env.stop)
+        self.ctx = ToolContext(None, {"conversationId": "test-todos"})
+        self.updates = AsyncMock()
+        self.widget = AsyncMock()
+        for target, attribute, replacement in [
+            (self.ctx, "update", self.updates),
+            (self.ctx.ui, "set_widget", self.widget),
+        ]:
+            patched = patch.object(target, attribute, replacement)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    async def write(self, todos: list[dict[str, str]]) -> dict[str, Any]:
+        result = await self.module["todo_write"](
+            self.module["TodoWriteInput"](todos=todos), self.ctx,
+        )
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
+        return result
+
+    async def test_read_write_and_live_updates_share_checklist_in_plan_order(self) -> None:
+        todos = [
+            {"content": "Inspect tools", "status": "completed", "priority": "high"},
+            {"content": "Improve presentation", "status": "in_progress", "priority": "high"},
+            {"content": "Run tests", "status": "pending", "priority": "medium"},
+            {"content": "Replace widget", "status": "canceled", "priority": "low"},
+        ]
+        expected = {
+            "summary": "Todo updated",
+            "body": (
+                "✓ ~~Inspect tools~~ · high priority  \n"
+                "**→ Improve presentation** · in progress · high priority  \n"
+                "○ Run tests · medium priority  \n"
+                "× ~~Replace widget~~ · canceled · low priority"
+            ),
+            "format": "markdown",
+        }
+        written = await self.write(todos)
+        self.assertEqual(written["content"], "Todo list updated.")
+        self.assertEqual(written["data"]["presentation"], expected)
+        self.assertEqual(json.loads(self.path.read_text()), {"todos": todos})
+        self.assertEqual(set(written["data"]), {"presentation"})
+        self.assertEqual(written["structuredContent"]["statistics"], {
+            "total": 4, "completed": 1, "in_progress": 1, "pending": 1, "canceled": 1,
+        })
+
+        read = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(read["structuredContent"])
+        expected_read = {**expected, "summary": "Todo read"}
+        self.assertEqual(read["data"]["presentation"], expected_read)
+        self.assertEqual(read["content"], (
+            "Current todos:\nID\tStatus\tPriority\tContent\n"
+            "1\tcanceled\tlow\tReplace widget\n"
+            "2\tcompleted\thigh\tInspect tools\n"
+            "3\tin_progress\thigh\tImprove presentation\n"
+            "4\tpending\tmedium\tRun tests"
+        ))
+        self.assertEqual(self.updates.await_count, 2)
+        for call, presentation in zip(self.updates.call_args_list, [expected, expected_read]):
+            self.assertEqual(call.args[1]["presentation"], presentation)
+            self.assertEqual(call.args[1]["todo"]["statistics"], written["structuredContent"]["statistics"])
+        self.assertEqual(self.widget.await_count, 2)
+
+    async def test_terminal_lists_keep_presentation_after_widget_is_removed(self) -> None:
+        for status, icon in [("completed", "✓"), ("canceled", "×")]:
+            with self.subTest(status=status):
+                result = await self.write([
+                    {"content": "Finish task", "status": status, "priority": "medium"},
+                ])
+                presentation = result["data"]["presentation"]
+                self.assertEqual(presentation["summary"], "Todo updated")
+                self.assertIn(f"{icon} ~~Finish task~~", presentation["body"])
+                self.widget.assert_awaited_with("todo-progress", None)
+
+    async def test_task_text_cannot_change_checklist_markdown(self) -> None:
+        content = "Keep **literal** [link](https://example.com)\n- <tag> &copy; `code` ~text~"
+        result = await self.write([
+            {"content": content, "status": "pending", "priority": "low"},
+        ])
+        self.assertEqual(result["data"]["presentation"], {
+            "summary": "Todo updated",
+            "body": (
+                r"○ Keep \*\*literal\*\* \[link\]\(https://example\.com\) "
+                r"\- \<tag\> \&copy; \`code\` \~text\~ · low priority"
+            ),
+            "format": "markdown",
+        })
+        self.assertEqual(result["structuredContent"]["todos"][0]["content"], content)
+
+    async def test_presentation_survives_unavailable_live_ui(self) -> None:
+        self.updates.side_effect = RuntimeError("disconnected")
+        self.widget.side_effect = RuntimeError("disconnected")
+        result = await self.write([
+            {"content": "Work offline", "status": "in_progress", "priority": "high"},
+        ])
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            result["data"]["presentation"]["summary"], "Todo updated",
+        )
+
+    async def test_missing_list_does_not_claim_successful_progress(self) -> None:
+        result = await self.module["todo_read"](self.module["TodoReadInput"](), self.ctx)
+        self.assertIn("todo file not found", result["error"])
+        self.assertNotIn("data", result)
+        self.assertEqual(result["structuredContent"], {"success": False, "error": result["error"]})
+        Draft202012Validator(self.module["TODO_OUTPUT_SCHEMA"]).validate(result["structuredContent"])
+        self.updates.assert_not_awaited()
+
+
+class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.peer = ACPProcess()
+        self.clients: list[Client] = []
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.closed_clients: list[Client] = []
+        self.close_started = asyncio.Event()
+        self.responding = asyncio.Event()
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "search-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
+
+        async def update(_content: str, data: dict[str, Any]) -> None:
+            if data["taskRun"]["phase"] == "responding":
+                self.responding.set()
+
+        self.updates = AsyncMock(side_effect=update)
+        self.update_patch = patch.object(self.ctx, "update", self.updates)
+        self.update_patch.start()
+        self.addCleanup(self.update_patch.stop)
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.clients.append(self)
+                owner.client_kwargs = kwargs
+                super().__init__(spawn=owner.spawn, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                owner.close_started.set()
+                try:
+                    await super().close()
+                finally:
+                    owner.closed_clients.append(self)
+
+        self.client_patch = patch.dict(
+            SEARCH["run_search_agent"].__globals__, Client=RecordingClient,
+        )
+        self.client_patch.start()
+        self.addCleanup(self.client_patch.stop)
+
+    def spawn(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({"command": command, "args": list(args), "options": options})
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        # Every submitted search must own cleanup, including failed initialization.
+        for client in self.clients:
+            self.assertIn(client, self.closed_clients)
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        if self.clients:
+            self.assertTrue(self.peer.closed.is_set())
+        self.peer.terminate()
+        await self.peer.wait()
+
+    async def search(self, **kwargs: Any) -> dict[str, Any]:
+        with patch("tempfile.NamedTemporaryFile", side_effect=AssertionError("no prompt files")):
+            return await SEARCH["code_search"](SEARCH["CodeSearchInput"](**kwargs), self.ctx)
+
+    async def prompt_patch(self, max_turns: int) -> dict[str, Any]:
+        extension = self.session_options[-1]["extensions"][0]
+        manifest = extension.initialize({})
+        self.assertEqual(manifest["tools"], [])
+        self.assertEqual(manifest["commands"], [])
+        self.assertEqual([row["event"] for row in manifest["subscriptions"]], ["agent.init"])
+        harness = await create_test_harness(extension)
+        result = await harness.handle_event({
+            "id": "init", "event": "agent.init",
+            "payload": {"systemPrompt": "Runner instructions and tool guidance"},
+        })
+        self.assertEqual(
+            result, {"systemPrompt": {"append": SEARCH["build_sysprompt_text"](max_turns)}},
+        )
+        return result
+
+    async def test_acp_profile_prompt_hook_progress_and_result(self) -> None:
+        (self.root / "src").mkdir()
+        result = await self.search(query="  Find the handler.  ", cwd="src", max_turns=5)
+        self.assertEqual(result["content"], "Found src/handler.go:20-40.")
+        self.assertEqual(result["structuredContent"], result["content"])
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            self.client_kwargs, {"cwd": str(self.root / "src"), "runner": "search-runner"},
+        )
+        self.assertFalse(hasattr(self.ctx, "children"))
+        self.assertIsNone(self.ctx._host_rpc_client)
+        self.assertEqual(self.launches[0]["command"], "kodelet")
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "search-runner", "--code-mode=off", "--profile=code-search",
+        ])
+        # No noExtensions flag: the inline prompt hook must remain attached.
+        self.assertEqual(
+            set(self.session_options[0]), {"profile", "options", "extensions", "parent_conversation_id"},
+        )
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        self.assertEqual(self.session_options[0]["parent_conversation_id"], "parent-conversation")
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
+        await self.prompt_patch(5)
+        new = next(row for row in self.peer.requests if row.get("method") == "session/new")
+        self.assertEqual(new["params"], {
+            "cwd": str(self.root / "src"),
+            "_meta": {
+                "sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]},
+                "conversationHierarchy": {"version": 1, "parentConversationId": "parent-conversation"},
+            },
+        })
+        prompt = next(row for row in self.peer.requests if row.get("method") == "session/prompt")
+        self.assertEqual(
+            prompt["params"]["prompt"], [{"type": "text", "text": "Find the handler."}],
+        )
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        self.assertEqual(progress["activities"][0]["label"], 'Search "parser" in .')
+        phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
+        self.assertIn("working", phases)
+        self.assertIn("responding", phases)
+        self.assertEqual(list(self.root.iterdir()), [self.root / "src"])
+
+    async def test_dedicated_profile_overrides_parent_and_environment_selection(self) -> None:
+        with patch.object(self.ctx, "profile", "team-research"), patch.dict(
+            os.environ, {"KODELET_PROFILE": "host-other"},
+        ):
+            result = await self.search(query="Find code")
+        self.assertNotIn("error", result)
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
+        self.assertEqual(
+            [arg for arg in self.launches[0]["args"] if arg.startswith("--profile=")],
+            ["--profile=code-search"],
+        )
+        self.assertEqual(self.launches[0]["options"]["env"]["KODELET_PROFILE"], "host-other")
+        self.assertFalse(
+            any(arg.startswith("--reasoning-effort") for arg in self.launches[0]["args"]),
+        )
+
+    async def test_absent_parent_profile_still_selects_registered_search_profile(self) -> None:
+        with patch.dict(os.environ, {"KODELET_PROFILE": "host-other"}):
+            result = await self.search(query="Find code")
+        self.assertNotIn("error", result)
+        self.assertEqual(self.session_options[0]["profile"], "code-search")
+        self.assertIn("--profile=code-search", self.launches[0]["args"])
+
+    async def test_missing_runner_context_does_not_use_default_runner(self) -> None:
+        with patch.object(self.ctx, "runner_id", None):
+            result = await self.search(query="Find code")
+        self.assertIn("requires a runner-backed extension context", result["error"])
+        self.assertFalse(self.launches)
+
+    async def test_parallel_tool_results_and_errors_before_summary_finishes(self) -> None:
+        self.peer.events = [
+            tool_call("a", "grep_tool", {"pattern": "parser", "path": "."}),
+            tool_call("b", "glob_tool", {"pattern": "*.go", "path": "."}),
+            tool_call("c", "file_read", {"file_path": "src/handler.go"}),
+            tool_result("a", "grep_tool", "in_progress", "partial matches"),
+            tool_result("c", "file_read"),
+            tool_result("a", "grep_tool"),
+            tool_result("b", "glob_tool", "failed", "permission denied"),
+            message("Writing the answer"),
+        ]
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.search(query="Find code"))
+        try:
+            await asyncio.wait_for(self.responding.wait(), timeout=2)
+            snapshots = [call.args[1]["taskRun"] for call in self.updates.call_args_list]
+            self.assertTrue(any(snapshot["counts"]["running"] == 3 for snapshot in snapshots))
+            summary = snapshots[-1]
+            self.assertEqual(summary["status"], "running", "the answer is still in flight")
+            self.assertEqual(summary["phase"], "responding")
+            self.assertEqual(summary["detail"], "writing summary")
+            self.assertEqual(summary["counts"], {"succeeded": 2, "failed": 1, "running": 0})
+            self.assertEqual(
+                [(row["label"], row["status"]) for row in summary["activities"]],
+                [('Search "parser" in .', "succeeded"),
+                 ('Find files "*.go" in .', "failed"), ("Read src/handler.go", "succeeded")],
+            )
+            self.assertEqual(summary["activities"][1]["preview"], "permission denied")
+            self.assertNotIn("preview", summary["activities"][0])
+            self.assertFalse(task.done())
+        finally:
+            self.peer.allow_result.set()
+            result = await task
+        self.assertEqual(result["data"]["taskRun"]["counts"], summary["counts"])
+
+    async def test_truncated_tool_input_and_result_without_start_are_safe(self) -> None:
+        self.peer.events[0]["rawInput"] = '{"pattern":"truncated'
+        self.peer.events.insert(2, tool_result("lost", "file_read", "failed", "file missing"))
+        result = await self.search(query="Find code")
+        progress = result["data"]["taskRun"]
+        # TaskProgress's ACP adapter ignores results with no observed start.
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        self.assertEqual(progress["activities"][0]["label"], "Search in .")
+
+    async def test_default_turn_budget_is_advisory_and_workspace_is_inherited(self) -> None:
+        await self.search(query="Find code")
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root), "runner": "search-runner"})
+        self.assertNotIn("max_turns", self.session_options[0])
+        self.assertFalse(any(arg.startswith("--max-turns") for arg in self.launches[0]["args"]))
+        await self.prompt_patch(3)
+
+    async def test_invalid_queries_and_paths_do_not_start_acp(self) -> None:
+        (self.root / "file").write_text("text")
+        inputs = [{"query": "   "}] + [
+            {"query": "find", "cwd": cwd} for cwd in ("", "missing", "file")
+        ]
+        for value in inputs:
+            with self.subTest(value=value):
+                self.assertIn("error", await self.search(**value))
+        self.assertEqual(self.clients, [])
+        self.assertEqual(self.launches, [])
+        self.updates.assert_not_called()
+
+    async def test_relative_absolute_and_symlink_cwd_outside_workspace_reach_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory).resolve()
+            (self.root / "outside").symlink_to(outside, target_is_directory=True)
+            for cwd in (str(outside), os.path.relpath(outside, self.root), "outside", ".."):
+                with self.subTest(cwd=cwd):
+                    self.peer = ACPProcess()
+                    result = await self.search(query="find", cwd=cwd)
+                    self.assertNotIn("error", result)
+                    expected = self.root.parent if cwd == ".." else outside
+                    new = next(
+                        row for row in self.peer.requests if row.get("method") == "session/new"
+                    )
+                    self.assertEqual(new["params"]["cwd"], str(expected))
+                    self.assertTrue(self.peer.closed.is_set())
+            self.assertEqual(list(outside.iterdir()), [])
+
+    async def test_provider_failure_does_not_return_partial_output_as_success(self) -> None:
+        self.peer.events.append(message("partial answer"))
+        self.peer.prompt_error = "provider failed"
+        result = await self.search(query="find")
+        self.assertIn("provider failed", result["error"])
+        self.assertNotIn("partial answer", result["content"])
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_daemon_cancellation_does_not_return_partial_output_as_success(self) -> None:
+        self.peer.events = [message("partial answer")]
+        self.peer.stop_reason = "cancelled"
+        result = await self.search(query="find")
+        self.assertEqual(result["error"], "code_search failed: code_search was canceled")
+        self.assertNotIn("partial answer", result["content"])
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_empty_or_missing_output_is_an_error(self) -> None:
+        for content in ("", " \n ", None):
+            with self.subTest(content=content):
+                self.peer = ACPProcess()
+                self.peer.events = self.peer.events[:2]
+                if content is not None:
+                    self.peer.events.append(message(content))
+                result = await self.search(query="find")
+                self.assertEqual(result["error"], "code_search returned an empty response")
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+                self.assertEqual(result["data"]["taskRun"]["counts"], {
+                    "succeeded": 1, "failed": 0, "running": 0,
+                })
+                self.assertTrue(self.peer.closed.is_set())
+
+    async def test_failed_session_initialization_closes_client(self) -> None:
+        self.peer.init_error = "runner rejected workspace"
+        result = await self.search(query="find")
+        self.assertIn("runner rejected workspace", result["error"])
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.peer.prompt_started.is_set())
+        self.assertEqual(len(self.launches), 1, "No fallback or retry")
+
+    async def test_missing_inline_capability_fails_without_fallback(self) -> None:
+        self.peer.extension_version = 0
+        result = await self.search(query="find")
+        self.assertIn("sessionExtensions", result["error"])
+        self.assertFalse(self.peer.loading.is_set())
+        self.assertEqual(len(self.launches), 1)
+
+    async def test_missing_hierarchy_capability_fails_without_fallback(self) -> None:
+        self.peer.hierarchy_version = 0
+        result = await self.search(query="find")
+        self.assertIn("conversationHierarchy", result["error"])
+        self.assertFalse(self.peer.loading.is_set())
+        self.assertEqual(len(self.launches), 1)
+
+    async def test_missing_parent_conversation_does_not_launch(self) -> None:
+        with patch.object(self.ctx, "conversation_id", None):
+            result = await self.search(query="find")
+        self.assertIn("requires a parent conversation", result["error"])
+        self.assertFalse(self.launches)
+
+    async def test_timeout_closes_client_and_cancels_active_session(self) -> None:
+        self.peer.allow_result.clear()
+        with patch.dict(SEARCH["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+            result = await self.search(query="find")
+        self.assertIn("timed out", result["error"])
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        cancel = next(row for row in self.peer.requests if row.get("method") == "session/cancel")
+        self.assertEqual(cancel["params"], {"sessionId": "search-conversation"})
+
+    async def test_session_initialization_timeout_closes_client(self) -> None:
+        self.peer.allow_load.clear()
+        with patch.dict(SEARCH["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+            result = await self.search(query="find")
+        self.assertIn("timed out", result["error"])
+        self.assertTrue(self.peer.loading.is_set())
+        self.assertFalse(self.peer.prompt_started.is_set())
+
+    async def test_handler_cancellation_is_propagated_and_closes_client(self) -> None:
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(self.peer.closed.is_set())
+
+    async def test_cancellation_during_session_initialization_closes_client(self) -> None:
+        self.peer.allow_load.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        await asyncio.wait_for(self.peer.loading.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(self.peer.prompt_started.is_set())
+        self.assertTrue(self.peer.closed.is_set())
+
+    async def assert_repeated_cancellation_waits_for_cleanup(
+        self, task: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        await asyncio.wait_for(self.close_started.wait(), timeout=2)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done(), "cancellation must wait for the owned client close")
+        self.assertFalse(self.peer.closed.is_set(), "SIGTERM was intentionally ignored")
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        self.assertTrue(self.peer.killed.is_set(), "the SDK must escalate to SIGKILL")
+        self.assertTrue(self.peer.reaped.is_set(), "the SDK must await process exit")
+        self.assertEqual(self.closed_clients, self.clients, "close runs once per client")
+        self.assertFalse(self.clients[0]._sessions)
+        self.assertFalse(self.clients[0]._rpcs)
+        self.assertTrue(task.cancelled(), "cleanup must not turn cancellation into success")
+
+    async def test_repeated_cancellation_during_prompt_waits_for_escalation_and_reaping(
+        self,
+    ) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=2)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_repeated_cancellation_during_startup_waits_for_escalation_and_reaping(
+        self,
+    ) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_load.clear()
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.loading.wait(), timeout=2)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            # Interrupt create_session's own cleanup before the outer client-close barrier.
+            task.cancel()
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+            self.assertFalse(self.peer.prompt_started.is_set())
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancellation_during_success_cleanup_does_not_return_success(self) -> None:
+        self.peer.ignore_terminate = True
+        task = asyncio.create_task(self.search(query="find"))
+        try:
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+            await self.assert_repeated_cancellation_waits_for_cleanup(task)
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "read-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
+        self.peer = ACPProcess()
+        self.peer.events = [
+            tool_call("a", "file_read", {"file_path": "transcript.md", "line_limit": 100}),
+            tool_result("a", "file_read", text="1: Evidence"),
+            message("  Reverted: conversation parent-conversation, transcript lines 1-3.  "),
+        ]
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.exporters: list[asyncio.subprocess.Process] = []
+        self.transcripts: list[Path] = []
+        self.clients: list[Client] = []
+        self.closed_clients: list[Client] = []
+        self.export_started = asyncio.Event()
+        self.allow_export_return = asyncio.Event()
+        self.allow_export_return.set()
+        self.export_program = "print('# Archived\\noriginal change\\n# Active\\nreverted change')"
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.client_kwargs = kwargs
+                owner.clients.append(self)
+                super().__init__(spawn=owner.spawn_agent, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                owner.assertTrue(owner.transcripts[-1].exists())
+                await super().close()
+                owner.assertTrue(owner.transcripts[-1].exists(), "cleanup must follow child close")
+                owner.closed_clients.append(self)
+
+        self.real_spawn = asyncio.create_subprocess_exec
+        self.updates = AsyncMock()
+        for replacement in [
+            patch.dict(CONVERSATION["run_read_agent"].__globals__, Client=RecordingClient),
+            patch("asyncio.create_subprocess_exec", side_effect=self.spawn_exporter),
+            patch.object(self.ctx, "update", self.updates),
+        ]:
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    async def spawn_exporter(self, *args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        self.export_args, self.export_kwargs = args, kwargs
+        transcript = Path(kwargs["stdout"].name)
+        self.transcripts.append(transcript)
+        self.assertEqual(transcript.parent.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(kwargs["stderr"].seekable(), "stderr must be a file, not a PIPE")
+        process = await self.real_spawn(sys.executable, "-c", self.export_program, **kwargs)
+        self.exporters.append(process)
+        self.export_started.set()
+        await self.allow_export_return.wait()
+        return process
+
+    def spawn_agent(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({"command": command, "args": list(args), "options": options})
+        self.assertEqual(self.exporters[-1].returncode, 0, "export must finish before child starts")
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        self.peer.kill()
+        await self.peer.wait()
+        for process in self.exporters:
+            self.assertIsNotNone(process.returncode, "exporter must be reaped")
+        self.assertEqual(self.closed_clients, self.clients)
+        for client in self.clients:
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        for transcript in self.transcripts:
+            self.assertFalse(transcript.parent.exists(), "all temporary files must be removed")
+
+    async def read(self, **kwargs: Any) -> dict[str, Any]:
+        return await CONVERSATION["read_conversation"](CONVERSATION["ReadConversationInput"](**{
+            "conversation_id": "parent-conversation", "goal": " What changed? ", **kwargs,
+        }), self.ctx)
+
+    async def test_large_current_snapshot_stays_on_disk_with_profile_progress_and_callback(self) -> None:
+        self.export_program = (
+            "import sys; sys.stdout.buffer.write(b'# Archived\\n' + "
+            "b'untrusted archived tool output\\n' * 300_000 + b'x' * 5000 + "
+            "b'\\n# Active\\nreverted change\\n')"
+        )
+        self.peer.allow_result.clear()
+        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(
+            os.environ, KODELET_PROFILE="other", KODELET_SERVER="http://saved-history",
+            KODELET_AUTH_TOKEN="inherited-test-token",
+        ):
+            task = asyncio.create_task(self.read(max_turns=7))
+            try:
+                await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=3)
+                transcript = self.transcripts[-1]
+                size = len(b'# Archived\n') + 300_000 * len(b'untrusted archived tool output\n')
+                tail = b'x' * 5000 + b'\n# Active\nreverted change\n'
+                self.assertEqual(transcript.stat().st_size, size + len(tail))
+                with transcript.open("rb") as stream:
+                    self.assertEqual(stream.read(11), b'# Archived\n')
+                    stream.seek(-len(tail), 2)
+                    self.assertEqual(stream.read(), tail, "long tool results must not be truncated")
+                prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
+                text = prompt["params"]["prompt"][0]["text"]
+                self.assertLess(len(text), 1000, "transcript must never be embedded in the prompt")
+                self.assertNotIn("untrusted archived tool output", text)
+                self.assertEqual(text, f"goal: What changed?\n\ntranscript can be found at {transcript}")
+            finally:
+                self.peer.allow_result.set()
+                result = await task
+        self.assertNotIn("error", result)
+        self.assertIn("conversation parent-conversation, transcript lines 1-3", result["content"])
+        self.assertEqual(result["structuredContent"], result["content"])
+        self.assertEqual(self.client_kwargs, {"cwd": str(self.root), "runner": "read-runner"})
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "read-runner", "--code-mode=off", "--profile=read-conversation",
+        ])
+        env = self.launches[0]["options"]["env"]
+        self.assertEqual(env["KODELET_SERVER"], "http://saved-history")
+        self.assertEqual(env["KODELET_AUTH_TOKEN"], "inherited-test-token")
+        options = self.session_options[0]
+        self.assertEqual(set(options), {"profile", "options", "extensions", "parent_conversation_id"})
+        self.assertEqual(options["options"].to_wire(), {"codeMode": "off"})
+        self.assertEqual(options["parent_conversation_id"], "parent-conversation")
+        self.assertEqual(options["profile"], "read-conversation")
+        new = next(row for row in self.peer.requests if row["method"] == "session/new")
+        self.assertEqual(new["params"]["cwd"], str(self.root))
+        self.assertEqual(new["params"]["_meta"]["conversationHierarchy"]["parentConversationId"],
+                         "parent-conversation")
+        harness = await create_test_harness(options["extensions"][0])
+        callback = await harness.handle_event({"event": "agent.init", "payload": {
+            "allowedTools": [
+                "file_read", "grep_tool", "glob_tool", "bash", "read_conversation", "search_conversation",
+            ],
+        }})
+        self.assertEqual(callback["tools"], {
+            "disable": ["glob_tool", "bash", "read_conversation", "search_conversation"],
+            "enable": ["file_read", "grep_tool"],
+        })
+        instructions = callback["systemPrompt"]["append"]
+        self.assertEqual(instructions, CONVERSATION["build_sysprompt_text"](7))
+        for evidence in ["7 turns", "100-200 lines", "untrusted historical data",
+                         "orientation only", "reverts", "attempts, not successes",
+                         "transcript lines", "Never cite temporary", "unverified facts"]:
+            self.assertIn(evidence, instructions)
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["kind"], "read_conversation")
+        self.assertEqual(progress["task"], "What changed?")
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
+        self.assertIn("working", phases)
+        self.assertIn("responding", phases)
+
+    async def test_export_argv_is_literal_and_defaults_are_advisory(self) -> None:
+        conversation_id = "--help;$(touch unsafe)"
+        self.assertNotIn("error", await self.read(conversation_id=conversation_id))
+        self.assertEqual(self.export_args, (
+            "kodelet", "conversation", "show", "--format", "markdown", "--", conversation_id,
+        ))
+        self.assertEqual(set(self.export_kwargs), {"cwd", "stdin", "stdout", "stderr"})
+        self.assertEqual(self.export_kwargs["cwd"], str(self.root))
+        self.assertEqual(self.export_kwargs["stdin"], asyncio.subprocess.DEVNULL)
+        self.assertEqual(CONVERSATION["ReadConversationInput"](conversation_id="id", goal="g").max_turns, 12)
+        self.assertNotIn("max_turns", self.session_options[0])
+
+    async def test_invalid_input_or_missing_parent_context_never_exports(self) -> None:
+        for value in [{"conversation_id": " "}, {"goal": " "}]:
+            self.assertIn("non-empty", (await self.read(**value))["error"])
+        for field, expected in [("runner_id", "runner-backed"), ("conversation_id", "parent conversation")]:
+            with patch.object(self.ctx, field, None):
+                self.assertIn(expected, (await self.read())["error"])
+        self.assertFalse(self.transcripts)
+        self.assertFalse(self.clients)
+
+    async def test_export_failure_discards_partial_file_and_bounds_stderr(self) -> None:
+        self.export_program = (
+            "import sys; print('partial transcript'); "
+            "sys.stderr.write('ignored prefix' + 'x' * 100_000 + 'response exceeds 64 MiB'); "
+            "sys.exit(1)"
+        )
+        result = await self.read()
+        self.assertIn("partial transcript discarded", result["error"])
+        self.assertIn("response exceeds 64 MiB", result["error"])
+        self.assertNotIn("ignored prefix", result["error"])
+        self.assertLess(len(result["error"]), CONVERSATION["ERROR_TAIL_BYTES"] + 200)
+        self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.clients)
+
+    async def test_empty_export_and_missing_cli_fail_without_child(self) -> None:
+        self.export_program = "pass"
+        self.assertIn("empty transcript", (await self.read())["error"])
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("missing kodelet")):
+            self.assertIn("missing kodelet", (await self.read())["error"])
+        self.assertFalse(self.clients)
+
+    async def test_child_failures_never_return_partial_success(self) -> None:
+        for field, value, expected in [
+            ("init_error", "runner unavailable", "runner unavailable"),
+            ("prompt_error", "provider failed", "provider failed"),
+            ("stop_reason", "cancelled", "was canceled"),
+            ("events", [message("  ")], "empty response"),
+        ]:
+            with self.subTest(field=field):
+                self.peer = ACPProcess()
+                setattr(self.peer, field, value)
+                result = await self.read()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("Found src", result["content"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_export_timeout_kills_and_reaps_without_child(self) -> None:
+        self.export_program = "import time; time.sleep(60)"
+        with patch.dict(CONVERSATION["export_transcript"].__globals__, EXPORT_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out exporting", (await self.read())["error"])
+        self.assertEqual(self.exporters[0].returncode, -9)
+        self.assertFalse(self.clients)
+
+    async def test_child_timeout_cancels_session_and_cleans_transcript(self) -> None:
+        self.peer.allow_result.clear()
+        with patch.dict(CONVERSATION["run_read_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out", (await self.read())["error"])
+        self.assertTrue(any(row["method"] == "session/cancel" for row in self.peer.requests))
+
+    async def test_export_startup_cancellation_owns_process_and_files_until_reaped(self) -> None:
+        self.export_program = "import time; time.sleep(60)"
+        self.allow_export_return.clear()
+        task = asyncio.create_task(self.read())
+        try:
+            await asyncio.wait_for(self.export_started.wait(), timeout=3)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(self.transcripts[-1].exists())
+            self.allow_export_return.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
+            self.assertEqual(self.exporters[0].returncode, -9)
+            self.assertFalse(self.clients)
+        finally:
+            self.allow_export_return.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_repeated_child_cancellation_waits_for_close_before_removing_files(self) -> None:
+        self.peer.ignore_terminate = True
+        self.peer.allow_result.clear()
+        task = asyncio.create_task(self.read())
+        try:
+            await asyncio.wait_for(self.peer.prompt_started.wait(), timeout=3)
+            task.cancel()
+            await asyncio.wait_for(self.peer.terminating.wait(), timeout=3)
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(self.transcripts[-1].exists())
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
+            self.assertTrue(self.peer.killed.is_set())
+            self.assertTrue(self.peer.reaped.is_set())
+        finally:
+            self.peer.kill()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def search_hit(conversation_id: str, title: str = "", **fields: Any) -> dict[str, Any]:
+    return {
+        "id": conversation_id, "title": title, "cwd": "/srv/project",
+        "created_at": "2026-09-29T18:00:00Z", "updated_at": "2026-09-29T18:23:12.476821083Z",
+        "message_count": 4, "match_count": 1, "matches": [], **fields,
+    }
+
+
+class SearchConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": str(self.root), "runnerId": "search-runner"}},
+            {"conversationId": "current"},
+        )
+        self.response: dict[str, Any] = {"conversations": [], "total": 0}
+        self.program: str | None = None
+        self.spawned: list[asyncio.subprocess.Process] = []
+        self.started = asyncio.Event()
+        self.real_spawn = asyncio.create_subprocess_exec
+        replacement = patch("asyncio.create_subprocess_exec", side_effect=self.spawn)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    async def spawn(self, *args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        self.args, self.kwargs = args, kwargs
+        program = self.program or f"import sys; sys.stdout.write({json.dumps(json.dumps(self.response))})"
+        process = await self.real_spawn(sys.executable, "-c", program, **kwargs)
+        self.spawned.append(process)
+        self.started.set()
+        return process
+
+    async def asyncTearDown(self) -> None:
+        for process in self.spawned:
+            self.assertIsNotNone(process.returncode, "search process must be reaped")
+
+    async def search(self, **kwargs: Any) -> dict[str, Any]:
+        return await CONVERSATION["search_conversation"](CONVERSATION["SearchConversationInput"](**{
+            "query": " fts5 index ", **kwargs,
+        }), self.ctx)
+
+    async def test_argv_is_literal_and_current_conversation_is_excluded(self) -> None:
+        self.response = {"total": 5, "conversations": [
+            search_hit("current", "This conversation"),
+            search_hit("alpha", "Search design", match_count=3, matches=[
+                {"entry_index": 2, "role": "user", "kind": "text", "snippet": "add an **fts5** **index**"},
+                {"entry_index": 5, "role": "assistant", "kind": "tool-use", "snippet": "bash command: rg **fts5**"},
+            ]),
+            search_hit("beta", "", cwd="", matches=[
+                {"entry_index": -1, "kind": "title", "snippet": "**fts5** **index** notes"},
+            ]),
+        ]}
+        query = "--help;$(touch unsafe)"
+        result = await self.search(query=f" {query} ", cwd=" /srv/project ", limit=2)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["structuredContent"], {
+            "query": query, "cwd": "/srv/project", "total": 4, "search_pending": 0,
+            "conversations": self.response["conversations"][1:],
+        })
+        self.assertEqual(self.args, (
+            "kodelet", "conversation", "search", "--json", "--limit", "3", "--matches", "3",
+            "--cwd", "/srv/project", "--", query,
+        ))
+        self.assertEqual(self.kwargs["cwd"], str(self.root))
+        self.assertEqual(self.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+        self.assertEqual(result["content"], "\n".join([
+            (
+                f"Found 4 matching conversations in `/srv/project` for `{query}`; showing the 2 most relevant."
+                " Use read_conversation with an ID and a goal to read one."
+            ),
+            "",
+            "1. `alpha` - Search design",
+            "   updated 2026-09-29 18:23 UTC · /srv/project · 3 matching messages",
+            "   - user: add an **fts5** **index**",
+            "   - tool input: bash command: rg **fts5**",
+            "",
+            "2. `beta` - (untitled)",
+            "   updated 2026-09-29 18:23 UTC · 1 matching message",
+            "   - title: **fts5** **index** notes",
+        ]))
+
+    async def test_defaults_and_empty_results_suggest_broader_queries(self) -> None:
+        self.response = {"conversations": [search_hit("current")], "total": 1, "search_pending": 3}
+        result = await self.search()
+        self.assertNotIn("error", result)
+        self.assertEqual(self.args[4:], ("--limit", "11", "--matches", "3", "--", "fts5 index"))
+        self.assertIn("No saved conversations match `fts5 index`.", result["content"])
+        self.assertIn("try fewer or different words", result["content"])
+        self.assertIn("Note: 3 conversations are still being indexed", result["content"])
+        self.assertEqual(result["structuredContent"], {
+            "query": "fts5 index", "cwd": None, "total": 0, "search_pending": 3,
+            "conversations": [],
+        })
+
+    async def test_sdk_preserves_search_nulls_and_only_returns_visible_hits(self) -> None:
+        hit = search_hit("saved", title=None, cwd=None, matches=[{"snippet": "evidence", "role": None}])
+        self.response = {"total": 3, "conversations": [search_hit("current"), hit, search_hit("extra")]}
+        harness = await create_test_harness(CONVERSATION["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {"cwd": str(self.root)},
+        })
+        result = await harness.execute_tool({
+            "name": "search_conversation", "input": {"query": "evidence", "limit": 1},
+            "context": {"conversationId": "current"},
+        })
+        self.assertEqual(result["structuredContent"], {
+            "query": "evidence", "cwd": None, "total": 2, "search_pending": 0, "conversations": [hit],
+        })
+        self.assertNotIn("data", result)
+        schema = next(tool["outputSchema"] for tool in manifest["tools"] if tool["name"] == "search_conversation")
+        Draft202012Validator(schema).validate(result["structuredContent"])
+
+    async def test_invalid_input_never_spawns(self) -> None:
+        self.assertIn("non-empty", (await self.search(query="   "))["error"])
+        with self.assertRaises(ValueError):
+            CONVERSATION["SearchConversationInput"](query="x", limit=CONVERSATION["MAX_LIMIT"] + 1)
+        self.assertFalse(self.spawned)
+
+    async def test_failures_are_errors_with_bounded_detail(self) -> None:
+        for program, expected in [
+            ("import sys; sys.stderr.write('ignored' + 'x' * 10_000 + 'HTTP 401'); sys.exit(1)", "HTTP 401"),
+            ("print('not json')", "invalid JSON"),
+            ("print('[]')", "unexpected response"),
+        ]:
+            with self.subTest(expected=expected):
+                self.program = program
+                result = await self.search()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("ignored", result["error"])
+                self.assertLess(len(result["error"]), CONVERSATION["ERROR_TAIL_CHARS"] + 200)
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("missing kodelet")):
+            self.assertIn("missing kodelet", (await self.search())["error"])
+
+    async def test_timeout_and_cancellation_kill_and_reap(self) -> None:
+        self.program = "import time; time.sleep(60)"
+        with patch.dict(CONVERSATION["run_search"].__globals__, SEARCH_TIMEOUT_SECONDS=0.1):
+            self.assertIn("timed out", (await self.search())["error"])
+        self.assertEqual(self.spawned[-1].returncode, -9)
+
+        self.started.clear()
+        task = asyncio.create_task(self.search())
+        await asyncio.wait_for(self.started.wait(), timeout=3)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=3)
+        self.assertEqual(self.spawned[-1].returncode, -9)
+
+
+class WebSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_env_registers_only_selected_native_search_profile(self) -> None:
+        baseline = WEB["ext"].initialize({"capabilities": {"profiles": {"remote": True}}})
+        for provider in [None, "anthropic", "openai"]:
+            with self.subTest(provider=provider), patch.dict(os.environ):
+                if provider is None:
+                    os.environ.pop("KODELET_WEB_SEARCH_PROVIDER", None)
+                else:
+                    os.environ["KODELET_WEB_SEARCH_PROVIDER"] = provider
+                module = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+                harness = await create_test_harness(module["ext"])
+                manifest = harness.initialize({"capabilities": {"profiles": {"remote": True}}})
+                options = {
+                    "provider": provider or "openai",
+                    "reasoning_effort": "none",
+                    "max_tokens": 4096,
+                    "skills": {"enabled": False},
+                }
+                if provider in {None, "openai"}:
+                    options.update({
+                        "model": "gpt-6-luna",
+                        "openai": {
+                            "api_mode": "responses",
+                            "platform": "codex",
+                            "service_tier": "fast",
+                            "enable_search": True,
+                        },
+                        "allowed_tools": ["openai_web_search"],
+                    })
+                else:
+                    options.update({
+                        "model": "claude-haiku-5-5",
+                        "anthropic_api_access": "subscription",
+                        "allowed_tools": ["anthropic_web_search"],
+                    })
+                self.assertEqual(manifest["profiles"], [{
+                    "name": "web-search", "hidden": True, "options": options,
+                }])
+                self.assertEqual(module["SEARCH_PROFILE"], "web-search")
+                self.assertEqual(manifest["tools"], baseline["tools"])
+                self.assertEqual(module["TOOL_TIMEOUT_SECONDS"], 5 * 60)
+
+    def test_invalid_provider_env_fails_at_startup_without_registering_profile(self) -> None:
+        for provider in ["", " ", "gemini", "OpenAI", " openai "]:
+            with self.subTest(provider=provider), patch.dict(
+                os.environ, KODELET_WEB_SEARCH_PROVIDER=provider,
+            ), patch.object(kodelet_sdk.Extension, "register_profile") as register:
+                with self.assertRaises(ValueError) as error:
+                    runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+                self.assertIn(f"KODELET_WEB_SEARCH_PROVIDER={provider!r}", str(error.exception))
+                self.assertIn("expected 'anthropic' or 'openai'", str(error.exception))
+                self.assertIn("unset defaults to 'openai'", str(error.exception))
+                register.assert_not_called()
+
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.ctx = ToolContext(
+            {"extension": {"cwd": directory.name, "runnerId": "web-runner"}},
+            {"conversationId": "parent-conversation"},
+        )
+        self.peer = ACPProcess()
+        self.answer_block = {
+            "text": "Verified finding.",
+            "citations": [{
+                "url": "https://example.com",
+                "title": "Source",
+                "cited_text": "Evidence",
+            }],
+        }
+        self.peer.events = [
+            tool_call("a", "web_search", {"query": "Question"}),
+            tool_result("a", "web_search", text="private search evidence"),
+            message("Display text is not parsed", self.answer_block),
+        ]
+        self.clients: list[Client] = []
+        self.closed_clients: list[Client] = []
+        self.launches: list[dict[str, Any]] = []
+        self.session_options: list[dict[str, Any]] = []
+        self.updates = AsyncMock()
+        owner = self
+
+        class RecordingClient(Client):
+            def __init__(self, **kwargs: Any) -> None:
+                owner.clients.append(self)
+                super().__init__(spawn=owner.spawn, **kwargs)
+
+            async def create_session(self, **kwargs: Any) -> Any:
+                owner.session_options.append(kwargs)
+                return await super().create_session(**kwargs)
+
+            async def close(self) -> None:
+                await super().close()
+                owner.closed_clients.append(self)
+
+        self.client_class = RecordingClient
+        for replacement in [
+            patch.dict(WEB["run_search_agent"].__globals__, Client=RecordingClient),
+            patch.object(self.ctx, "update", self.updates),
+        ]:
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def spawn(self, command: str, args: Any, options: Any) -> ACPProcess:
+        self.launches.append({
+            "command": command,
+            "args": list(args),
+            "options": options,
+            "peer": self.peer,
+        })
+        return self.peer
+
+    async def asyncTearDown(self) -> None:
+        self.assertEqual(self.closed_clients, self.clients, "close runs once per client")
+        for client in self.clients:
+            self.assertFalse(client._sessions)
+            self.assertFalse(client._rpcs)
+        for launch in self.launches:
+            self.assertTrue(launch["peer"].closed.is_set())
+            self.assertTrue(launch["peer"].reaped.is_set())
+
+    async def search(self, query: str = "Question", **input: Any) -> dict[str, Any]:
+        return await WEB["web_search"](
+            WEB["WebSearchInput"](query=query, **input), self.ctx,
+        )
+
+    async def test_fresh_linked_session_profile_runner_prompt_and_progress(self) -> None:
+        with patch.object(self.ctx, "profile", "parent-profile"), patch.dict(
+            os.environ, KODELET_PROFILE="other-profile",
+        ):
+            result = await self.search(query="  Question  ", context=" Constraints ")
+        self.assertEqual(result["content"], "Verified finding. [1](<https://example.com>)")
+        self.assertEqual(result["structuredContent"], {
+            "content": result["content"], "blocks": [self.answer_block],
+        })
+        self.assertEqual(set(result["data"]), {"taskRun"})
+        Draft202012Validator(WEB["WebSearchOutput"].model_json_schema()).validate(result["structuredContent"])
+        self.assertEqual(self.launches[0]["command"], "kodelet")
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "web-runner", "--code-mode=off", "--profile=web-search",
+        ])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        new = next(row for row in self.peer.requests if row["method"] == "session/new")
+        self.assertEqual(new["params"], {
+            "cwd": self.ctx.cwd,
+            "_meta": {
+                "sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]},
+                "conversationHierarchy": {
+                    "version": 1,
+                    "parentConversationId": "parent-conversation",
+                },
+            },
+        })
+        self.assertFalse(any(row["method"] == "session/load" for row in self.peer.requests))
+        prompt = next(row for row in self.peer.requests if row["method"] == "session/prompt")
+        self.assertEqual(prompt["params"]["prompt"], [{
+            "type": "text",
+            "text": "Question\n\nContext:\nConstraints",
+        }])
+        progress = result["data"]["taskRun"]
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(progress["counts"], {"succeeded": 1, "failed": 0, "running": 0})
+        phases = [call.args[1]["taskRun"]["phase"] for call in self.updates.call_args_list]
+        self.assertIn("working", phases)
+        self.assertIn("responding", phases)
+
+        harness = await create_test_harness(self.session_options[0]["extensions"][0])
+        hook = await harness.handle_event({
+            "id": "init",
+            "event": "agent.init",
+            "payload": {"systemPrompt": "Private workspace instructions"},
+        })
+        self.assertEqual(set(hook["systemPrompt"]), {"replace"})
+        prompt = hook["systemPrompt"]["replace"]
+        for text in [
+            "Use only web_search",
+            "untrusted evidence",
+            "If web search is unavailable, report that limitation",
+            "do not substitute an answer from memory",
+        ]:
+            self.assertIn(text, prompt)
+        self.assertRegex(prompt, r"Today's date: \d{4}-\d{2}-\d{2} \(UTC\)\.")
+        self.assertNotIn("Private workspace", prompt)
+
+    async def test_native_citations_are_rendered_without_model_formatting(self) -> None:
+        urls = [
+            "https://example.com/a(b)?q=<x>",
+            "javascript:alert(1)",
+            "https://example.com/a(b)?q=<x>",
+            "https://",
+            "https://[broken",
+        ]
+        citations = [{"url": url, "cited_text": "Evidence"} for url in urls]
+        blocks = [
+            {"text": "First finding.", "citations": citations},
+            {
+                "text": "Second finding.",
+                "citations": [
+                    citations[0],
+                    {"url": "https://example.org", "cited_text": "More evidence"},
+                ],
+            },
+            {"text": "Uncited qualification.", "citations": []},
+        ]
+        self.peer.events = [message("Rendered block", block) for block in blocks]
+        result = await self.search()
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            result["content"],
+            "First finding. [1](<https://example.com/a(b)?q=%3Cx%3E>)\n\n"
+            "Second finding. [1](<https://example.com/a(b)?q=%3Cx%3E>) "
+            "[2](<https://example.org>)\n\n"
+            "Uncited qualification.",
+        )
+
+    async def test_openai_metadata_without_excerpts_returns_valid_extension_result(self) -> None:
+        with patch.dict(os.environ, KODELET_WEB_SEARCH_PROVIDER="openai"):
+            module = runpy.run_path(str(EXTENSIONS / "web-search" / "kodelet-extension-web-search"))
+        del self.answer_block["citations"][0]["cited_text"]
+        harness = await create_test_harness(module["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {
+                "id": "web-search", "cwd": self.ctx.cwd, "runnerId": "web-runner",
+            },
+        })
+        with patch.dict(module["run_search_agent"].__globals__, Client=self.client_class):
+            result = await harness.execute_tool({
+                "name": "web_search", "input": {"query": "Question"},
+                "context": {"conversationId": "parent-conversation", "cwd": self.ctx.cwd},
+            })
+        self.assertNotIn("error", result)
+        self.assertEqual(result["content"], "Verified finding. [1](<https://example.com>)")
+        self.assertEqual(result["structuredContent"], {
+            "content": result["content"],
+            "blocks": [{
+                **self.answer_block,
+                "citations": [{**self.answer_block["citations"][0], "cited_text": None}],
+            }],
+        })
+        schema = manifest["tools"][0]["outputSchema"]
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+        validator.validate(result["structuredContent"])
+        validator.validate({"content": result["content"], "blocks": [self.answer_block]})
+        self.assertNotIn("cited_text", schema["$defs"]["SearchCitation"]["required"])
+        self.assertEqual(self.launches[0]["args"], [
+            "acp", "--runner", "web-runner", "--code-mode=off", "--profile=web-search",
+        ])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        self.assertEqual(self.session_options[0]["parent_conversation_id"], "parent-conversation")
+        self.assertEqual(result["data"]["taskRun"]["status"], "completed")
+        self.assertEqual(result["data"]["taskRun"]["counts"], {
+            "succeeded": 1, "failed": 0, "running": 0,
+        })
+
+    async def test_invalid_input_and_missing_context_never_launch(self) -> None:
+        self.assertIn("non-empty", (await self.search(query="   "))["error"])
+        for field, expected in [
+            ("runner_id", "runner-backed"),
+            ("conversation_id", "parent conversation"),
+        ]:
+            with patch.object(self.ctx, field, None):
+                result = await self.search()
+            self.assertIn(expected, result["error"])
+            self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+        self.assertFalse(self.launches)
+
+    async def test_failures_are_not_successful_briefs(self) -> None:
+        invalid_answer = message("Display text", {"text": "Missing citations"})
+        empty_answer = message("Display text", {"text": " \n ", "citations": []})
+        for field, value, expected in [
+            ("init_error", "runner unavailable", "runner unavailable"),
+            ("prompt_error", "provider failed", "provider failed"),
+            ("stop_reason", "cancelled", "was canceled"),
+            ("events", [message("Prose without data")], "no answer data"),
+            ("events", [invalid_answer], "invalid answer data"),
+            ("events", [empty_answer], "empty answer text"),
+        ]:
+            with self.subTest(field=field, value=value):
+                self.peer = ACPProcess()
+                self.peer.events = [message(
+                    "Display text", {"text": "partial answer", "citations": []},
+                )]
+                setattr(self.peer, field, value)
+                result = await self.search()
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("partial answer", result["content"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+
+    async def test_timeout_covers_startup_and_prompt_and_closes_client(self) -> None:
+        self.assertEqual(WEB["AGENT_TIMEOUT_SECONDS"], WEB["TOOL_TIMEOUT_SECONDS"] - 10)
+        for gate in ["allow_load", "allow_result"]:
+            with self.subTest(gate=gate):
+                self.peer = ACPProcess()
+                getattr(self.peer, gate).clear()
+                with patch.dict(WEB["run_search_agent"].__globals__, AGENT_TIMEOUT_SECONDS=0.1):
+                    result = await self.search()
+                self.assertIn("timed out", result["error"])
+                self.assertEqual(result["data"]["taskRun"]["status"], "failed")
+                if gate == "allow_result":
+                    self.assertTrue(any(
+                        row["method"] == "session/cancel" for row in self.peer.requests
+                    ))
+
+    async def test_repeated_cancellation_during_success_cleanup_never_succeeds(self) -> None:
+        self.peer.ignore_terminate = True
+        with patch.object(
+            WEB["TaskProgress"], "finish", autospec=True,
+            side_effect=WEB["TaskProgress"].finish,
+        ) as finish:
+            task = asyncio.create_task(self.search())
+            try:
+                await asyncio.wait_for(self.peer.terminating.wait(), timeout=2)
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3)
+                self.assertTrue(self.peer.killed.is_set())
+                self.assertTrue(self.peer.reaped.is_set())
+                self.assertEqual(finish.call_args.kwargs, {
+                    "success": False,
+                    "error": "web_search cancelled",
+                })
+                self.assertEqual(finish.call_args.args[0].snapshot()["status"], "failed")
+            finally:
+                self.peer.kill()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
