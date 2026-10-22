@@ -7,7 +7,7 @@
 #   "google-genai",
 #   "pillow",
 #   "typesafe-sdk==0.7.1",
-#   "playwright==1.63.0",
+#   "playwright==1.64.1",
 # ]
 # ///
 
@@ -15,7 +15,7 @@
 
 For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
 ../kodelet-python-sdk --with filetype --with google-genai --with pillow --with jsonschema
---with typesafe-sdk==0.7.1 --with playwright==1.63.0
+--with typesafe-sdk==0.7.1 --with playwright==1.64.1
 -- python tests/test_extensions.py
 """
 

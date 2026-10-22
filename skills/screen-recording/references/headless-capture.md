@@ -15,6 +15,8 @@ tmux -L llm-agent list-sessions
 
 Use the user's preferred package manager for missing dependencies (prefer `dnf` on Fedora when authorized). Check that the FFmpeg build actually has `libx264`; package names and codec availability vary. Use an existing Playwright/Chromium installation or install dependencies only in a private capture workspace. Do not hardcode another machine's cached npm path, Chrome path, or maco endpoint.
 
+For Python capture controllers, use `playwright>=1.64.1`.
+
 Create a private workspace and use it throughout the capture:
 
 ```bash

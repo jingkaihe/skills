@@ -4,7 +4,7 @@
 #   "kodelet-sdk==0.6.1",
 #   "jsonschema>=4,<5",
 #   "typesafe-sdk==0.7.1",
-#   "playwright==1.63.0",
+#   "playwright==1.64.1",
 # ]
 # ///
 
