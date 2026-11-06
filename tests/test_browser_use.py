@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "kodelet-sdk==0.6.1",
+#   "kodelet-sdk==0.7.0",
 #   "jsonschema>=4,<5",
 #   "typesafe-sdk==0.7.1",
 #   "playwright==1.64.1",

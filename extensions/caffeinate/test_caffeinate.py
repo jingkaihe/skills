@@ -1,4 +1,4 @@
-"""Run: uv run --with 'kodelet-sdk==0.6.1' -- python -m unittest discover -s extensions/caffeinate"""
+"""Run: uv run --with 'kodelet-sdk==0.7.0' -- python -m unittest discover -s extensions/caffeinate"""
 
 import asyncio
 import importlib.machinery
@@ -9,6 +9,9 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+# Load platform-dependent SDK dependencies before simulating macOS on Linux.
+import kodelet_sdk  # noqa: F401
 
 loader = importlib.machinery.SourceFileLoader(
     "caffeinate_extension",
