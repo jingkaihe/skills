@@ -39,14 +39,14 @@ kodelet plugin add jingkaihe/skills      # current repo only
 Extensions run with `uv` (Python 3.11+). Some need extra setup:
 
 - `look-at`, `nano-banana`: Gemini credentials (`GEMINI_API_KEY`, or `GOOGLE_CLOUD_PROJECT` for Vertex AI).
-- `web-search`: OpenAI via Codex by default (`kodelet codex login`); set `KODELET_WEB_SEARCH_PROVIDER=anthropic` to switch.
+- `web-search`: OpenAI via Codex by default (`kodelet codex login`); configure an inline profile below to switch providers or models.
 - `code-search`, `conversation`, `web-search`: `kodelet` on `PATH`, configured and authenticated against your daemon.
 
 Looking for subagents? See [jingkaihe/kodelet-subagent](https://github.com/jingkaihe/kodelet-subagent).
 
 ### Search model profiles
 
-`code-search` and `conversation` accept an inline model profile under `extensions.config`, keyed by their full installed extension IDs:
+`code-search`, `conversation`, and `web-search` accept an inline model profile under `extensions.config`, keyed by their full installed extension IDs:
 
 ```yaml
 extensions:
@@ -66,11 +66,20 @@ extensions:
         model: claude-haiku-5-5
         anthropic_api_access: subscription
         max_tokens: 8192
+    jingkaihe@skills/web-search:
+      profile:
+        provider: anthropic
+        model: claude-haiku-5-5
+        anthropic_api_access: subscription
+        reasoning_effort: none
+        max_tokens: 4096
 ```
 
 The optional `profile` object uses Kodelet's native profile keys and must include `provider` (`openai` or `anthropic`) and a nonempty `model`. It replaces the built-in model settings rather than merging with them; omitted settings use Kodelet's defaults. Omit `profile` entirely to keep the current OpenAI/Codex `gpt-6-luna` defaults. Invalid profiles are reported as errors, not silently replaced with defaults. Provider-specific settings are validated by the daemon when it resolves the profile; credentials remain daemon-managed.
 
-The extensions retain their hidden profile names (`code-search` and `read-conversation`), read-only tool allowlists, enabled filesystem search, disabled skills, and code mode off. Configured `allowed_tools`, `enable_fs_search_tools`, and `skills` values cannot override those restrictions. For `conversation`, this only affects `read_conversation`; keyword-based `search_conversation` does not use an LLM.
+`code-search` and `conversation` retain their hidden profile names (`code-search` and `read-conversation`), read-only tool allowlists, enabled filesystem search, disabled skills, and code mode off. Configured `allowed_tools`, `enable_fs_search_tools`, and `skills` values cannot override those restrictions. For `conversation`, this only affects `read_conversation`; keyword-based `search_conversation` does not use an LLM.
+
+`web-search` retains its hidden `web-search` profile name, disables skills, and runs with code mode off. It enforces a tool allowlist of only `anthropic_web_search` or `openai_web_search`, according to the configured provider. OpenAI profiles always use `openai.api_mode: responses` and `openai.enable_search: true`; other provider settings are preserved. To use OpenAI via Codex, include `openai.platform: codex` as in the example above. `KODELET_WEB_SEARCH_PROVIDER` is no longer read; migrate any existing environment setting to `extensions.config`.
 
 Apply these settings in the runner's extension configuration and reload resources to initialize the extensions with the new profiles. No separate named model profile is required.
 

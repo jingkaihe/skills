@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 import asyncio
-import os
-from datetime import datetime, timezone
-from typing import cast
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 from kodelet_sdk import (
@@ -21,11 +21,13 @@ from kodelet_sdk import (
     ExecutionOptions,
     Extension,
     Field,
+    SharedContext,
     TaskProgress,
     TaskProgressContext,
     ToolContext,
     ToolExecutionResult,
 )
+from kodelet_sdk.execution import ExtensionProfileOptions
 
 DESCRIPTION = (
     "Search the web to research a question and return a concise answer with source links. "
@@ -46,43 +48,50 @@ assistant message containing your findings.
 If web search is unavailable, report that limitation; do not substitute an answer from memory.
 """
 
-SEARCH_PROVIDER = os.environ.get("KODELET_WEB_SEARCH_PROVIDER", "openai")
-if SEARCH_PROVIDER not in {"anthropic", "openai"}:
-    raise ValueError(
-        f"Invalid KODELET_WEB_SEARCH_PROVIDER={SEARCH_PROVIDER!r}; "
-        "expected 'anthropic' or 'openai' (unset defaults to 'openai')"
-    )
 
-ext = Extension(name="web-search", version="0.1.0")
-if SEARCH_PROVIDER == "anthropic":
-    SEARCH_PROFILE = ext.register_profile(
-        "web-search",
-        provider="anthropic",
-        model="claude-haiku-5-5",
-        anthropic_api_access="subscription",
-        reasoning_effort="none",
-        max_tokens=4096,
-        allowed_tools=["anthropic_web_search"],
-        skills={"enabled": False},
-        hidden=True,
-    )
-else:
-    SEARCH_PROFILE = ext.register_profile(
-        "web-search",
-        provider="openai",
-        model="gpt-6-luna",
-        reasoning_effort="none",
-        max_tokens=4096,
-        openai={
-            "api_mode": "responses",
-            "platform": "codex",
-            "service_tier": "fast",
-            "enable_search": True,
-        },
-        allowed_tools=["openai_web_search"],
-        skills={"enabled": False},
-        hidden=True,
-    )
+class WebSearchExtension(Extension):
+    def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        manifest = super().initialize(params)
+        config = SharedContext(params).config
+        profile = manifest["profiles"][0]
+        if "profile" in config:
+            try:
+                options = ExtensionProfileOptions.model_validate(config["profile"]).to_wire()
+            except ValueError as exc:
+                raise ValueError(f"web-search config.profile: {exc}") from exc
+        else:
+            options = profile["options"]
+        if options["provider"] == "openai":
+            openai = options.get("openai", {})
+            if not isinstance(openai, Mapping):
+                raise ValueError("web-search config.profile.openai must be an object")
+            options["openai"] = {**openai, "api_mode": "responses", "enable_search": True}
+        # The SDK returns a copy; never mutate config or the registered defaults.
+        profile["options"] = {
+            **options,
+            "allowed_tools": [f"{options['provider']}_web_search"],
+            "skills": {"enabled": False},
+        }
+        return manifest
+
+
+ext = WebSearchExtension(name="web-search", version="0.1.0")
+SEARCH_PROFILE = ext.register_profile(
+    "web-search",
+    provider="openai",
+    model="gpt-6-luna",
+    reasoning_effort="none",
+    max_tokens=4096,
+    openai={
+        "api_mode": "responses",
+        "platform": "codex",
+        "service_tier": "fast",
+        "enable_search": True,
+    },
+    allowed_tools=["openai_web_search"],
+    skills={"enabled": False},
+    hidden=True,
+)
 
 
 class WebSearchInput(BaseModel):
@@ -116,7 +125,7 @@ def search_instructions() -> Extension:
 
     @instructions.on("agent.init")
     def configure_search(_event: AgentInitEvent, _ctx: EventContext) -> EventResult:
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(UTC).date().isoformat()
         return {"systemPrompt": {"replace": f"{SYSTEM_PROMPT}\nToday's date: {today} (UTC)."}}
 
     return instructions
