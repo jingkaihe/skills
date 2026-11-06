@@ -10,6 +10,7 @@ import asyncio
 import json
 import tempfile
 import textwrap
+from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -24,11 +25,13 @@ from kodelet_sdk import (
     ExecutionOptions,
     Extension,
     Field,
+    SharedContext,
     TaskProgress,
     TaskProgressContext,
     ToolContext,
     ToolExecutionResult,
 )
+from kodelet_sdk.execution import ExtensionProfileOptions
 
 READ_DESCRIPTION = textwrap.dedent(
     """
@@ -66,7 +69,28 @@ ERROR_TAIL_CHARS = 4096
 
 MATCH_LABELS = {"title": "title", "tool-use": "tool input", "compaction": "compaction summary"}
 
-ext = Extension(name="conversation", version="0.1.0")
+
+class ConversationExtension(Extension):
+    def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        manifest = super().initialize(params)
+        config = SharedContext(params).config
+        if "profile" in config:
+            try:
+                options = ExtensionProfileOptions.model_validate(config["profile"]).to_wire()
+            except ValueError as exc:
+                raise ValueError(f"conversation config.profile: {exc}") from exc
+            # The SDK returns a copy; keep defaults intact across initialization calls.
+            profile = manifest["profiles"][0]
+            profile["options"] = {
+                **options,
+                **{key: profile["options"][key] for key in (
+                    "allowed_tools", "enable_fs_search_tools", "skills",
+                )},
+            }
+        return manifest
+
+
+ext = ConversationExtension(name="conversation", version="0.1.0")
 READ_PROFILE = ext.register_profile(
     "read-conversation",
     provider="openai",

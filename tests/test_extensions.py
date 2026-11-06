@@ -22,6 +22,7 @@ For an unpublished local SDK: KODELET_TEST_LOCAL_SDK=1 uv run --project
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import runpy
@@ -298,6 +299,74 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(read.await_args.kwargs, {
                 "runner": "conversation-runner", "parent_conversation_id": "current",
             })
+
+    def test_inline_search_profiles_replace_model_settings_and_preserve_restrictions(self) -> None:
+        for name in ["code-search", "conversation"]:
+            module = runpy.run_path(str(EXTENSIONS / name / f"kodelet-extension-{name}"))
+            ext = module["ext"]
+            params = {"capabilities": {"profiles": {"remote": True}}}
+            baseline = ext.initialize(params)
+            for options in [
+                {
+                    "provider": "anthropic", "model": "claude-haiku-5-5",
+                    "anthropic_api_access": "subscription", "max_tokens": 8192,
+                },
+                {
+                    "provider": "openai", "model": "gpt-6-astra", "reasoning_effort": "medium",
+                    "openai": {"api_mode": "responses", "platform": "openai"},
+                },
+            ]:
+                with self.subTest(extension=name, provider=options["provider"]):
+                    config = {"profile": {
+                        **copy.deepcopy(options),
+                        "allowed_tools": ["bash"],
+                        "enable_fs_search_tools": False,
+                        "skills": {"enabled": True},
+                    }}
+                    original = copy.deepcopy(config)
+                    configured_params = {**params, "extension": {"config": config}}
+                    manifest = ext.initialize(configured_params)
+                    expected = copy.deepcopy(baseline)
+                    expected["profiles"][0]["options"] = {
+                        **options,
+                        "allowed_tools": ["file_read", "grep_tool"] + (
+                            ["glob_tool"] if name == "code-search" else []
+                        ),
+                        "enable_fs_search_tools": True,
+                        "skills": {"enabled": False},
+                    }
+                    self.assertEqual(manifest, expected)
+                    self.assertEqual(config, original, "Initialization must not mutate caller config")
+                    self.assertEqual(ext.initialize(configured_params), expected)
+                    self.assertEqual(ext.initialize(params), baseline, "No custom settings may leak")
+
+    def test_inline_search_profiles_reject_invalid_configuration(self) -> None:
+        for name in ["code-search", "conversation"]:
+            module = runpy.run_path(str(EXTENSIONS / name / f"kodelet-extension-{name}"))
+            for profile in [
+                None, "named-profile", [], {},
+                {"provider": "anthropic"},
+                {"model": "claude-haiku-5-5"},
+                {"provider": "unsupported", "model": "example"},
+                {"provider": "openai", "model": " "},
+                {"provider": "openai", "model": 123},
+            ]:
+                with (
+                    self.subTest(extension=name, profile=profile),
+                    self.assertRaisesRegex(ValueError, rf"{name} config\.profile:"),
+                ):
+                    module["ext"].initialize({
+                        "capabilities": {"profiles": {"remote": True}},
+                        "extension": {"config": {"profile": profile}},
+                    })
+            with (
+                self.subTest(extension=name, missing_capability=True),
+                self.assertRaisesRegex(RuntimeError, "capabilities.profiles.remote"),
+            ):
+                module["ext"].initialize({"extension": {"config": {"profile": {
+                    "provider": "anthropic", "model": "claude-haiku-5-5",
+                    "anthropic_api_access": "subscription",
+                }}}})
 
     async def test_active_and_archived_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
@@ -945,6 +1014,34 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session_options[0]["profile"], "code-search")
         self.assertIn("--profile=code-search", self.launches[0]["args"])
 
+    async def test_configured_profile_is_used_by_child_session(self) -> None:
+        harness = await create_test_harness(SEARCH["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {
+                "cwd": str(self.root), "runnerId": "search-runner",
+                "config": {"profile": {
+                    "provider": "anthropic", "model": "claude-haiku-5-5",
+                    "anthropic_api_access": "subscription",
+                    "code_mode": "only",
+                }},
+            },
+        })
+        result = await harness.execute_tool({
+            "name": "code_search", "input": {"query": "Find code"},
+            "context": {"conversationId": "parent-conversation"},
+        })
+        self.assertNotIn("error", result)
+        profile = manifest["profiles"][0]
+        self.assertEqual(profile["options"]["provider"], "anthropic")
+        self.assertEqual(profile["options"]["model"], "claude-haiku-5-5")
+        self.assertEqual(profile["options"]["anthropic_api_access"], "subscription")
+        self.assertNotIn("openai", profile["options"])
+        self.assertEqual(self.session_options[0]["profile"], profile["name"])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        self.assertIn(f"--profile={profile['name']}", self.launches[0]["args"])
+        self.assertIn("--code-mode=off", self.launches[0]["args"])
+
     async def test_missing_runner_context_does_not_use_default_runner(self) -> None:
         with patch.object(self.ctx, "runner_id", None):
             result = await self.search(query="Find code")
@@ -1274,6 +1371,35 @@ class ReadConversationTests(unittest.IsolatedAsyncioTestCase):
         return await CONVERSATION["read_conversation"](CONVERSATION["ReadConversationInput"](**{
             "conversation_id": "parent-conversation", "goal": " What changed? ", **kwargs,
         }), self.ctx)
+
+    async def test_configured_profile_is_used_by_child_session(self) -> None:
+        harness = await create_test_harness(CONVERSATION["ext"])
+        manifest = harness.initialize({
+            "capabilities": {"profiles": {"remote": True}},
+            "extension": {
+                "cwd": str(self.root), "runnerId": "read-runner",
+                "config": {"profile": {
+                    "provider": "anthropic", "model": "claude-haiku-5-5",
+                    "anthropic_api_access": "subscription",
+                    "code_mode": "only",
+                }},
+            },
+        })
+        result = await harness.execute_tool({
+            "name": "read_conversation",
+            "input": {"conversation_id": "parent-conversation", "goal": "What changed?"},
+            "context": {"conversationId": "parent-conversation"},
+        })
+        self.assertNotIn("error", result)
+        profile = manifest["profiles"][0]
+        self.assertEqual(profile["options"]["provider"], "anthropic")
+        self.assertEqual(profile["options"]["model"], "claude-haiku-5-5")
+        self.assertEqual(profile["options"]["anthropic_api_access"], "subscription")
+        self.assertNotIn("openai", profile["options"])
+        self.assertEqual(self.session_options[0]["profile"], profile["name"])
+        self.assertEqual(self.session_options[0]["options"].to_wire(), {"codeMode": "off"})
+        self.assertIn(f"--profile={profile['name']}", self.launches[0]["args"])
+        self.assertIn("--code-mode=off", self.launches[0]["args"])
 
     async def test_large_current_snapshot_stays_on_disk_with_profile_progress_and_callback(self) -> None:
         self.export_program = (
