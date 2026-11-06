@@ -40,6 +40,7 @@ from kodelet_sdk.agent.transport import ACP_MESSAGE_LIMIT
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSIONS = ROOT / "extensions"
+BONEYARD_EXTENSIONS = ROOT / "boneyard" / "extensions"
 SEARCH = runpy.run_path(str(EXTENSIONS / "code-search" / "kodelet-extension-code-search"))
 CONVERSATION = runpy.run_path(str(EXTENSIONS / "conversation" / "kodelet-extension-conversation"))
 with patch.dict(os.environ, KODELET_WEB_SEARCH_PROVIDER="anthropic"):
@@ -298,7 +299,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "runner": "conversation-runner", "parent_conversation_id": "current",
             })
 
-    async def test_all_extensions_initialize_over_real_stdio(self) -> None:
+    async def test_active_and_archived_extensions_initialize_over_real_stdio(self) -> None:
         expected = {
             "browser-use": ["browser_use"],
             "caffeinate": [],
@@ -319,7 +320,10 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             env = {"HOME": directory, "PATH": "", "KODELET_HOME": str(state)}
             for name, tools in expected.items():
                 with self.subTest(extension=name):
-                    script = EXTENSIONS / name / f"kodelet-extension-{name}"
+                    extension_root = (
+                        BONEYARD_EXTENSIONS if name in {"browser-use", "goal", "todo"} else EXTENSIONS
+                    )
+                    script = extension_root / name / f"kodelet-extension-{name}"
                     self.assertIn("kodelet-sdk>=0.7.0,<0.8", script.read_text())
                     payload = json.dumps(
                         {
@@ -442,7 +446,7 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def new_harness(self) -> tuple[dict[str, Any], Any]:
-        module = runpy.run_path(str(EXTENSIONS / "goal" / "kodelet-extension-goal"))
+        module = runpy.run_path(str(BONEYARD_EXTENSIONS / "goal" / "kodelet-extension-goal"))
         harness = await create_test_harness(module["ext"])
         harness.initialize({"extension": {
             "id": "goal", "cwd": str(self.root), "dataDir": str(self.data_dir),
@@ -675,7 +679,7 @@ class GoalExtensionTests(unittest.IsolatedAsyncioTestCase):
 
 class TodoPresentationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.module = runpy.run_path(str(EXTENSIONS / "todo" / "kodelet-extension-todo"))
+        self.module = runpy.run_path(str(BONEYARD_EXTENSIONS / "todo" / "kodelet-extension-todo"))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "test-todos.json"

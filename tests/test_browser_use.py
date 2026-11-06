@@ -39,7 +39,7 @@ from pydantic import ValidationError
 from typesafe_sdk import AsyncTypeSafeClient
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "extensions" / "browser-use"))
+sys.path.insert(0, str(ROOT / "boneyard" / "extensions" / "browser-use"))
 import browser_dom
 import browser_goal
 import browser_use

@@ -1,10 +1,12 @@
 # Browser use
 
+Archived for reference; this extension is no longer installed by `kodelet plugin add`.
+
 A Python port of Kodelet's TypeScript browser-use extension. It operates the conversation's existing shared browser through the published `kodelet-sdk` browser capability, async Playwright, and the official `typesafe-sdk`. The control plane authorizes and returns a runner-local CDP lease; observations, Jev decisions, and browser actions stay inside the extension. No browser-action RPC or Node project build is required.
 
 ## Setup
 
-Install this plugin repository with `kodelet plugin add jingkaihe/skills`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. All extensions in this repository require `kodelet-sdk>=0.7.0,<0.8`; this extension also pins `typesafe-sdk==0.7.1` and `playwright==1.64.1`.
+To use this archived extension manually, copy this entire directory to `~/.kodelet/extensions/browser-use/`. The executable `kodelet-extension-browser-use` uses `uv run --script` to resolve its Python dependencies. Python 3.11 or later and `uv` must be available on the runner. This extension requires `kodelet-sdk>=0.7.0,<0.8` and pins `typesafe-sdk==0.7.1` and `playwright==1.64.1`.
 
 Use a Kodelet host advertising browser capability version 1. Configure Chrome on the runner and enable browser access on the control-plane host, rather than in repository model-profile overrides:
 
@@ -113,11 +115,11 @@ The Python implementation is separated into `browser_use.py` (registration, SDK 
 # From this repository's root; no provider calls.
 uv run --script tests/test_extensions.py
 uv run --script tests/test_browser_use.py
-extensions/browser-use/kodelet-extension-browser-use </dev/null
+boneyard/extensions/browser-use/kodelet-extension-browser-use </dev/null
 
 # Static checks for the port.
-uv run --with ruff -- ruff check extensions/browser-use tests/test_browser_use.py
-uv run --with ruff -- ruff format --line-length 100 --check extensions/browser-use tests/test_browser_use.py
+uv run --with ruff -- ruff check boneyard/extensions/browser-use tests/test_browser_use.py
+uv run --with ruff -- ruff format --line-length 100 --check boneyard/extensions/browser-use tests/test_browser_use.py
 ```
 
 Tests use mocked model responses and browser fixtures, never the conversation's existing browser. Browser-backed fixtures use a separate Chromium process when available; they make no paid model requests. Live Jev quality and production-host authorization remain separate integration concerns.
