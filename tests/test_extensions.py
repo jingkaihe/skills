@@ -193,6 +193,8 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "provider": "openai",
                 "model": "accounts/fireworks/models/glm-5p3",
                 "max_tokens": 32768,
+                "tool_mode": "full",
+                "enable_fs_search_tools": True,
                 "openai": {
                     "platform": "fireworks",
                     "api_mode": "responses",
@@ -210,6 +212,25 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             },
         }])
         self.assertEqual(manifest.get("tools", []), [])
+
+    async def test_rush_disables_image_viewing_only_for_its_profile(self) -> None:
+        module = runpy.run_path(str(EXTENSIONS / "rush" / "kodelet-extension-rush"))
+        harness = await create_test_harness(module["ext"])
+        harness.initialize({"capabilities": {"profiles": {"remote": True}}})
+        for profile in ["rush", "other", None]:
+            with self.subTest(profile=profile):
+                result = await harness.handle_event({
+                    "event": "agent.init",
+                    "payload": {
+                        "systemPrompt": "Runner instructions",
+                        "allowedTools": ["bash", "code_execute", "view_image", "look_at"],
+                    },
+                    "context": {"profile": profile} if profile else {},
+                })
+                self.assertEqual(
+                    result,
+                    {"tools": {"disable": ["view_image"], "enable": []}} if profile == "rush" else {},
+                )
 
     def test_nano_banana_uses_image_model_default_and_override(self) -> None:
         module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))

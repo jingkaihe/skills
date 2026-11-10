@@ -4,16 +4,18 @@
 # dependencies = ["kodelet-sdk>=0.7.0,<0.8"]
 # ///
 
-from kodelet_sdk import Extension
+from kodelet_sdk import AgentInitEvent, EventContext, EventResult, Extension
 
 MODEL = "accounts/fireworks/models/glm-5p3"
 
 ext = Extension(name="rush", version="0.1.0")
-ext.register_profile(
+RUSH_PROFILE = ext.register_profile(
     "rush",
     provider="openai",
     model=MODEL,
     max_tokens=32768,
+    tool_mode="full",
+    enable_fs_search_tools=True,
     openai={
         "platform": "fireworks",
         "api_mode": "responses",
@@ -32,6 +34,14 @@ ext.register_profile(
     },
     hidden=False,
 )
+
+
+@ext.on("agent.init")
+def configure_rush(_event: AgentInitEvent, ctx: EventContext) -> EventResult | None:
+    if ctx.profile == RUSH_PROFILE:
+        # GLM-5.3 is text-only; leave other profiles and tools unchanged.
+        return {"tools": {"disable": ["view_image"]}}
+    return None
 
 
 if __name__ == "__main__":
