@@ -180,6 +180,37 @@ class ACPProcess:
 
 
 class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
+    def test_rush_registers_visible_fireworks_profile_without_credentials(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            module = runpy.run_path(str(EXTENSIONS / "rush" / "kodelet-extension-rush"))
+            manifest = module["ext"].initialize({
+                "capabilities": {"profiles": {"remote": True}},
+            })
+        self.assertEqual(manifest["profiles"], [{
+            "name": "rush",
+            "hidden": False,
+            "options": {
+                "provider": "openai",
+                "model": "accounts/fireworks/models/glm-5p3",
+                "max_tokens": 32768,
+                "openai": {
+                    "platform": "fireworks",
+                    "api_mode": "responses",
+                    "base_url": "https://api.fireworks.ai/inference/v1",
+                    "api_key_env_var": "FIREWORK_API_KEY",
+                    "pricing": {
+                        "accounts/fireworks/models/glm-5p3": {
+                            "input": 1.40 / 1_000_000,
+                            "cached_input": 0.26 / 1_000_000,
+                            "output": 4.40 / 1_000_000,
+                            "context_window": 1_040_000,
+                        },
+                    },
+                },
+            },
+        }])
+        self.assertEqual(manifest.get("tools", []), [])
+
     def test_nano_banana_uses_image_model_default_and_override(self) -> None:
         module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
         generate = module["generate_image"]
@@ -377,6 +408,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             "last-word": [],
             "look-at": ["look_at"],
             "nano-banana": ["nano_banana"],
+            "rush": [],
             "todo": ["todo_read", "todo_write"],
             "web-search": ["web_search"],
         }

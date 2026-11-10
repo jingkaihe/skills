@@ -1,0 +1,38 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk>=0.7.0,<0.8"]
+# ///
+
+from kodelet_sdk import Extension
+
+MODEL = "accounts/fireworks/models/glm-5p3"
+
+ext = Extension(name="rush", version="0.1.0")
+ext.register_profile(
+    "rush",
+    provider="openai",
+    model=MODEL,
+    max_tokens=32768,
+    openai={
+        "platform": "fireworks",
+        "api_mode": "responses",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env_var": "FIREWORK_API_KEY",
+        # Per-token prices and context window from the Fireworks model page:
+        # https://fireworks.ai/models/fireworks/glm-5p3
+        "pricing": {
+            MODEL: {
+                "input": 1.40 / 1_000_000,
+                "cached_input": 0.26 / 1_000_000,
+                "output": 4.40 / 1_000_000,
+                "context_window": 1_040_000,
+            },
+        },
+    },
+    hidden=False,
+)
+
+
+if __name__ == "__main__":
+    ext.run_sync()
