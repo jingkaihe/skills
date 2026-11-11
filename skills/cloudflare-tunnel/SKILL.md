@@ -1,6 +1,6 @@
 ---
 name: cloudflare-tunnel
-description: Use whenever the user wants to expose localhost or a private service through Cloudflare Tunnel, publish a stable custom-domain HTTPS endpoint with cloudflared, run a named tunnel with API-provisioned credentials, or generate a temporary trycloudflare.com URL. Trigger on mentions of cloudflared, Cloudflare Tunnel, trycloudflare, Argo Tunnel, public hostname, expose localhost, preview URL, webhook testing, or custom-domain HTTPS over Cloudflare.
+description: Expose localhost or private services via Cloudflare Tunnel (cloudflared), either as stable custom-domain HTTPS with named tunnels or as temporary trycloudflare.com URLs. Use for preview URLs, webhook testing, or any cloudflared/Argo Tunnel task.
 ---
 
 # Cloudflare Tunnel

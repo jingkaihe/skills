@@ -1,6 +1,6 @@
 ---
 name: strix-halo-llm
-description: Run, benchmark, and serve local GGUF / llama.cpp models on AMD Strix Halo systems such as Framework Desktop using kyuz0 toolboxes, unified-memory sizing, and reproducible podman commands. Use this skill for Strix Halo local LLM work, especially llama.cpp setup, memory-fit or performance tuning, toolbox benchmarking, and podman-based serving.
+description: Run, benchmark, and serve local GGUF/llama.cpp models on AMD Strix Halo systems using kyuz0 toolboxes and podman. Use for memory-fit sizing and performance tuning.
 ---
 
 # Strix Halo LLMs with llama.cpp

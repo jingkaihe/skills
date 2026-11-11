@@ -1,6 +1,6 @@
 ---
 name: librarian
-description: "Maintain a local cache of remote Git repositories (GitHub, GitLab, Bitbucket, etc.) for code research and exploration. Use when users share a GitHub/GitLab URL, ask to look at a remote codebase, reference an open-source project by name (e.g. 'look at how kubernetes does X'), or want to compare code across repos. Always use this instead of fetching individual files via HTTP or cloning manually."
+description: "Maintain a local cache of remote Git repos for code research. Use when users share a GitHub/GitLab URL, ask about a remote or open-source codebase (e.g. 'how does kubernetes do X'), or compare code across repos. Prefer this over fetching files via HTTP or cloning manually."
 ---
 
 # Librarian — Local Cache for Remote Repositories

@@ -1,6 +1,6 @@
 ---
 name: uv
-description: Use `uv` as the default Python tool for package management, environments, and self-contained scripts instead of separate `pip`, `venv`, `poetry`, or raw `python` workflows. Trigger on mentions of uv, Python dependency management, `uv run`, inline script metadata, PEP 723, virtualenv setup, or `uv_build` backend setup.
+description: Use `uv` as the default Python tool for packages, environments, and scripts instead of `pip`, `venv`, `poetry`, or raw `python`.
 ---
 
 Use this skill when the user wants help with Astral `uv`. Keep the main flow short, then use the reference docs for deeper details.
