@@ -35,12 +35,14 @@ kodelet plugin add jingkaihe/skills      # current repo only
 | [last-word](./extensions/last-word) | `/last-word`, `ctrl+alt+w` | Save the last response to a Markdown file |
 | [look-at](./extensions/look-at) | `look_at` | Analyse PDFs, images, audio, and video |
 | [nano-banana](./extensions/nano-banana) | `nano_banana` | Generate images with Gemini |
+| [profiles](./extensions/profiles) | `openai`, `anthropic` model profiles | OpenAI (`patch` tool mode) and Anthropic (`full` tool mode) profiles, without daemon profile configuration |
 | [rush](./extensions/rush) | `rush` model profile | GLM-5.3 via Fireworks Responses API |
 | [web-search](./extensions/web-search) | `web_search` | Web research with cited answers |
 
 Extensions run with `uv` (Python 3.11+). Some need extra setup:
 
 - `look-at`, `nano-banana`: Gemini credentials (`GEMINI_API_KEY`, or `GOOGLE_CLOUD_PROJECT` for Vertex AI).
+- `profiles`: uses subscriptions; run `kodelet codex login` and `kodelet anthropic login` against the daemon.
 - `rush`: set `FIREWORK_API_KEY` in the daemon's environment, then use `kodelet chat --profile rush` or `kodelet run --profile rush "query"`.
 - `web-search`: OpenAI via Codex by default (`kodelet codex login`); use the [extension-config skill](./skills/extension-config/SKILL.md) to switch providers or models.
 - `code-search`, `conversation`, `web-search`: `kodelet` on `PATH`, configured and authenticated against your daemon.

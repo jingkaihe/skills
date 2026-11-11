@@ -232,6 +232,47 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
                     {"tools": {"disable": ["view_image"], "enable": []}} if profile == "rush" else {},
                 )
 
+    def test_profiles_registers_visible_openai_and_anthropic_profiles(self) -> None:
+        efforts = ["medium", "high", "xhigh", "max"]
+        with patch.dict(os.environ, {}, clear=True):
+            module = runpy.run_path(str(EXTENSIONS / "profiles" / "kodelet-extension-profiles"))
+            manifest = module["ext"].initialize({
+                "capabilities": {"profiles": {"remote": True}},
+            })
+        self.assertEqual(manifest["profiles"], [
+            {
+                "name": "openai",
+                "hidden": False,
+                "options": {
+                    "provider": "openai",
+                    "model": "gpt-6-astra",
+                    "max_tokens": 128000,
+                    "reasoning_effort": "xhigh",
+                    "allowed_reasoning_efforts": efforts,
+                    "weak_model": "gpt-5.6-luna",
+                    "weak_model_max_tokens": 8192,
+                    "tool_mode": "patch",
+                    "openai": {"api_mode": "responses", "platform": "codex"},
+                },
+            },
+            {
+                "name": "anthropic",
+                "hidden": False,
+                "options": {
+                    "provider": "anthropic",
+                    "model": "claude-opus-5-5",
+                    "max_tokens": 64000,
+                    "reasoning_effort": "xhigh",
+                    "allowed_reasoning_efforts": efforts,
+                    "weak_model": "claude-haiku-5-5",
+                    "weak_model_max_tokens": 8192,
+                    "tool_mode": "full",
+                    "anthropic_api_access": "subscription",
+                },
+            },
+        ])
+        self.assertEqual(manifest.get("tools", []), [])
+
     def test_nano_banana_uses_image_model_default_and_override(self) -> None:
         module = runpy.run_path(str(EXTENSIONS / "nano-banana" / "kodelet-extension-nano-banana"))
         generate = module["generate_image"]
@@ -429,6 +470,7 @@ class ExtensionSmokeTests(unittest.IsolatedAsyncioTestCase):
             "last-word": [],
             "look-at": ["look_at"],
             "nano-banana": ["nano_banana"],
+            "profiles": [],
             "rush": [],
             "todo": ["todo_read", "todo_write"],
             "web-search": ["web_search"],
