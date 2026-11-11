@@ -13,9 +13,7 @@ kodelet plugin add jingkaihe/skills      # current repo only
 
 | Skill | Description |
 |-------|-------------|
-| [cloudflare-tunnel](./skills/cloudflare-tunnel/SKILL.md) | Expose local services with Cloudflare Tunnel |
 | [extension-config](./skills/extension-config/SKILL.md) | Configure search extension models and providers through `extensions.config` |
-| [google-workspace](./skills/google-workspace/SKILL.md) | Gmail, Calendar, Contacts, and Drive via the google-workspace MCP server |
 | [icloud-cli](./skills/icloud-cli/SKILL.md) | iCloud calendars, events, and email |
 | [librarian](./skills/librarian/SKILL.md) | Local cache of remote Git repositories for code research |
 | [matchlock](./skills/matchlock/SKILL.md) | Run agents and code in isolated micro-VMs |
